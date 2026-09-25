@@ -683,13 +683,76 @@ compute 留给 fragment 做不了的事（前缀和、GPU culling）。
 
 **这是最大的性能杠杆。** 参考 Hyprland：壁纸静态 + 窗口平铺时模糊结果预计算掉，每帧零成本；只有动态壁纸 / 浮动窗口才逐帧算。
 
-**per-region backdrop cache：**
+#### 捕获时机：per-surface 的类型化义务，不是全局开关
 
-- key = (屏幕区域矩形, blur 参数)
+**这是最容易做错的一处。** 绝不能只给一个「每帧都捕获」的布尔值——那样会在静止内容上白耗电，在动画内容上出现陈旧模糊。
+
+正确做法是让每个 surface 声明自己的刷新意图：
+
+```rust
+pub enum RepaintPolicy {
+    Static,             // 默认。捕获一次，永不主动刷新
+    Live,               // 每帧刷新
+    Bounded(Duration),  // 按已知节奏定期刷新
+}
+```
+
+**一个极易搞错的语义：**
+
+> `Static` 意味着适配层**不为这个 surface 驱动重绘**——**不是**意味着停止合成。宿主因任何其他原因重绘时（输入、别处动画、另一个 surface 的 `Live`），这一帧仍会重新捕获并重新合成。
+>
+> **是「不请求帧」，不是「不绘制」。**
+
+映射到我们的场景：
+
+| 场景 | 策略 |
+|---|---|
+| 对话框、工具提示、静态背景上的玻璃面板 | `Static`（最省电） |
+| **玻璃覆盖在滚动内容 / 专辑封面动画之上** | **必须 `Live`**，否则模糊陈旧 |
+| 已知节奏的动画（如逐字歌词推进） | `Bounded` |
+
+**为什么必须是类型化义务而不是全局开关：** 模糊背景在背后内容变化时是否还保持正确，**不能跨工具包泛化**——不同宿主的重绘语义完全不同（有的默认响应式，背后内容变了不重绘，也没有区域失效机制，于是「只要宿主重绘就是新鲜的」可能是**零帧**）。所以必须由领域类型声明意图，不能假设宿主会重绘。
+
+#### 缓存 key：`levels` 的 log2 量化就是复用机制
+
+```rust
+pub struct PingPongKey {
+    pub size: [u32; 2],   // chain 的 level-0 全尺寸，物理像素
+    pub levels: u32,      // 1 = 可分离高斯；N = N 级 dual-Kawase 金字塔
+}
+
+pub const KAWASE_THRESHOLD_PX: f32 = 16.0;
+pub const MAX_KAWASE_LEVELS: u32 = 6;      // 1/64 降采样
+pub const MAX_GAUSSIAN_RADIUS: i32 = 64;
+
+pub fn use_dual_kawase(r: f32) -> bool { r >= KAWASE_THRESHOLD_PX }
+
+pub fn resolve_kawase_levels(r: f32) -> u32 {
+    let levels = r.max(2.0).log2().round() as i32;
+    levels.clamp(1, MAX_KAWASE_LEVELS as i32) as u32
+}
+
+pub fn resolve_gaussian(r: f32) -> GaussianKernel {
+    let tap_radius = (r.round() as i32).clamp(0, MAX_GAUSSIAN_RADIUS);
+    let sigma = (r / 3.0).max(0.5);        // 3σ = 视觉半径
+    GaussianKernel { sigma, tap_radius }
+}
+```
+
+**关键洞察：每 pass 的采样扩散固定为一个 half-texel，所以半径粒度是 log2 量化的。** 一个区间内所有半径（如 16–22 → `N=4`，23–45 → `N=5`）**模糊结果完全相同**。
+
+这正是缓存能高效复用的原因——UI 里不同玻璃面板的 radius 只要落在同一区间，就命中同一个 cache entry。**这不是近似，是精确相等。**
+
+两条阈值规则：`r >= 16px` 才启用 dual Kawase（以下是可分离高斯更划算），`levels` 上限 6 级（1/64 降采样）。
+
+#### 其余 cache 机制
+
 - value = 已模糊的 texture（存在 texture pool 里）
 - **per-target-format composite cache**（每个输出格式一套 pipeline，懒创建）
 - **last-frame-used 淘汰**
 - **bind group 和 pool lease 必须持有到合成结束**，否则 pooled texture 会在被采样期间回收——这是很容易踩的 use-after-free 类 bug
+
+**待解决：** `size` 用 level-0 全尺寸做 key，意味着**窗口 resize 时 key 变化、全部 cache 失效**。这对拖拽窗口边缘的场景是个性能悬崖，需要在实现时专门处理（可能的方案：cache 用「相对尺寸」或分级复用，而不是绝对像素）。
 
 **damage tracking（Rust 生态里没人做过，需要自己设计）：**
 
@@ -862,12 +925,49 @@ outColor = mix(outColor, vec4f(linearTint + vec3f(fres * 0.2), 1.0), fres);
 
 **但那个仓库是 NONE-DECLARED（无 license）——不可用，且它的上游 `Muggleee/liquid-glass` 同样无 license，属于双重 provenance 问题。**
 
+#### ⚠️⚠️ provenance 污染链（单独标红）
+
+**下面这一行代码在整个 Web 玻璃生态里被广泛复制，但它的源头是未授权的：**
+
+```glsl
+vec2 offset = mix(vec2(0), normalize(st) / sd, length(st));
+```
+
+```
+Muggleee/liquid-glass（无 license）原创
+        ↓ 推广到任意形状
+Jason-JP-Yang/Reimagined-Glass（无 license）
+        ↓ 被多个下游复制
+   大量教程 / 博客 / 仓库
+```
+
+**双重无授权。** 你在网上搜「liquid glass shader」时，撞到这条链的概率很高。
+
+**许可干净的等价实现：用 `argui` 的 `glass_gradient` + `glass_normalize`（Apache-2.0 ✅）。** 它做的是同一件事，但授权链清楚。
+
 因此：
 
-- **不得从该仓库复制任何代码**
+- **不得从这两个仓库复制任何代码文本**（包括 shader 注释里的公式写法）
 - 上面记录的是**算法推导与踩坑结论**（事实性知识），可以据此自行实现
-- 这几条推导在数学上可以从第一性原理重新得出（SDF 梯度、度量距离、中心差分都是标准工具），**实现时应当自行推导一遍，不要对照该仓库的代码**
-- 如需一个许可干净的可抄来源，走 **`iyinchao/liquid-glass-studio`（MIT ✅）** 的 superellipse SDF 与 Fresnel（见下），以及 **`Kyant0/AndroidLiquidGlass`（Apache-2.0 ✅）** 的主体算法
+- 这几条推导在数学上可以从第一性原理重新得出（SDF 梯度、度量距离、中心差分都是标准工具），**实现时应当自行推导一遍，不要对照那些仓库的代码**
+- 许可干净的来源：**`Kyant0/AndroidLiquidGlass`（Apache-2.0 ✅）** 主体算法、**`ExtraBinoss/argui`（Apache-2.0 ✅）** 等价 SDF 写法、**`iyinchao/liquid-glass-studio`（MIT ✅）** 的 superellipse SDF 与 Fresnel
+
+#### 另一个「只能读思路」的例子：liquidGL 的高光
+
+`naughtyduk/liquidGL`（**无 license**）是生态里**唯一实现了 Apple Highlights 层**的，功能最全（折射 + bevel + 色散 + frost + 双移动光源高光 + tilt + magnify + reveal），**诱惑最大**。
+
+它的高光做法是**两个按时间漂移的光源 + `smoothstep` 距离场相加**：
+
+```wgsl
+let lp1 = vec2(sin(u.time*0.2), cos(u.time*0.3)) * 0.6 + vec2(0.5);
+let lp2 = vec2(sin(u.time*-0.4+1.5), cos(u.time*0.25-0.5)) * 0.6 + vec2(0.5);
+var h = smoothstep(0.4, 0.0, distance(in.uv, lp1)) * 0.1;
+h += smoothstep(0.5, 0.0, distance(in.uv, lp2)) * 0.08;
+```
+
+**思路本身不受版权保护**：双光源而非单光源是为了让高光**不规则移动**（单光源是纯周期性运动，一眼假）；两个光源用不同的频率和相位（0.2/0.3 vs -0.4/0.25），合成出来的轨迹近似随机。这对应 Apple 说的 Highlights「响应几何」和「响应设备运动」。
+
+**实现时自己重写**，不要复制上面这段。
 
 ### 9.11 pass 编排：手写，不引入框架
 
@@ -1147,13 +1247,24 @@ pub struct LiquidGlass {
 
 ### 14.5 不可用清单（无 license = 保留所有权利）
 
-| 仓库 | 说明 |
-|---|---|
-| **`Jason-JP-Yang/Reimagined-Glass`** | **NONE-DECLARED**。且上游 `Muggleee/liquid-glass` 同样无 license——**双重 provenance 问题**。0 star、JavaScript、最后 push 2026-08-01。**§9.10 的 SDF 通用化推导源自对该仓库的阅读，但不得复制其代码** |
-| `naughtyduk/liquidGL` | **无 license**（897★）。虽有完整 GLSL/WGSL 折射实现，不可用 |
-| `BarredEwe/LiquidGlass` | **无 license**（202★）。Metal 折射 + 快照背景捕获，不可用 |
+**代码和 shader 文本都不能进库。**
 
-**这三条是 §14.1 红线的具体落点。** 前两条尤其危险——它们功能完整、star 数不低、看起来"就是我们要的东西"，但**没有 license 文件就意味着作者保留全部权利**，抄进闭源产品是法律风险。
+| 仓库 | Star | 风险 | 代价 |
+|---|---|---|---|
+| [`naughtyduk/liquidGL`](https://github.com/naughtyduk/liquidGL) | **897** | **高** | **诱惑最大**。功能最全：折射 + bevel + 色散 + frost + **双移动光源高光** + tilt + magnify + reveal。**生态里唯一实现了 Apple Highlights 层的** |
+| [`Muggleee/liquid-glass`](https://github.com/Muggleee/liquid-glass) | 161 | **高** | **那行被广泛抄袭的代码的源头**（见 §9.10 provenance 污染链） |
+| [`Jason-JP-Yang/Reimagined-Glass`](https://github.com/Jason-JP-Yang/Reimagined-Glass) | 0 | **高** | 推广了上面那行。0 star、非 fork、最后 push 2026-08-01 |
+| [`archisvaze/liquid-glass`](https://github.com/archisvaze/liquid-glass) | 781 | 中 | three.js `ShaderMaterial` + 全屏 quad |
+| [`ybouane/liquidglass`](https://github.com/ybouane/liquidglass) | 507 | 中 | Web 折射/模糊/色散库 |
+| [`whynotmake-it/flutter_liquid_glass`](https://github.com/whynotmake-it/flutter_liquid_glass) | 444 | 中 | Flutter 包工作区 |
+| [`DnV1eX/LiquidGlassKit`](https://github.com/DnV1eX/LiquidGlassKit) | 443 | 中 | Apple Liquid Glass 向 iOS 13–18 的 backport |
+| [`conorluddy/LiquidGlassReference`](https://github.com/conorluddy/LiquidGlassReference) | 340 | 低（纯文档） | 只能读，**不能引用为规范来源** |
+| [`GetStream/awesome-liquid-glass`](https://github.com/GetStream/awesome-liquid-glass) | 251 | 低（示例代码） | SwiftUI 示例集 |
+| [`BarredEwe/LiquidGlass`](https://github.com/BarredEwe/LiquidGlass) | 202 | 中 | Metal 折射 + 快照背景捕获 |
+
+**这张表是 §14.1 红线的具体落点。** 前三条尤其危险——它们功能完整、star 数不低、看起来「就是我们要的东西」，但**没有 license 文件就意味着作者保留全部权利**。
+
+**GPL / AGPL 零命中** —— 已核验 25 个仓库无 copyleft。**但仅覆盖已核验的这些，新增仓库要重核。**
 
 **遇到「仓库没 license 但代码很诱人」时的正确做法：**
 
