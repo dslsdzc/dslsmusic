@@ -482,6 +482,54 @@ v1 用 symphonia 解码 + cpal 输出。**Rust 生态里这是事实标准**（R
 | libmpv | 解码能力最强但是 C 库 + FFI |
 | kira | 偏游戏音频（tween、混音），做播放器方向不对 |
 
+### 6.1 v1 必须预留的钩子（不做实现，只留形状）
+
+v1 的出口标准只是「能出声」，但**下面两件事的成本在 v1 几乎为零，事后补则要动管线**：
+
+1. **预加载** —— 播放当前曲时就把下一曲解码到 PCM 缓冲。这是 gapless 与交叉淡入的共同前提，也是「切歌不卡」的关键。v1 只需把 `dsls-audio` 的队列设计成「当前 + 预备」两槽，不做交叉淡入。
+2. **PCM graph 的挂载点** —— 解码输出到 ring 之间留出一个 `&mut [i16]` 的处理链位置。v1 是空的（零开销），v2 的 EQ / 响度 / 变调都挂在这里。
+
+### 6.2 v2：DSP 路线
+
+> **参考实现：`Adreno5/SouthsideMusic`**（17★，Python/PySide6，Windows-only）。
+> **License 是 PolyForm Noncommercial 1.0.0 —— 代码不可用，只能读思路。**
+> 它的音频引擎是自研的（numpy/scipy + PortAudio，不用现成引擎库），有参考价值。
+
+**它值得学的地方：**
+
+| 点 | 内容 |
+|---|---|
+| **WSOLA 是流式的，不是离线的** | `WsolaStretcher` 用 `readSamples(start, end)` 回调**拉取**样本，而非一次性喂整首歌。播放器场景必须如此——不能为了变速先把整首歌拉伸完。流式实现的关键是 overlap tail 的跨块管理，以及「起点跳变超过容差就重置」的 seek 判定 |
+| **调过的参数** | `hop = max(256, rate/43)`（44.1k → 1025）、`search = min(hop/2, max(32, rate/125))`（44.1k → 352）、搜索窗口**中心偏置 0.12**（防漂到极值）、seek 容差 **16 样本** |
+| **响度走标准而非自创** | 完整的 ITU-R BS.1770 / EBU R128：K-weighting 双二阶 → 均方 → gating → integrated loudness + LRA |
+| **复杂度在编排不在 DSP** | `playing_manager.py`(95KB) > `audio_player.py`(79KB)。预加载、切换、过渡的编排才是大头 |
+| **交叉淡入需要节拍检测** | 单独的 `beat.py`(18KB)——因为要做 tempo 匹配 |
+
+**对应的 Rust 轮子（已核实存在）：**
+
+| 能力 | crate | 版本 | 备注 |
+|---|---|---|---|
+| EBU R128 响度 | `ebur128` | 0.1.10 | **直接用，不要自己写**——它是标准实现 |
+| 时间拉伸 + 变调 | `signalsmith-stretch` | 0.1.3 | 纯 Rust |
+| 同上（备选） | `rubberband` | 0.1.5 | 音质标杆，但是 C++ 依赖 |
+| 双二阶滤波器 | `biquad` | 0.6.0 | EQ 用 |
+| 节拍检测 | `aubio-rs` | 0.2.0 | C 依赖 |
+| PCM DSP 基础 | `dasp` | 0.11.0 | 采样格式转换 |
+
+**实施顺序建议（按性价比排）：**
+
+```
+1. 预加载 + gapless          ← v1 已留钩子，v2 先做，收益最直接
+2. 响度归一化（ebur128）      ← 标准实现现成，接进 PCM graph 即可
+3. 静音尾部检测              ← 成本极低，配合 gapless 消除假间隙
+4. EQ（biquad）
+5. 变速保音高（signalsmith-stretch）
+6. 交叉淡入 + 节拍匹配        ← 最复杂，依赖节拍检测与编排层重构
+7. 变调、立体声展宽、混响
+```
+
+**一个方法论上的借鉴**：SouthsideMusic 为交叉淡入单独建了实验台（`crossfade_lab.py` / `crossfade_sweep.py` / `crossfade_probe.py` / `crossfade_gallery.py`）去**扫参数空间**，而不是拍脑袋定参数。DSP 参数（淡入时长、过渡曲线、增益斜坡）本来就该实测决定——这和我们在 M3 用性能原型代替猜测是同一种做法。
+
 ---
 
 ## 7. UI Runtime
