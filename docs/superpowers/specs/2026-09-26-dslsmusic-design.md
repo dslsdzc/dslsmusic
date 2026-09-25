@@ -745,14 +745,99 @@ pub fn resolve_gaussian(r: f32) -> GaussianKernel {
 
 两条阈值规则：`r >= 16px` 才启用 dual Kawase（以下是可分离高斯更划算），`levels` 上限 6 级（1/64 降采样）。
 
-#### 其余 cache 机制
+#### ⚠️ 缓存省的是「纹理分配」，不是「模糊计算」
 
-- value = 已模糊的 texture（存在 texture pool 里）
+**这一点极易误解，必须写清楚：**
+
+```rust
+fn ensure_scratch(&mut self, device: &wgpu::Device, key: PingPongKey) {
+    if let Some(chain) = self.scratch.get_mut(&key) {
+        chain.last_used_frame = self.frame;
+        return;                                    // ← 命中：只更新时间戳，不分配
+    }
+    // ... 未命中才分配两条新 view
+}
+
+struct ScratchChain { views: [wgpu::TextureView; 2], last_used_frame: u64 }  // 高斯乒乓
+struct PyramidChain { views: Vec<wgpu::TextureView>, last_used_frame: u64 }  // Kawase，N+1 级
+```
+
+结构体**只存 views**（`wgpu::TextureView` 通过引用计数保持父纹理存活）。
+
+**所以：pass 每次都要重跑。缓存省的是纹理分配，不是卷积计算。** 背景内容变了就必须重新卷积——**没有任何「背景没变就跳过 blur」的优化**。
+
+**要真正的「跳过重算」，那正是 §9.7 上半部分 damage tracking 要解决的事，而且是本项目要自己设计、`backdrop-blur-core` 没有提供的部分。**
+
+#### 两个独立的 HashMap（照做）
+
+```rust
+scratch:  HashMap<PingPongKey, ScratchChain>,    // 高斯
+pyramids: HashMap<PingPongKey, PyramidChain>,    // dual-Kawase
+```
+
+**两种算法分开存，键别名在结构上不可能。** glow 后端把两者塞进同一个缓存，才需要靠「选 Kawase 的必然 levels ≥ 2」这种单调性契约来保证不相交。**我们照 wgpu 这条做，就不需要操心那个契约。**
+
+#### 失效策略：纯帧龄，无内存上限
+
+**没有任何内存预算、没有 max_bytes、没有按大小的 LRU。** 唯一的失效机制是帧龄：
+
+```rust
+pub const RETENTION_FRAMES: u64 = 8;
+
+pub fn evict_decision<K: Copy>(
+    chains: impl IntoIterator<Item = (K, u64)>, now: u64, retention: u64,
+) -> Vec<K> {
+    chains.into_iter()
+        .filter(|&(_, last_used)| now.wrapping_sub(last_used) >= retention)
+        .map(|(key, _)| key).collect()
+}
+```
+
+`RETENTION_FRAMES = 8` 是为 resize 定的：一个不再霜化的 surface 不应长期占内存，**但一条链必须挺过几帧抖动**（拖拽时每帧都在改尺寸）而不 thrashing。
+
+**触发点的顺序很讲究：**
+
+```rust
+if request.target_rect.is_empty() { return Ok(None); }   // 先做 no-op 守卫
+self.begin_frame();                                      // 再推进驱逐时钟
+```
+
+**这个设计很精妙：驱逐时钟只在「真的发生了霜化」的帧上走。**
+
+推论：**一个滚出屏幕的玻璃面板，它的链会无限期存活**（因为它不再产生「霜化帧」，时钟不走），重新出现时直接命中。这解决了「面板来回滚动的 thrashing」问题——比单纯的时间戳驱逐聪明。**不可见 ≠ 未使用。**
+
+#### resize：真实行为与一个高价值改进
+
+`size` 是 level-0 全尺寸，**所以窗口 resize 时 key 必变**。真实行为：
+
+- 每出现一个新的 (size, levels) 组合就插入一条新 chain
+- **拖动窗口时尺寸每帧都变 → 每帧分配一条新链**
+- 旧尺寸的链在 8 帧后老化驱逐
+
+代价（`Rgba16Float`）：400×200 区域的单张图约 **640 KB**，拖拽期间峰值约 8 条链——**约 5–10 MB 的分配抖动**。
+
+**上游 v1 没有任何缓解措施。我们的改进：把 texture 分配尺寸量化到 16px 或 32px 网格。** 这样拖动时只有跨越网格边界才新建链，其余帧全部命中。
+
+> **这个改进实现极简、价值很大，直接写进 `ui-render` 的设计。**
+
+#### Static 策略不检测「背后内容没变」——它不检测
+
+**最重要的一条结论：没有任何机制。`Static` 是契约，不是检测器。**
+
+core 层**完全不做 backdrop 的脏检测**，把新鲜度责任整个推给适配层。`Static` 的字面含义只是「我们不主动请求帧，只在宿主因别的原因重绘时顺带重捕」。
+
+它对跨工具包的诚实警告值得原样记住：
+
+> 模糊背景在背后内容变化时是否还保持正确，**并不能跨工具包泛化**（egui 默认响应式：背后内容变了它不重绘，也没有区域失效机制——所以「只要宿主重绘就是新鲜的」可能是**零帧**）。
+
+**对我们的含义：要真正的正确性，必须自己做脏区追踪。** 具体做法——**监听场景图里位于玻璃下方的节点是否发生变更或动画**，据此在 `Static` / `Live` / `Bounded` 之间切换。
+
+> **这是 `backdrop-blur-core` 明确留下的空缺，不是我们没找到。** 好消息是它正好和上面 damage tracking 的方案合流：**damage rect 的来源就是「玻璃下方的节点变更集」，两者是同一套机制。**
+
+#### 其余机制
+
 - **per-target-format composite cache**（每个输出格式一套 pipeline，懒创建）
-- **last-frame-used 淘汰**
 - **bind group 和 pool lease 必须持有到合成结束**，否则 pooled texture 会在被采样期间回收——这是很容易踩的 use-after-free 类 bug
-
-**待解决：** `size` 用 level-0 全尺寸做 key，意味着**窗口 resize 时 key 变化、全部 cache 失效**。这对拖拽窗口边缘的场景是个性能悬崖，需要在实现时专门处理（可能的方案：cache 用「相对尺寸」或分级复用，而不是绝对像素）。
 
 **damage tracking（Rust 生态里没人做过，需要自己设计）：**
 
