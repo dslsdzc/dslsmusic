@@ -102,7 +102,7 @@ license = "GPL-3.0-or-later"
 # ── 平台层 ──
 sdl3 = { version = "0.20", features = ["raw-window-handle"] }
 wgpu = "30.0.1"
-pollster = "0.4"
+pollster = "1"
 raw-window-handle = "0.6"
 
 # ── 基础设施 ──
@@ -126,11 +126,28 @@ components = ["rustfmt", "clippy"]
 
 再创建仓库根的 `LICENSE`，**内容是 GPLv3 全文**：
 
+系统的 GPLv3 文本位置因发行版而异，**按序找第一个存在的**：
+
 ```bash
-cp /usr/share/common-licenses/GPL-3 LICENSE
+for p in /usr/share/common-licenses/GPL-3 \
+         /usr/share/licenses/spdx/GPL-3.0-or-later.txt \
+         /usr/share/licenses/GPL-3.0-or-later/LICENSE \
+         /usr/share/licenses/gpl-3.0-or-later.txt; do
+  [ -f "$p" ] && cp "$p" LICENSE && echo "取自 $p" && break
+done
 ```
 
-**若该文件不存在，报告 BLOCKED**——GPLv3 是法律文本，**不要凭记忆写一份**。
+**若一个都不存在，报告 BLOCKED**——GPLv3 是法律文本，**不要凭记忆写一份**。
+
+**选到文件后必须验证完整性**，不能只信文件名：
+- 字节数应在 34–36 KB 量级
+- 应含 `END OF TERMS AND CONDITIONS` 与 `How to Apply These Terms`
+- 应含 0–17 共 18 个编号小节
+- 若该文件由系统包提供，用包管理器校验（Arch: `pacman -Qkk licenses`；Debian: `dpkg -V`）
+
+> **计划早期版本把这里写成了单一 Debian 路径 `/usr/share/common-licenses/GPL-3`
+> 并要求「不存在就 BLOCKED」——那在本机（Arch）根本不存在，指令字面上无法执行。
+> 已改为按序查找 + 完整性验证，这才是可移植的写法。**
 
 - [ ] **Step 3: 建 platform crate 骨架**
 
@@ -141,6 +158,7 @@ cp /usr/share/common-licenses/GPL-3 LICENSE
 name = "dsls-platform"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 sdl3.workspace = true
@@ -155,9 +173,13 @@ log.workspace = true
 `crates/platform/src/lib.rs`：
 
 ```rust
-//! SDL3 与 wgpu 的唯一接触面。
+//! SDL3 的唯一接触面。
 //!
 //! 本 crate 之外的任何地方都不允许出现 `use sdl3::...`（设计文档 §11.3）。
+//! **这条由依赖图强制**：只有本 crate 依赖 sdl3，别处写了会直接编译失败。
+//!
+//! 注意：**wgpu 不是本 crate 独有**——`app` 的 main.rs 会直接用 wgpu 类型
+//! 建管线。让渲染收敛到 `ui-render` 是后续目标，不是当前的不变量。
 
 pub mod capability;
 
@@ -173,6 +195,7 @@ pub use capability::RenderTier;
 name = "dslsmusic"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 dsls-platform = { path = "../crates/platform" }
@@ -600,9 +623,13 @@ pub fn init_gpu<'a>(window: &'a PlatformWindow) -> anyhow::Result<GpuContext<'a>
 - [ ] **Step 3: 更新 lib.rs**
 
 ```rust
-//! SDL3 与 wgpu 的唯一接触面。
+//! SDL3 的唯一接触面。
 //!
 //! 本 crate 之外的任何地方都不允许出现 `use sdl3::...`（设计文档 §11.3）。
+//! **这条由依赖图强制**：只有本 crate 依赖 sdl3，别处写了会直接编译失败。
+//!
+//! 注意：**wgpu 不是本 crate 独有**——`app` 的 main.rs 会直接用 wgpu 类型
+//! 建管线。让渲染收敛到 `ui-render` 是后续目标，不是当前的不变量。
 
 pub mod capability;
 pub mod gpu;
@@ -2431,7 +2458,7 @@ impl AudioEngine {
 `app/Cargo.toml` 再加：
 
 ```toml
-dirs = "6"
+dirs = "7"
 ```
 
 - [ ] **Step 3: 构建**
