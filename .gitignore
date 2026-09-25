@@ -1,0 +1,4 @@
+/target
+
+# 控制者的进度账本（scratch，不应入库）
+.superpowers/
