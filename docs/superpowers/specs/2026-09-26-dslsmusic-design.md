@@ -558,6 +558,58 @@ pub trait DesignSystem {
 
 ## 9. 渲染管线：玻璃
 
+### 复刻基准：Apple 官方对 Liquid Glass 的定义
+
+主源：WWDC25 session 219《Meet Liquid Glass》。
+
+**官方定性：「digital meta-material」（数字超材料），明确不是任何真实材质的模拟。**
+
+这句话是判断「像不像」的总纲——**不要往「物理正确的玻璃」方向过度投入**。它也直接支持了 §9.10 走启发式而非 Snell 物理折射的选择：目标是「看起来对」，不是「算得对」。
+
+#### 四个视觉层（基准清单）
+
+**1. Lensing（透镜）** —— 实时折射并**聚焦**背景光，区别于旧材质（`UIBlurEffect` 那套）的**散射**。
+
+- 折射强度**沿边缘响应式变化**，这是 Apple 让控件「极度通透但仍能与背景区分」的手段
+- **淡入淡出不是 alpha 渐变，而是折射强度的渐变**（Apple 叫 "materialize in/out"）
+- **对我们的含义：`opacity` 这个参数在液态玻璃里语义是错的。** 正确的参数是「折射强度」和「模糊量」的插值
+
+**2. Highlights（高光）** —— 材质处在一个类物理环境里，环境中的光照在材质上产生高光。
+
+- **响应几何**：系统动效（如锁屏/解锁）时「光会绕过材质」勾出轮廓
+- 部分情况下**响应设备运动**，让它感觉「知道自己在真实世界里的位置」
+
+**3. Shadow / grounding（接地阴影）** —— 材质**感知背后内容**。
+
+- 背后是文字 → 阴影加深；背后是浅色实底 → 阴影减弱
+- 大元件（sidebar）受影响更明显：附近鲜艳内容会**微微溢到表面**，光反射、散射并渗进阴影
+
+**4. Interaction illumination（交互内发光）** —— 指尖按下时材质**从内部发光**，并**蔓延到相邻的 Liquid Glass 元件**（不是单个控件的局部效果）。
+
+#### 硬约束（API 设计约束，不只是视觉）
+
+| 约束 | 内容 |
+|---|---|
+| **两变体不可混用** | **Regular**（全效果、自适应、任意尺寸任意内容）/ **Clear**（永久更透明、**无自适应行为**、**必须配 35% 黑色 dimming 层**才能保证可读性，仅限媒体丰富内容的小 footprint） |
+| **glass cannot sample glass** | 相邻/重叠玻璃必须放进同一个 `GlassEffectContainer` 合并采样，否则折射不正确。**对我们的 backdrop 设计是直接约束，见 §9.12** |
+| **明暗自适应有尺寸规则** | 玻璃根据背景亮度自动切明暗风格，但 **Apple 只翻转小元件，绝不翻转大元件** |
+| **Scroll edge effect** | 内容滚到玻璃下方时**溶解**进背景；若深色内容触发玻璃切到 dark 风格，则改为轻微 dimming；固定配件视图用 "hard style" 统一效果 |
+| **失焦后退** | 窗口失焦时（Mac/iPad）玻璃切换外观并**视觉上后退** |
+| **无公开数值参数** | SwiftUI **不暴露任何数值参数**（模糊/饱和度由系统决定），只有 `.regular` / `.clear` / `.identity` 三档 |
+
+**SwiftUI API 面**（供理解语义，我们不复刻 API）：`glassEffect(_:in:)`、`glassEffectID(_:in:)`、`GlassEffectContainer`、`.interactive()`、`.buttonStyle(.glass)`、`.containerConcentric`（配 `ConcentricRectangle`，**圆角同心而非硬编码半径**）。注意 `glassEffect()` 必须放在 modifier 链**最后**。
+
+#### 没人做对的四件事（差异化空间）
+
+1. **背景明暗自适应** —— 且必须遵守「只翻转小元件」的规则
+2. **glass-cannot-sample-glass 的合成** —— 相邻玻璃合并为一次采样
+3. **shadow / grounding 层** —— 阴影随背后内容变化，而不是固定投影
+4. **触摸内发光及其向相邻元件的蔓延**
+
+**开源实现全都只做了第 1 层（Lensing）和第 2 层的一部分，第 3、4 层是空白。**
+
+这意味着两件事：一是我们**不可能通过抄开源实现在保真度上胜出**（抄到的只有一半）；二是第 3、4 层是**真正能拉开差距的地方**，但也是需要自己设计的部分。**v1 的目标是先做扎实第 1、2 层，第 3、4 层列入 v2 候选。**
+
 ### 9.1 own-loop：唯一干净的捕获方案
 
 **整个 UI 场景渲染到一张 offscreen intermediate texture**（`usage = RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC`），然后模糊其中若干区域，最后合成到 display target。因为 scene texture 本来就在我们手里，**捕获这一步的成本是零**。
@@ -804,7 +856,18 @@ outColor = mix(outColor, vec4f(linearTint + vec3f(fres * 0.2), 1.0), fres);
 
 **注意：** argui 的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），不是可直接使用的文件。但数学部分只有约 40 行，移植到我们自己的 shader ABI 上是几天的工作量。
 
-**最该精读的文档：`Jason-JP-Yang/Reimagined-Glass` 的 README** —— 通用 SDF 法线/厚度/offset 的完整推导 + 中轴线接缝 + mip 选择的踩坑记录，玻璃 shader 部分的第一参考资料。
+#### ⚠️ 关于上面那份 SDF 通用化推导的来源
+
+上面的四处替换、三个坑、以及中轴线接缝与 mip 选择的结论，来自对 `Jason-JP-Yang/Reimagined-Glass` 的阅读。
+
+**但那个仓库是 NONE-DECLARED（无 license）——不可用，且它的上游 `Muggleee/liquid-glass` 同样无 license，属于双重 provenance 问题。**
+
+因此：
+
+- **不得从该仓库复制任何代码**
+- 上面记录的是**算法推导与踩坑结论**（事实性知识），可以据此自行实现
+- 这几条推导在数学上可以从第一性原理重新得出（SDF 梯度、度量距离、中心差分都是标准工具），**实现时应当自行推导一遍，不要对照该仓库的代码**
+- 如需一个许可干净的可抄来源，走 **`iyinchao/liquid-glass-studio`（MIT ✅）** 的 superellipse SDF 与 Fresnel（见下），以及 **`Kyant0/AndroidLiquidGlass`（Apache-2.0 ✅）** 的主体算法
 
 ### 9.11 pass 编排：手写，不引入框架
 
@@ -842,6 +905,23 @@ Extract（主世界 → 渲染世界的唯一接触点）
 同一个 command buffer 里的两个 render pass，如果 pipeline 之间没有依赖，**可能并发执行**。
 
 因此**任何跨 pass 的隐式假设都必须显式建模成资源依赖**。对我们的 backdrop cache 尤其重要：**读 scene texture 的 blur pass 和写 scene texture 的图元 pass 之间必须有显式依赖边**，不能靠提交顺序隐式保证。
+
+### 9.12 "glass cannot sample glass" 在架构上的落点
+
+Apple 的硬约束是：**相邻/重叠的玻璃必须合并到同一次采样**，否则会互相采样到对方（错误的递归），折射结果不正确。Apple 的公开解法是 `GlassEffectContainer`——把相邻玻璃装进同一个容器统一处理。
+
+**我们的 own-loop + Backdrop-Root 架构（§9.1 / §9.3）在结构上天然满足这条约束**，推导如下：
+
+1. Backdrop-Root rule 说的是「玻璃面板不把自己的填充画进 blur source」
+2. 把它推广一步：**scene texture 里不含任何玻璃**——玻璃是完全在合成阶段产生的
+3. 因此所有玻璃面板采样的是**同一张不含玻璃的 scene texture**
+4. 玻璃之间**不可能互相采样到**——它们要采样的东西里根本没有玻璃
+
+也就是说 Apple 需要显式容器来保证的事，在我们的管线拓扑下是**免费**的。代价是：嵌套玻璃（玻璃上的玻璃）不会呈现「透过上层玻璃看下层玻璃」的效果，而是都直接看穿到最底层内容。**这正是 Apple 的行为**。
+
+**但这条推导有一个前提必须守住：scene texture 里绝不能有任何玻璃元素。**（包括 HUD、悬浮按钮、歌词遮罩这类可能被顺手画进去的东西。）这需要一条明确的绘制层规则，并且应该在 golden test 里覆盖。
+
+> **状态：这条推导是基于架构的推论，逻辑自洽但尚未经第二方核验。M4 实现时需要实测确认，尤其是嵌套玻璃与滚动内容重叠的场景。**
 
 ---
 
@@ -965,9 +1045,23 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 - **`Fei-xiangShi/Rustle`（AGPL-3.0）** —— 和我们技术栈最像，最容易产生「抄两段」的冲动。**只读思路，不抄代码。**
 - **AMLL（AGPL-3.0）** —— 同上。算法参数照搬没问题（那是事实性知识），代码不行。
+- **`Jason-JP-Yang/Reimagined-Glass`（NONE-DECLARED）** —— 上游 `Muggleee/liquid-glass` 同样无 license，**双重 provenance 问题**。见 §14.5
 - `naughtyduk/liquidGL`、`BarredEwe/LiquidGlass` —— **无 license**，不可用
 - `slint` —— GPLv3 / 商业授权，已否决
 - `Cider 1`、`SPlayer`、`listen1`、`MusicFree` —— AGPL / 其他，只读思路
+
+**已坐实的可用许可（玻璃相关）：**
+
+| 仓库 | 许可 | 用途 |
+|---|---|---|
+| `Kyant0/AndroidLiquidGlass` | **Apache-2.0** ✅ | 主体折射算法（§9.10） |
+| `iyinchao/liquid-glass-studio` | **MIT** ✅ | superellipse SDF、Fresnel（§9.10） |
+| `ExtraBinoss/argui` | **Apache-2.0** ✅ | WGSL 移植参考（须保留 `LICENSE-android-liquid-glass`） |
+| `backdrop-blur-core` / `-wgpu` / `-glow` / `-egui` | **MIT OR Apache-2.0** ✅ | backdrop 架构参考 |
+| `QmDeve/AndroidLiquidGlassView` | MIT ✅ | — |
+| `skydoves/Cloudy` | Apache-2.0 ✅ | — |
+| `OverShifted/LiquidGlass` | MIT ✅ | 13-tap 可分离高斯 |
+| `andydbc/unity-frosted-glass` | MIT ✅ | 可分离模糊 shader |
 
 ### 14.2 可直接依赖
 
@@ -1002,7 +1096,8 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **app_rhyme / music_api** | MIT/Apache ✅ | 音源层做成独立 crate 的范例 |
 | **Kyant0/AndroidLiquidGlass** | Apache-2.0 ✅ | **折射算法源**（§9.10） |
 | **argui** | MIT/Apache-2.0 ✅ | WGSL 移植参考、`argui-layout/src/paint/effects.rs` 看 effect 怎么接进 paint 流程 |
-| **Reimagined-Glass** | 见仓库 | **玻璃 shader 第一参考资料**：通用 SDF 法线/厚度/offset 推导 + 中轴线接缝 + mip 选择（§9.10） |
+| **`iyinchao/liquid-glass-studio`** | MIT ✅ | **许可干净的可抄来源**：superellipse 圆角 SDF、Fresnel（§9.10） |
+| ~~Reimagined-Glass~~ | **NONE-DECLARED ❌** | **不可用**（见 §14.5） |
 | **Hyprland** `src/render/shaders/glsl/blur1.glsl` | GPL ⚠️ | dual Kawase 降采样参考实现 + **vibrancy/saturation 逐级施加**的技巧（§9.5）。**只读思路** |
 | **`backdrop-blur-wgpu`** | 见 crate | **最贴近我们需求的架构参考**：两阶段 `prepare` → `record` 的 seam trait（因为 wgpu 走 Queue 上传而 glow 是 immediate mode）、按 target format 懒建 pipeline、sRGB 拒绝、Backdrop-Root rule、last-frame-used 淘汰。**注意它的 wgpu 后端目前只有可分离 Gaussian，dual Kawase 还是 TODO**。⚠️ **GitHub 主页 404——但源码可从 crates.io CDN 直接取**：`https://static.crates.io/crates/backdrop-blur-wgpu/backdrop-blur-wgpu-0.2.0.crate`（已验证可下载解包） |
 | **Bevy render graph** | MIT/Apache ✅ | 阶段划分词汇表 + 异步 PipelineCache（§9.11）。不引入依赖 |
@@ -1050,6 +1145,23 @@ pub struct LiquidGlass {
 
 注意它的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），**不是可直接使用的文件**——移植的是数学，不是文件。
 
+### 14.5 不可用清单（无 license = 保留所有权利）
+
+| 仓库 | 说明 |
+|---|---|
+| **`Jason-JP-Yang/Reimagined-Glass`** | **NONE-DECLARED**。且上游 `Muggleee/liquid-glass` 同样无 license——**双重 provenance 问题**。0 star、JavaScript、最后 push 2026-08-01。**§9.10 的 SDF 通用化推导源自对该仓库的阅读，但不得复制其代码** |
+| `naughtyduk/liquidGL` | **无 license**（897★）。虽有完整 GLSL/WGSL 折射实现，不可用 |
+| `BarredEwe/LiquidGlass` | **无 license**（202★）。Metal 折射 + 快照背景捕获，不可用 |
+
+**这三条是 §14.1 红线的具体落点。** 前两条尤其危险——它们功能完整、star 数不低、看起来"就是我们要的东西"，但**没有 license 文件就意味着作者保留全部权利**，抄进闭源产品是法律风险。
+
+**遇到「仓库没 license 但代码很诱人」时的正确做法：**
+
+1. 先看它的算法是否有**许可干净的同类上游**（本例：Kyant0 是 Reimagined-Glass 那类实现的公共祖先，且是 Apache-2.0）
+2. 记下**算法思路**（事实性知识），自行实现
+3. **不要复制任何代码文本**，包括 shader 注释里的公式写法
+4. 若该仓库本身是从别处 fork/移植的，**追它的上游 license**——上游干净的话，走上游（本例：`Muggleee/liquid-glass` 也不干净，所以只能走 Kyant0）
+
 ---
 
 ## 15. 未定项
@@ -1058,7 +1170,11 @@ pub struct LiquidGlass {
 
 ### 15.1 待补充的调研
 
-- **`glass-research` 的第二轮结论未回**：Apple 官方对 Liquid Glass 视觉成分的正式定义、`iyinchao/liquid-glass-studio`（MIT，WGSL + GLSL，物理折射 Snell + Fresnel）与 Kyant0 路线在视觉/性能上的取舍对比、纯模糊工程参考（`backdrop-blur-wgpu` 之外的）的补充。**这些不影响动工**——§9.10 已有足够信息启动 M4。
+调研已基本收口。以下为仍在等待的补充项，**均不阻塞动工**：
+
+- **纯模糊的「捕获时机」与「失效策略」** —— `render-research` 已覆盖 own-loop 架构、Backdrop-Root rule、per-region cache、damage tracking 的接法，但**捕获时机**与**失效策略**两点讲得较粗。我们自己的方案见 §9.7，若补充材料有更优解再修订
+- **「走启发式而非物理折射」在保真度（不只是性能）上的依据** —— §9.10 目前只有性能论证；Apple 的「digital meta-material」定性（§9 开头）在方向上支持这个选择，但缺少直接的保真度对比材料
+- **§9.12 的架构推论待核验** —— 「own-loop + Backdrop-Root 天然满足 glass-cannot-sample-glass」是基于架构的推论，逻辑自洽但未经第二方确认
 
 ### 15.2 需要在实施中验证的假设
 
