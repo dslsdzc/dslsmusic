@@ -140,7 +140,7 @@ dslsmusic/
 | 平台层 | **SDL3** | 提供 window / input / IME / popup / 移动端生命周期。IME 与 popup 都已验证可用（见 §11）。所有 SDL 调用包在 `platform/` trait 后面，应对 `sdl3` crate pre-1.0 风险 |
 | 渲染层 | **wgpu** | 否决 `SDL_GPU`：SDL 官方对 Android 的 Vulkan feature 要求态度是「Android will almost certainly hate this」，有人建议直接放弃 Android。wgpu 有 GLES 3.0 后端可兜底 Android；naga 是 Rust 原生 shader 工具链（写 WGSL，无 DXC / SPIRV-Cross 的 C 依赖）；且是 1.x 成熟生态 |
 | UI 模式 | **retained mode** | 否决 immediate mode（egui 式）：播放器需要动画状态、滚动状态、focus、文本选择、列表虚拟化、持久组件状态，immediate mode 全都做不了 |
-| 文本引擎 | **待定**（见 §15.1） | 候选：parley vs cosmic-text + glyphon。原定 parley，但其配套渲染器 vello 已被否决 |
+| 文本引擎 | **parley**（布局）+ **swash**（纯光栅化） | 见 §7.2。**不用 glyphon** |
 | 音频解码 | **symphonia** | 纯 Rust，mp3 / aac / flac / ogg / wav 全覆盖。格式不够用时换 ffmpeg 绑定，走 `dsls-audio` 抽象 |
 | 音频输出 | **cpal** | 独占模式 / bit-perfect 是发烧友需求，v1 不做，抽象留入口 |
 | 存储 | **SQLite + rusqlite** | 不引入 ORM |
@@ -401,13 +401,100 @@ ui-widgets   一套，不知道设计系统存在
 
 `ui-text` 必须为逐字歌词保留**字形级位置 + 时间轴**的输出——这是歌词组件的基础，不能等做歌词时才发现文本引擎给不了。
 
-### 7.2 文本引擎
+### 7.2 文本引擎：parley 做布局，swash 做光栅化
 
-**待定**，见 §15.1。
+**结论：parley 做布局层，glyphon 不用，swash 只当纯光栅化器。**
 
-约束条件：Rust + wgpu 自研渲染 + 需要逐字歌词的字形级定位 + 需要 CJK 断行 + 要跨 GLES 后端。
+**parley 可以脱离 vello 单独使用**——最硬的证据是 Slint 的 issue #9559：Slint 明确计划把 **FemtoVG、Skia、Qt 三个渲染器全部重构到 parley 上**，而这三个渲染器没有一个是 vello。parley 在其中的职责只有 line breaking、fallback font discovery、ellipsis、selection/cursor 边界计算；每个渲染器只保留「加载字体 / 渲染字形 / 渲染选区 / 渲染光标」四件事。
 
-**不要自己写文本引擎。** CJK 断行禁则、bidi、字形级定位是深坑，这是自研 UI 里唯一不该自研的部分。
+parley 的四大依赖**没有任何渲染相关的东西**：
+
+| 依赖 | 职责 |
+|---|---|
+| `fontique` | 字体枚举 + 字体回退（跨 Unicode 区段的 run → font 匹配） |
+| `HarfRust` | HarfBuzz 的 Rust 移植，shaping |
+| `skrifa` | TrueType/OpenType 解析 → 缩放后的带 hint 矢量轮廓 |
+| `ICU4X` | locale、bidi、segmentation、emoji、NFC/NFD |
+
+注意 **swash 已被 skrifa 取代**，不在 parley 依赖里（我们仍然用它做光栅化，见下）。
+
+**parley 输出什么 / 不输出什么：**
+
+- **输出**：每字形的 x/y/advance（**保留小数**）、每字形的 font + font_size + synthesis 标志、字形轮廓（矢量路径）、**cluster → 文本字节范围的映射**、selection/cursor 几何
+- **不输出**：**不做任何光栅化**（不出位图、不出纹理）、不碰 GPU、不出 coverage mask
+
+**为什么这一层必须自己写：** 这个项目里唯一不该自研的是**文本整形和断行**，而 parley 正好把这两件事包完了。剩下的「字形 → 像素」是渲染器的事，我们本来就在写渲染器。
+
+#### 为什么不用 glyphon
+
+**glyphon 是阻碍而非帮助。** 它的抽象是「把这个 `Buffer` 画出来」，而逐字歌词要求的逐字形颜色动画必须写进 `Buffer` 的 attrs——**改 attrs 会触发重新 shaping**。要么每帧 re-shape（贵），要么绕过 glyphon 直接用它的 atlas（那 glyphon 就只剩 atlas 管理这点价值）。
+
+**glyphon 为静态文本而生，逐字动画的抽象层级不对。**
+
+#### 逐字歌词的用法（shape 一次，每帧只重建 instance）
+
+逐字歌词每帧变化的只是「每个字形的颜色/透明度/裁剪进度」，**几何完全不变**。parley 天然支持这个模式：
+
+```rust
+let mut builder = layout_cx.ranged_builder(&mut font_cx, text, scale,
+                                           /* quantize */ false);  // ← 必须 false
+builder.build_into(&mut layout, text);
+layout.break_all_lines(None);
+layout.align(None, Alignment::Start);
+
+// 每帧只迭代，不重新 shape
+for line in layout.lines() {
+    for item in line.items() {
+        if let PositionedLayoutItem::GlyphRun(run) = item {
+            let mut x = run.offset();
+            let y = run.baseline();
+            for g in run.glyphs() {
+                let gx = x + g.x;
+                let gy = y - g.y;   // 注意 g.y 符号约定相反
+                // → 塞进 instance buffer
+                x += g.advance;
+            }
+        }
+    }
+}
+```
+
+`quantize = false` **保留小数位置是必须的**——否则亚像素抖动会让字形在动画中跳动。
+
+cluster 映射用 `Cluster::text_range()` / `Cluster::glyphs()`，「第 N 到第 M 个字符高亮」可精确映射成屏幕 x 区间，做渐变扫过或裁剪直接可用。
+
+#### CJK 断行的真实差异
+
+| | 断行实现 | 能力 |
+|---|---|---|
+| parley | **ICU4X `icu_segmenter`** | 完整 UAX #14 + **locale tailoring**，支持 CSS `line-break: strict/normal/loose` 对应的 BCP47 扩展，覆盖泰语/高棉语/老挝语的词典式断行 |
+| cosmic-text | `unicode-linebreak` | UAX #14 默认规则，约等于 CSS `line-break: normal` |
+
+**纯中/日文歌词两者都够**——CJK 禁则由 UAX #14 的 CL/OP/NS 类别覆盖。但音乐库大概率有日韩多语言混排，日文歌词要 `line-break: strict` 时只有 parley 能 tailoring。**这个差异是真实价值。**
+
+#### GLES 约束的交叉验证（好消息）
+
+**文本方案与「blur 走 fragment」零冲突。**
+
+字形上传走 `Queue::write_texture`——这是 **copy 类操作，在所有后端都可用，包括 GLES 3.0 / WebGL2**。会依赖 compute 的是「GPU 端字形光栅化」那条路（vello 的 compute 渲染器、pathfinder 风格），**我们不走那条路**。
+
+反过来说：如果当初选了 vello 那种 compute 光栅化，GLES 后端就直接出局了。这是一个正向的交叉验证。
+
+#### 光栅化器选择
+
+1. **swash 当纯光栅化器（推荐起步）** —— `swash::FontRef::from_index(font_data, 0)` 直接从原始字体数据构造，`Scaler` 出 `SwashImage`，完全不关心布局。代价是字体被解析两遍（parley 用 skrifa 一遍、swash 一遍），实测影响很小
+2. **skrifa 轮廓 + `zeno`** —— swash 同一作者的纯 Rust 2D 路径光栅化库，架构更干净（skrifa 已出带 hint 的轮廓直接喂进去，无重复解析）。更小众
+3. **skrifa 轮廓 + 自己写 coverage 光栅化** —— 控制力最强，工作量最大
+
+#### 五条实施要求
+
+1. **`FontContext` / `LayoutContext` 跨帧存活**，不要每帧重建
+2. **建 `TextLayoutCache`**：文本 + 样式 → parley `Layout`。只在文本/样式/换行宽度变化时重建
+3. **每帧从 cache 生成字形 instance**：`glyph_id` + 位置 + 颜色/进度 → instance buffer。逐字歌词的「当前时间 → 哪些字已高亮」在这一步转成每 instance 的 `color` / `clip_progress`
+4. **加一层中立类型做风险隔离** —— 在 parley 与渲染器之间放我们自己的 `LaidOutText` / `Line` / `GlyphInstance`。这样万一 parley 出问题，换 cosmic-text 只改适配层。**成本极低，必须加**
+5. **CI 里验证 peniko 版本兼容** —— linebender 全家桶（parley / fontique / skrifa / peniko / vello）版本联动紧。parley 唯一的外部耦合是 `StyleProperty::Brush` 用 `peniko::Brush`（纯类型 crate，无 GPU 依赖，可接受）
+
+**Plan B（如果 parley 出问题）：** cosmic-text 做布局（`Buffer::layout_runs()` 取逐字形 x/y）+ **自己写 atlas 和 pipeline**（跳过 glyphon），只损失 ICU4X 的 locale tailoring。这是第 4 条中立类型层值得加的原因。
 
 ### 7.3 图元层
 
@@ -533,6 +620,7 @@ compute 留给 fragment 做不了的事（前缀和、GPU culling）。
 - **层数**：`levels = floor(log2(min(w, h)))`，实践取 4–6 级。Hyprland 的经验是 **3–4 passes + 较大 radius 就够**，pass 越多越耗电（笔记本上是电池问题）
 - **必须 clamp passes 到 1–8**：Hyprland 的 `decoration:blur:passes` 没做校验，≥63 会导致**有符号位移溢出和除零 UB**
 - **半径 vs passes**：模糊量 ≈ `size × passes`。单次 offset 太大（`size > 5`）会出现块状 artifact，**加大 passes 比加大 size 更安全**。`1px` 以下的 sample 完全无意义
+- **vibrancy / saturation 在降采样 pass 里逐级施加，不是最后统一施加**（Hyprland 的非显然技巧）。让饱和色逐 pass 扩散生长，避免 banding；每级除以 `1.0 / passes`。参考实现：Hyprland `src/render/shaders/glsl/blur1.glsl`
 
 ### 9.6 格式与生命周期
 
@@ -584,9 +672,97 @@ CSS 做折射必须「在面板里放一份对齐的背景副本再对它做 fil
 
 关键参数：`refraction_height` / `refraction_amount` / `depth_effect` / `chromatic_aberration` / `highlight` / `edge_width` / `tint`。
 
-**实施路径：** 从上游 Kyant0 移植算法（Apache-2.0，需保留署名），以 `ExtraBinoss/argui` 的 WGSL 移植作为**翻译参考**——它已经趟过一遍（预乘 alpha 处理、法线退化防护、边界采样 clamp）。
+#### 必须做的一步通用化
+
+Kyant0 的原始偏移公式**只对圆形成立**：
+
+```glsl
+vec2 offset = mix(vec2(0), normalize(st) / sd, length(st));
+```
+
+对圆形，`normalize(st)` 恰好等于 `∇sd`，`length(st)` 恰好等于 `sd + R`。**但对圆角矩形，角的偏差可达 45°**；方形角上方向与法线分歧最大 45°，而且硬编码的 `sdCircle` 高光还是圆的。
+
+必须做四处替换，把它通用化到任意形状（超椭圆、blob、morph blend、拉伸实例）：
+
+```glsl
+vec2  n  = normalize(∇f);                        // 原为 normalize(st)
+float sd = f / |∇f|;                             // 任意场 → 度量距离
+float w  = clamp(sd + inradius, 0, inradius);    // 原为 length(st)
+vec2 offset = n * (w / sd);                      // 圆形下与原始公式恒等
+```
+
+- **法线**：4-tap 中心差分同时给出精确法线和梯度模长 `|∇f|`，**零额外成本**
+- **深度/厚度**：除以 `|∇f|` 把任意场统一成度量距离，折射强度无需逐形状调参
+- **厚度 ramp**：`clamp(sd + r, 0, r)`，`r` = 最大内切圆半径
+- **形状用距离场而非二值 mask**——「距边缘多远」是连续量，折射和抗锯齿都要它
+
+#### 三个真实踩过的坑
+
+1. **`1/sd` 在边缘梯度无界 → 色差不能用比例分配。** 基础 offset 在边缘像 `1/sd` 爆炸，按百分比拆 RGB 会糊成彩虹。**必须解析推导屏幕空间 footprint（`amp·re·px/sd²`），再显式选 mip 级别（`textureLod`）。** 动态控制流下隐式导数是坏的，会强制 `textureLod`。对无界梯度 point sample，无论怎么超采样都有彩色噪点。
+
+2. **中轴线接缝。** 最近边界点切换处（方形对角线、任意形状中轴线、多边形角）精确法线不连续翻转，一个像素宽的差分就渲染出硬线。**解法：stencil 宽度随形状缩放而非固定像素（默认取内切半径的 5%）**，把硬线变成等宽平滑旋转——轮廓在 `f == 0` 处，加宽 stencil 不损精度。这同时消除 SDF 贴图的双线性刻面。方形对角线上的接缝物理上真实，圆角会把中轴线内推从而消除。
+
+3. **offset 在 aspect-scaled 空间算、却应用到裸 UV**，会被宽高比拉伸。mipmapped 边缘采样必须 `textureLod`。
+
+#### 高光与 Fresnel
+
+- **Fresnel / 边缘高光**：`dot(n, lightDir)` 调制贴边高光带 + 约 2px 镜面唇边。通用化后不能用硬编码的 `sdCircle` 高光，要用边界带 + 法线夹角
+- **边缘反射带**：约 `0.35 · minDim`，平方 falloff，模拟玻璃胶囊上下端的倒影回声（iOS 26 的观感）
+- **`axisFade`**：`smoothstep(0.15, 0.8, conf)`，作用是在 SDF 梯度塌缩的中轴线处消除接缝
+- **lens profile**：`bend = rim * rim * axisFade`，**平方 falloff**——折射几乎只发生在边缘环带
+
+#### Apple 的实现要点（作为「像不像」的基准）
+
+- Liquid Glass **偏好凸形 profile**（Switch 组件除外）——凹面会把光线推到玻璃外部，需要采样物体之外的背景
+- 折射遵循 **Snell–Descartes** `n1·sin(θ1) = n2·sin(θ2)`，玻璃 n2 = 1.5
+- 因旋转对称，位移量只需在一条 2D 半切片 (x,z) 上按「距边界距离」预计算一次，再绕 z 轴旋转
+- **一个半径需要 127 次光线模拟**（受 SVG displacement map 分辨率限制）
+- 若预烘焙 displacement map：`RG = 128 + Normal × 127`，B 固定 0，A 固定 255（零向量 = RGBA(127,127,0,255)）；所有向量除以最大位移模长归一化，另存 `maximumDisplacement` 还原
+
+#### 实施路径
+
+**从上游 Kyant0 移植算法**（Apache-2.0，需保留署名），以 `ExtraBinoss/argui` 的 WGSL 移植作为**翻译参考**——它已经趟过一遍（预乘 alpha 处理、法线退化防护、边界采样 clamp）。
 
 **注意：** argui 的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），不是可直接使用的文件。但数学部分只有约 40 行，移植到我们自己的 shader ABI 上是几天的工作量。
+
+**最该精读的文档：`Jason-JP-Yang/Reimagined-Glass` 的 README** —— 通用 SDF 法线/厚度/offset 的完整推导 + 中轴线接缝 + mip 选择的踩坑记录，玻璃 shader 部分的第一参考资料。
+
+### 9.11 pass 编排：手写，不引入框架
+
+**结论：手写 200–300 行的 pass graph**（对资源依赖做拓扑排序 + cycle 检测）就够了。
+
+被否决的选项：
+
+| 项目 | 否决原因 |
+|---|---|
+| `engawa` / `engawa-wgpu` | v0.1.1，**compute / blit pass 和 MRT 都还没实现**，零生态验证。设计干净值得读，但不能依赖 |
+| `rend3` | 标注 "MAINTENANCE MODE"，0.3.0 是 3–4 年前的版本。有反馈说它 "owns the event loop"、与 winit 冲突、内部单队列导致复杂场景掉到 ~10 FPS |
+| `bevy_render` | 生产可用，但引入 bevy 太重。**只借它的词汇表和机制** |
+
+#### 借 bevy 的阶段划分
+
+```
+Extract（主世界 → 渲染世界的唯一接触点）
+  → Prepare（创建 GPU 资源、触发 pipeline 编译）
+  → Queue（按 camera 构建 PhaseItems）
+  → PhaseSort
+  → Render（执行 pass graph）
+  → Cleanup
+```
+
+#### 必须照抄的一个机制：异步 PipelineCache
+
+一个 `wgpu::RenderPipeline` 对应 material × mesh layout × shader 特化。**未就绪的 pipeline 当帧跳过、下帧重试。**
+
+这直接解决「首次出现新材质时的掉帧」——对我们是首次出现新玻璃效果、新字形样式、新封面格式时的卡顿。**必须照抄。**
+
+#### 一个必须知道的前提（对 backdrop cache 尤其关键）
+
+> **wgpu 官方没有文档化 pass 的时序 / 并发 / 同步保证**（issue #6273）。
+
+同一个 command buffer 里的两个 render pass，如果 pipeline 之间没有依赖，**可能并发执行**。
+
+因此**任何跨 pass 的隐式假设都必须显式建模成资源依赖**。对我们的 backdrop cache 尤其重要：**读 scene texture 的 blur pass 和写 scene texture 的图元 pass 之间必须有显式依赖边**，不能靠提交顺序隐式保证。
 
 ---
 
@@ -718,12 +894,21 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 | 库 | 许可 | 用途 |
 |---|---|---|
+| `wgpu` | MIT/Apache-2.0 | 渲染层（无争议） |
+| `parley` | MIT/Apache-2.0 | 文本 shaping / layout（`parley_emoji` 是 MIT only） |
+| `swash` | MIT | 纯字形光栅化（见 §7.2） |
+| `etagere` | MIT/Apache-2.0 | atlas packing |
+| `lyon` | MIT/Apache-2.0 | **按需**——只在真需要任意贝塞尔路径填充/描边时引入。它不做抗锯齿 |
 | `ncm-api-rs` | WTFPL | 网易云接口 + eapi 加密 |
-| `ttml_processor` | MIT | TTML 逐字歌词解析（需 pin 版本，作者自述 unstable） |
+| `ttml_processor` | MIT | TTML 逐字歌词解析（**需 pin 版本**，作者自述 unstable） |
 | `symphonia` | MPL-2.0 | 音频解码 |
 | `cpal` | Apache-2.0 | 音频输出 |
 | `rusqlite` | MIT | 数据库 |
 | `lofty` | MIT/Apache-2.0 | 本地音乐标签与封面 |
+
+**明确不依赖的：** `glyphon`（见 §7.2）、`vello`、`femtovg`、`slint`、`engawa`、`rend3`。
+
+**版本联动风险：** linebender 全家桶（parley / fontique / skrifa / peniko / vello）版本联动较紧，CI 里要提前验证兼容。
 
 ### 14.3 读源码抄思路（不看代码，看设计）
 
@@ -738,6 +923,12 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **app_rhyme / music_api** | MIT/Apache ✅ | 音源层做成独立 crate 的范例 |
 | **Kyant0/AndroidLiquidGlass** | Apache-2.0 ✅ | **折射算法源**（§9.10） |
 | **argui** | MIT/Apache-2.0 ✅ | WGSL 移植参考、`argui-layout/src/paint/effects.rs` 看 effect 怎么接进 paint 流程 |
+| **Reimagined-Glass** | 见仓库 | **玻璃 shader 第一参考资料**：通用 SDF 法线/厚度/offset 推导 + 中轴线接缝 + mip 选择（§9.10） |
+| **Hyprland** `src/render/shaders/glsl/blur1.glsl` | GPL ⚠️ | dual Kawase 降采样参考实现 + **vibrancy/saturation 逐级施加**的技巧（§9.5）。**只读思路** |
+| **`backdrop-blur-wgpu`** | — | **最贴近我们需求的架构参考**：两阶段 `prepare` → `record` 的 seam trait（因为 wgpu 走 Queue 上传而 glow 是 immediate mode）、按 target format 懒建 pipeline、sRGB 拒绝、Backdrop-Root rule、last-frame-used 淘汰。**GitHub 主页 404，只抄设计不依赖**。注意它的 wgpu 后端目前只有可分离 Gaussian，dual Kawase 还是 TODO |
+| **Bevy render graph** | MIT/Apache ✅ | 阶段划分词汇表 + 异步 PipelineCache（§9.11）。不引入依赖 |
+| **SIGGRAPH 2015** Marius Bjørge "Bandwidth-Efficient Rendering" + three.js PR #33920 | — | dual Kawase 原始出处与工程数据（§9.2） |
+| **Slint** box shadow 缓存 | GPLv3 ⚠️ | `SkiaBoxShadowCache` / `FemtovgBoxShadowCache` 的模糊纹理复用思路。**只读思路不抄代码** |
 
 ### 14.4 关于 argui 的重要说明
 
@@ -751,25 +942,21 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 ## 15. 未定项
 
-### 15.1 文本引擎：parley vs cosmic-text + glyphon
+**技术选型已全部落定。** 仅剩以下非阻塞项。
 
-**状态：待调研结论。**
+### 15.1 待补充的调研
 
-约束：Rust + wgpu 自研渲染 + 需要逐字歌词的字形级定位 + 需要 CJK 断行 + 要跨 GLES 后端。
+- **`glass-research` 的第二轮结论未回**：Apple 官方对 Liquid Glass 视觉成分的正式定义、`iyinchao/liquid-glass-studio`（MIT，WGSL + GLSL，物理折射 Snell + Fresnel）与 Kyant0 路线在视觉/性能上的取舍对比、纯模糊工程参考（`backdrop-blur-wgpu` 之外的）的补充。**这些不影响动工**——§9.10 已有足够信息启动 M4。
 
-已知的取舍线索：
+### 15.2 需要在实施中验证的假设
 
-- **parley** 是 Linebender 的文本引擎，但其配套渲染器 **vello 已被否决**
-- **cosmic-text + glyphon** 提供了完整的 wgpu 路径：cosmic-text 的 shaping 后端已从 rustybuzz 换成 **HarfRust**，光栅化交给 swash；**glyphon 渲染到「已存在的 render pass」**（遵循 wgpu wiki 的 middleware 模式），不额外开 pass，这对我们很友好。MSRV 1.92
-- 附带约束：**glyph atlas 上传不能用 compute**（因为 GLES 后端没有 compute shader，见 §9.4）
-
-待确认：parley 脱离 vello 单独用是否可行、它的字形级输出能否支撑逐字高亮动画。
-
-### 15.2 其他待定
-
-- 玻璃 shader 的完整实现细节（调研进行中）
-- render graph / pass 编排的具体形态（调研进行中）
-- `glass-research` 的完整结论（Apple 官方对 Liquid Glass 的视觉成分定义、更多实现的取舍）
+| 假设 | 验证时机 | 万一不成立的退路 |
+|---|---|---|
+| SDL3 → `raw-window-handle` → wgpu 在 Linux 可行 | **M0** | 桌面端退到 winit（移动端仍留 SDL3） |
+| 同上，在 **Android** 可行（走 SDL3 window properties 拿 `ANativeWindow`） | M0 之后尽早 | 需要实测，暂无干净退路——**这是最大的未验证风险** |
+| parley 与渲染器的中立类型层能挡住 parley 的变动 | M3 | 换 cosmic-text，只改适配层（§7.2 第 4 条） |
+| `ncm-api-rs` 的 eapi 加密正确 | M1 | 对照 `Cloud370/ncm-rs` / `ddy314/netease-music` 交叉验证；最坏情况自己 vendor 加密实现 |
+| damage tracking 的收益值得复杂度 | M4 | backdrop cache 退化成「每帧全量重算 + last-frame-used 淘汰」 |
 
 ---
 
@@ -788,3 +975,6 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | v1 歌词 | amll-ttml-db 打底 | 只走网易云 yrc | 一个 GET 拿到逐字 TTML，不碰接口、不需登录、效果更好 |
 | 音源抽象 | 独立 crate + 本地文件第二实现 | 只留 trait 边界 / 插件 ABI | 单一实现的抽象大概率是错的；插件 ABI 是大工程 |
 | 主题 | Glass 完整 + M3E 薄版 | 只做一套 / 两套都完整 | 薄版只需实现 ①②③ 三个差异点即可压弯抽象 |
+| 文本引擎 | parley + swash | cosmic-text + glyphon / 自研 | parley 原生给「保留小数的逐字形 x/y/advance + cluster 映射」，正是逐字歌词要的；glyphon 的 Buffer 抽象在逐字动画下属层级错误 |
+| 文本光栅化 | swash（纯光栅化器） | skrifa + zeno / 自己写 | 能用，代价是字体解析两遍（实测影响很小） |
+| pass 编排 | 手写 200–300 行 | engawa / rend3 / bevy_render | engawa v0.1 未实现 compute/blit；rend3 维护模式；bevy 太重。只借 bevy 的阶段词汇表与异步 PipelineCache |
