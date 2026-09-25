@@ -599,16 +599,31 @@ pub trait DesignSystem {
 
 **SwiftUI API 面**（供理解语义，我们不复刻 API）：`glassEffect(_:in:)`、`glassEffectID(_:in:)`、`GlassEffectContainer`、`.interactive()`、`.buttonStyle(.glass)`、`.containerConcentric`（配 `ConcentricRectangle`，**圆角同心而非硬编码半径**）。注意 `glassEffect()` 必须放在 modifier 链**最后**。
 
-#### 没人做对的四件事（差异化空间）
+#### 开源实现的覆盖度：Kyant0 是唯一覆盖到第 3 层的
+
+> **更正：** 早先版本的本文档写过「开源实现全都只做了第 1 层和第 2 层的一部分，第 3、4 层是空白」。**这句是错的**，经直接核查源码后更正如下。
+
+| Apple 的四层 | `Kyant0/AndroidLiquidGlass` | 证据 |
+|---|---|---|
+| 1. Lensing | ✅ | `effects/Lens.kt` + `RoundedRectRefractionShaderString` / `...WithDispersionShaderString`（七通道色散） |
+| 2. Highlights | ✅ | `highlight/` 完整模块：`Highlight(width, blurRadius, alpha, style)`，三种样式 `Default` / `Ambient` / `Plain`；shader 有 `angle` / `falloff` uniform |
+| 3. Shadow / grounding | ✅ | `shadow/` 模块：`Shadow(radius, offset, color, alpha, blendMode)` + `InnerShadow` |
+| 4. Interaction illumination | ❌ | 未见（这层需要触摸输入集成，库层面做不了） |
+
+另外 **`CombinedBackdrop`（`rememberCombinedBackdrop` 系列）就是 Apple `GlassEffectContainer` 的对应物**——即「glass cannot sample glass」的现成解法。
+
+**结论：Kyant0 是开源里唯一覆盖到第 3 层的实现，这就是它还原度最高的原因。** 一般性的「开源只做对第 1 层」结论对 Web/JS 那批成立，对 Kyant0 不成立。
+
+**对我们的影响：移植范围要相应扩大**，见 §9.10。
+
+#### 仍然是空白的地方
 
 1. **背景明暗自适应** —— 且必须遵守「只翻转小元件」的规则
-2. **glass-cannot-sample-glass 的合成** —— 相邻玻璃合并为一次采样
-3. **shadow / grounding 层** —— 阴影随背后内容变化，而不是固定投影
+2. **glass-cannot-sample-glass 的完整合成语义** —— Kyant0 有 `CombinedBackdrop` 这个机制，但「什么情况下必须合并」的判定规则仍需自己定
+3. **shadow / grounding 的「感知背后内容」** —— Kyant0 的 `Shadow` 是固定参数投影，不是随背后内容变化的那种
 4. **触摸内发光及其向相邻元件的蔓延**
 
-**开源实现全都只做了第 1 层（Lensing）和第 2 层的一部分，第 3、4 层是空白。**
-
-这意味着两件事：一是我们**不可能通过抄开源实现在保真度上胜出**（抄到的只有一半）；二是第 3、4 层是**真正能拉开差距的地方**，但也是需要自己设计的部分。**v1 的目标是先做扎实第 1、2 层，第 3、4 层列入 v2 候选。**
+第 3、4 项是真正需要自己设计的部分。**v1 目标：做扎实第 1、2 层，移植第 3 层的基础形态，第 4 层列入 v2。**
 
 ### 9.1 own-loop：唯一干净的捕获方案
 
@@ -998,9 +1013,46 @@ outColor = mix(outColor, vec4f(linearTint + vec3f(fres * 0.2), 1.0), fres);
 
 在线性 RGB 里给 tint 加量，而不是抬高感知亮度。视觉差异是 LCH 版在不同色相上提亮更均匀、RGB 版会把高饱和色更快推向白——但这里 `fresnelFactor` 被 clamp 到 [0,1] 又乘了 0.7，是边缘一圈的细微高光，**肉眼看不出差别**。
 
-#### 实施路径
+#### 实施路径：从 Kyant0 移植
 
-**从上游 Kyant0 移植算法**（Apache-2.0，需保留署名），以 `ExtraBinoss/argui` 的 WGSL 移植作为**翻译参考**——它已经趟过一遍（预乘 alpha 处理、法线退化防护、边界采样 clamp）。
+**`Kyant0/AndroidLiquidGlass` 是本项目玻璃效果的主移植源。**
+
+**它为什么可信（不是「年轻项目」）：**
+
+| 项 | 值 |
+|---|---|
+| Star / Fork / Issues | 3922 / 316 / 35 open |
+| License | **Apache-2.0** ✅ |
+| 创建 / 最后推送 | 2025-06-18 / 2026-08-26（**超过一年，仍在维护**） |
+| 版本纪律 | Maven Central 发布，release 从 1.0.2 到 **2.0.1**，十余个版本 |
+| 平台 | **Compose Multiplatform**（默认分支 `kmp`）——有 `androidApp/` 与 `iosApp/` 两个壳 |
+| 文档 | 独立 GitBook 文档站 |
+| 定位 | 底层库，**明确不含高层组件**（与我们的定位一致） |
+
+**三套 source set，两种 shader 方言：**
+
+```
+backdrop/src/commonMain/   ← 共享逻辑 + Shaders.kt（shader 源）
+backdrop/src/androidMain/  ← AGSL（Android RuntimeShader）
+backdrop/src/skikoMain/    ← SkSL（Compose Multiplatform 的 Skia 后端，覆盖 iOS/桌面）
+```
+
+**⚠️ 关键约束：AGSL 和 SkSL 都是 Android/Skia 专属，我们用不了。** 我们是 wgpu，shader 必须重写成 **WGSL**。**移植的是数学，不是文件。**
+
+#### 移植清单
+
+| Kyant0 模块 | 内容 | 我们的目标 |
+|---|---|---|
+| `internal/Shaders.kt` | `RoundedRectSDF`、`RoundedRectRefractionShaderString`、`...WithDispersionShaderString` | `shaders/glass.wgsl` |
+| `internal/Shaders.kt` | `DefaultHighlightShaderString`、`AmbientHighlightShaderString`（`angle` / `falloff`） | `shaders/highlight.wgsl` |
+| `effects/Lens.kt` | 折射参数封装 | `theme-glass` 参数层 |
+| `highlight/` | `Highlight(width, blurRadius, alpha, style)`，三种样式 | `theme-glass` 高光层 |
+| `shadow/` | `Shadow(radius, offset, color, alpha, blendMode)` + `InnerShadow` | `theme-glass` 阴影层 |
+| `backdrops/CombinedBackdrop.kt` | `rememberCombinedBackdrop` 系列 | **对应 Apple `GlassEffectContainer`**，见 §9.12 |
+
+**以 `ExtraBinoss/argui` 的 WGSL 移植作为翻译参考**——它已经趟过一遍（预乘 alpha 处理、法线退化防护、边界采样 clamp），且许可同样是 Apache-2.0。
+
+**注意 `internal/Shaders.kt` 只有 6.4 KB** —— 整个移植源比想象的小得多。这是 M4 可控的原因。
 
 **注意：** argui 的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），不是可直接使用的文件。但数学部分只有约 40 行，移植到我们自己的 shader ABI 上是几天的工作量。
 
@@ -1179,7 +1231,7 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **M1** | 网易云登录（扫码）+ 搜索 + 取流 + 出声 | **能用最丑的方框听到歌** |
 | **M2** | 本地文件 provider + 抽象被两个实现压过 | provider trait 定型 |
 | **M3** | UI runtime：树 / 布局 / 文本 / 滚动 / 手势 / 动画 | 列表页能滚、能点、动画能跑，中文正常显示，IME 可用 |
-| **M4** | 玻璃管线在播放页跑通 | 玻璃折射和高光达到预期效果 |
+| **M4** | 玻璃管线在播放页跑通（移植 Kyant0 的折射 + 高光 + 阴影三层） | 玻璃折射、高光、阴影达到预期效果 |
 | **M5** | 逐字歌词 + 导航转场 | 播放页完整 |
 | **M6** | M3E 薄版 + 热切换 | `DesignSystem` 抽象定型 |
 
