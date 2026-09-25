@@ -21,6 +21,7 @@
 - **登录只做只读路径**（扫码 / UID），**绝不调用签到、打卡、云盘上传类接口**（设计文档 §4.4）。
 - **音频回调线程内禁止分配内存、加锁、IO**（设计文档 §16.2）。
 - 平台：Linux（Wayland/niri）为主，**无 X11 退路**。
+- **本项目是 GPLv3** —— 因此 GPL-3.0 / AGPL-3.0 的参考实现**可用**（此前被错误否决），但**非商业许可（如 PolyForm NC）与 GPLv3 不兼容，绝不可用**；无 license 的同样不可用（§14.1）。
 
 ---
 
@@ -95,7 +96,7 @@ members = ["crates/platform", "app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 # ── 平台层 ──
@@ -113,7 +114,7 @@ env_logger = "0.11"
 
 **注意 `sdl3` 的 feature 必须显式写 `raw-window-handle`** —— 它的 `default = []`。
 
-- [ ] **Step 2: 固定工具链**
+- [ ] **Step 2: 固定工具链 + 放 GPLv3 许可证**
 
 `rust-toolchain.toml`：
 
@@ -122,6 +123,14 @@ env_logger = "0.11"
 channel = "stable"
 components = ["rustfmt", "clippy"]
 ```
+
+再创建仓库根的 `LICENSE`，**内容是 GPLv3 全文**：
+
+```bash
+cp /usr/share/common-licenses/GPL-3 LICENSE
+```
+
+**若该文件不存在，报告 BLOCKED**——GPLv3 是法律文本，**不要凭记忆写一份**。
 
 - [ ] **Step 3: 建 platform crate 骨架**
 
@@ -2485,6 +2494,7 @@ git commit -m "feat(m1): CLI 端到端串联 —— 扫码登录 / 搜索 / 取�
 
 M0 与 M1 全部完成当且仅当：
 
+- [ ] 仓库根有 `LICENSE`（GPLv3 全文），且 workspace `license = "GPL-3.0-or-later"`
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --workspace -- -D warnings` 无告警
 - [ ] 运行 `cargo run -p dslsmusic` 弹出窗口、显示三角形、日志显示 `RenderTier: A` 且适配器**不是** llvmpipe

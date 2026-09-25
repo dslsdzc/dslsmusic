@@ -167,7 +167,7 @@ dslsmusic/
 |---|---|
 | vello | 2026 年大重构，原 compute 渲染器移入 `research/` 自称 experimental，新推的 `vello_gpu` 自称 "roughly beta quality"。**完全没有 blur / filter / layer 概念**——没有 layer 就没有背景模糊的立足点 |
 | femtovg | 功能表最对口（圆角裁剪、gaussian blur、image filter、layer + layer mask、渐变全家族），但 Features 明确写着**不支持自定义 shader**。玻璃折射插不进去 |
-| slint | license 是 GPLv3 / 商业授权三选一，闭源分发要付费 |
+| slint | ⚠️ **许可理由已作废**（我们是 GPLv3，见 §14.1）。**但技术理由独立成立**：它的渲染模型是自己的（自有 DSL + Renderer trait），而本设计需要的是对 pass 拓扑的完全控制——own-loop 捕获、共享 backdrop texture、damage tracking、RenderTier 分级（§9 / §17）。这些不是「换个后端」能拿到的，是渲染器本身的所有权问题。**结论不变，理由改为技术性。** |
 
 **结论：`ui-render` 层自己写。** 整个 Rust GUI 生态里没有一个成熟的 backdrop blur 实现（iced 的 Gaussian Blur PR #1952 找不到已发布迹象；`iced_blur` 明确标注 prototype）。这不是推测，是查证过的结论。
 
@@ -492,7 +492,11 @@ v1 的出口标准只是「能出声」，但**下面两件事的成本在 v1 �
 ### 6.2 v2：DSP 路线
 
 > **参考实现：`Adreno5/SouthsideMusic`**（17★，Python/PySide6，Windows-only）。
+>
 > **License 是 PolyForm Noncommercial 1.0.0 —— 代码不可用，只能读思路。**
+> 注意：**非商业许可与 GPLv3 不兼容**（比 GPL 更严格的限制无法被 GPLv3 吸收），
+> 所以即使本项目是 GPLv3，它仍然用不了。这与「无 license」是两类不同的障碍，
+> 结论相同。
 > 它的音频引擎是自研的（numpy/scipy + PortAudio，不用现成引擎库），有参考价值。
 
 **它值得学的地方：**
@@ -1608,15 +1612,48 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 ## 14. 参考实现与许可约束
 
-### 14.1 许可红线（硬约束——项目未来要闭源分发）
+### 14.1 许可红线
 
-| 类别 | 许可 | 义务 |
+> **⚠️ 重大更正（2026-09-26）：本项目是 GPLv3。**
+>
+> 本文档早期版本在此处写了「硬约束——项目未来要闭源分发」，并据此否决了 GPL / AGPL 代码。
+> **那个前提是错的**——用户从未说过闭源，是本文档自行假定的（源头是外部审查里的一句
+> 「按你的闭源目标」，未经核实即被采纳）。整个小节据此重写。
+
+**本项目采用 GPLv3。** 因此：
+
+| 类别 | 许可 | 结论 |
 |---|---|---|
-| **宽松许可** | MIT / Apache-2.0 / BSD / WTFPL | ✅ 可用。Apache-2.0 需保留 NOTICE + 专利授权条款；MIT / WTFPL 仅需保留版权声明 |
-| **公共领域奉献** | **CC0** | ✅ 可用。**CC0 没有法律上的署名要求**（它是公共领域奉献，不是许可）。*amll-ttml-db 在社区规范上请求署名，但那是礼节不是义务* |
-| **弱文件级 copyleft** | **MPL-2.0** | ✅ **可用于闭源程序**。MPL 是 file-level copyleft——允许 MPL 代码与专有代码组成 Larger Work，**静态链接也不触发整体开源**。义务仅限于：对 **MPL 覆盖文件的修改**需提供对应源码。**需单独跟踪 Covered Software 及其修改** |
-| **强 copyleft** | GPL / AGPL | ❌ **不可抄代码**。传染性，会把整个项目拖下水。只能读思路，且要谨慎 |
-| **无 license** | NONE-DECLARED | ❌ **不可用**。默认保留全部权利，代码和 shader 文本都不能进库 |
+| **宽松许可** | MIT / Apache-2.0 / BSD / WTFPL | ✅ 可用，且**与 GPLv3 兼容**。Apache-2.0 需保留 NOTICE |
+| **公共领域奉献** | **CC0** | ✅ 可用。**CC0 没有法律上的署名要求**（它是奉献，不是许可）。*amll-ttml-db 在社区规范上请求署名，但那是礼节不是义务* |
+| **弱文件级 copyleft** | **MPL-2.0** | ✅ 可用，且**与 GPLv3 兼容**（MPL-2.0 §3.3 把 GPLv3 列为 Secondary License） |
+| **强 copyleft** | **GPL-3.0 / AGPL-3.0** | ✅ **可用**。见下方 AGPL 说明 |
+| **非商业许可** | **PolyForm Noncommercial 等** | ❌ **不可用，且与 GPLv3 不兼容**——比 GPL 更严格的限制无法被 GPLv3 吸收 |
+| **无 license** | NONE-DECLARED | ❌ **仍不可用**。默认保留全部权利，**GPLv3 也救不了**——没有授权就是没有授权 |
+
+#### 我们是 GPLv3，所以负有义务
+
+- 分发二进制时**必须同时提供完整对应源码**
+- 修改过的文件必须保留声明、标注改动
+- 不能与 GPLv3 不兼容的许可代码链接（**PolyForm Noncommercial 正是这一类**）
+
+#### AGPL-3.0 可以吗？可以，但有一条要注意
+
+**GPLv3 §13 明确允许**把 GPLv3 作品与 AGPL-3.0 作品链接/组合成单一作品，整体按 GPLv3 分发。
+
+**但 AGPL §13 的网络条款会适用于整个组合**——即：如果用户通过网络与该程序交互，须向其提供源码。对**桌面音乐播放器而言这条基本不构成实际负担**（不提供网络服务），但若将来做 Web 版或服务端组件，就必须认真对待。
+
+#### 这解除了什么（原本被错误否决的）
+
+| 项目 | 原判 | 现判 |
+|---|---|---|
+| `Fei-xiangShi/Rustle`（AGPL-3.0） | ❌ 只读思路 | ✅ **可用**（技术栈与我们最像） |
+| AMLL（AGPL-3.0） | ❌ 只读思路 | ✅ **可用** |
+| Cider 1、SPlayer、MusicFree（AGPL-3.0） | ❌ 只读思路 | ✅ **可用** |
+| Hyprland `blur1.glsl`（GPL） | ❌ 只读思路 | ✅ **可用** |
+| Slint（GPLv3 / 商业双授权） | ❌ 许可否决 | ⚠️ **许可理由作废**，见 §3.1 |
+
+**但「可用」不等于「该抄」**——Rustle 是 27★ 个人项目、AMLL 只有一名活跃维护者，**代码质量与维护持续性仍是独立于许可的判断**。
 
 **明确标记为「不能碰代码」的：**
 
@@ -1666,8 +1703,8 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 |---|---|---|
 | **iced** `wgpu/src/quad.rs` | MIT | 图元层的正确形状（见 §3.1） |
 | **epaint** | MIT/Apache-2.0 | feathering 抗锯齿、预乘 alpha |
-| **Rustle** | AGPL ⚠️ | SDF GPU 文字做逐字歌词的可行性、弹簧参数建模、iced 里嵌自定义 shader、平台集成抽象 |
-| **AMLL core** | AGPL ⚠️ | 逐字渲染算法参数（§5.4） |
+| **Rustle** | **AGPL-3.0 ✅ 可用** | SDF GPU 文字做逐字歌词的可行性、弹簧参数建模、iced 里嵌自定义 shader、平台集成抽象。**但注意它只有 27★、是个人项目**——许可放开了，质量判断不受影响 |
+| **AMLL core** | **AGPL-3.0 ✅ 可用** | 逐字渲染算法参数（§5.4）。仅有 1 名活跃维护者 |
 | **Linn** `utils/lyric_parse.rs` | MIT ✅ | YRC 容错解析 + **测试夹具可直接复用** |
 | **termusic** | MIT ✅ | 双二进制 + Protobuf + 可插拔播放后端（跑了 5 年的成熟范例） |
 | **app_rhyme / music_api** | MIT/Apache ✅ | 音源层做成独立 crate 的范例 |
@@ -1675,11 +1712,11 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **argui** | MIT/Apache-2.0 ✅ | WGSL 移植参考、`argui-layout/src/paint/effects.rs` 看 effect 怎么接进 paint 流程 |
 | **`iyinchao/liquid-glass-studio`** | MIT ✅ | **许可干净的可抄来源**：superellipse 圆角 SDF、Fresnel（§9.10） |
 | ~~Reimagined-Glass~~ | **NONE-DECLARED ❌** | **不可用**（见 §14.5） |
-| **Hyprland** `src/render/shaders/glsl/blur1.glsl` | GPL ⚠️ | dual Kawase 降采样参考实现 + **vibrancy/saturation 逐级施加**的技巧（§9.5）。**只读思路** |
+| **Hyprland** `src/render/shaders/glsl/blur1.glsl` | **GPL ✅ 可用** | dual Kawase 降采样参考实现 + **vibrancy/saturation 逐级施加**的技巧（§9.5） |
 | **`backdrop-blur-wgpu`** | 见 crate | **最贴近我们需求的架构参考**：两阶段 `prepare` → `record` 的 seam trait（因为 wgpu 走 Queue 上传而 glow 是 immediate mode）、按 target format 懒建 pipeline、sRGB 拒绝、Backdrop-Root rule、last-frame-used 淘汰。**注意它的 wgpu 后端目前只有可分离 Gaussian，dual Kawase 还是 TODO**。⚠️ **GitHub 主页 404——但源码可从 crates.io CDN 直接取**：`https://static.crates.io/crates/backdrop-blur-wgpu/backdrop-blur-wgpu-0.2.0.crate`（已验证可下载解包） |
 | **Bevy render graph** | MIT/Apache ✅ | 阶段划分词汇表 + 异步 PipelineCache（§9.11）。不引入依赖 |
 | **SIGGRAPH 2015** Marius Bjørge "Bandwidth-Efficient Rendering" + three.js PR #33920 | — | dual Kawase 原始出处与工程数据（§9.2） |
-| **Slint** box shadow 缓存 | GPLv3 ⚠️ | `SkiaBoxShadowCache` / `FemtovgBoxShadowCache` 的模糊纹理复用思路。**只读思路不抄代码** |
+| **Slint** box shadow 缓存 | **GPLv3 ✅ 可用** | `SkiaBoxShadowCache` / `FemtovgBoxShadowCache` 的模糊纹理复用思路 |
 
 ### 14.4 关于 argui：抄 WGSL，不取依赖
 
@@ -1722,9 +1759,14 @@ pub struct LiquidGlass {
 
 注意它的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），**不是可直接使用的文件**——移植的是数学，不是文件。
 
-### 14.5 不可用清单（无 license = 保留所有权利）
+### 14.5 不可用清单
 
-**代码和 shader 文本都不能进库。**
+**这里有两类，原因不同：**
+
+- **无 license（NONE-DECLARED）** —— 作者保留全部权利，**没有任何授权**。GPLv3 也救不了。
+- **非商业许可（PolyForm Noncommercial）** —— 有授权但仅限非商业，**与 GPLv3 不兼容**（更严格的限制无法被 GPLv3 吸收）。
+
+两类结论相同：**代码和 shader 文本都不能进库。**
 
 | 仓库 | Star | 风险 | 代价 |
 |---|---|---|---|
@@ -2105,7 +2147,88 @@ v2 会有**自己的设计文档**——本文档是 v1 的，范围、里程碑
 
 **排除理由：** 无障碍是专项工程（数月），且 v1 已建语义树骨架（M4e），桥接可以后补；插件 ABI 在只有一个外部音源需求时不值得。
 
-### 18.3 v1 为此预留的东西
+### 18.3 自然过渡：目标是 Spotify「Mix」级别
+
+**用户设定的质量基准：达到 Spotify 最新版自然过渡（「Mix」，2025-08-19 上线）的程度。**
+
+它的机制（据官方与媒体报道）：
+
+- **自动分析每首歌的 key 与 BPM**，并显示波形与节拍数据
+- **节拍 / 速度匹配**——官方建议选速度相近的歌
+- **调性匹配**——推荐 Camelot 调性相近的歌（DJ 用来避免调性冲突的系统）
+- **过渡点可调**——用户按波形与节拍数据选「最佳切换时刻」
+- **可调的音量 / EQ / 效果曲线**，预设如 Fade、Rise
+- Auto 模式（AI 驱动）与 Custom 模式
+
+对照：Apple Music 的 AutoMix 明确使用 **timestretching + beatmatching**。
+
+#### 分层拆解：每层要什么、Rust 有没有
+
+| 层 | 需要什么 | Rust 可行性 |
+|---|---|---|
+| 1. 响度匹配的交叉淡入 | `ebur128` + 增益斜坡 | ✅ 简单 |
+| 2. 节拍对齐 | BPM + 节拍相位 | ✅ `stratum-dsp` / `beat-track-rs` |
+| 3. **乐句对齐**（4/8/16 小节边界） | **downbeat 检测** | ⚠️ 需 `beat-this`（ML + ONNX + 10.5MB 模型） |
+| 4. **调性匹配**（Camelot） | key 检测 | ✅ `stratum-dsp`。**但 key 检测是这几项里最不可靠的** |
+| 5. **速度对齐** | 时间拉伸 | ✅ `timestretch`（纯 Rust）或 `signalsmith-stretch` |
+| 6. EQ 曲线 / bass swap | 双二阶 + 斜坡 | ✅ `biquad` |
+| 7. **编排**（何时切、切多久、曲线怎么走） | 自研 | ❌ 没有现成的 |
+
+**已核实的组件（许可全部干净）：**
+
+| crate | 版本 | 许可 | 给什么 | 代价 |
+|---|---|---|---|---|
+| `stratum-dsp` | 1.0.0 | **MIT / Apache-2.0** ✅ | BPM + 调性 + 节拍（tempogram / novelty / chroma，**纯经典 DSP**） | 无模型文件 |
+| `beat-this` | 1.0.0 | **MIT** ✅ | 节拍 + **downbeat**（ML 推理） | **内嵌 10.5MB ONNX 模型**，需 ONNX 运行时 |
+| `timestretch` | 0.15.0 | **MIT** ✅ | 纯 Rust 时间拉伸 | 作者自述「optimized for EDM」 |
+| `beat-track-rs` | 0.1.2 | Apache-2.0 ✅ | Ellis 2007 动态规划节拍跟踪 | 0 star，53 下载 |
+
+#### ⚠️ 最容易被低估的一点：这是一条分析管线，不是一个 DSP 函数
+
+**做乐句对齐，必须在切换发生前就知道下一首歌的 downbeat 网格**——而那首歌可能还没播到那里。
+
+```
+歌进入队列
+    ↓
+后台下载 → 分析（BPM / 调性 / 节拍 / downbeat）→ 存进 SQLite
+                                    ↓
+                    播放时读分析结果 → 编排过渡
+```
+
+**Spotify 能做到是因为它后端已把全部曲目分析过。我们必须在本地做等效的事。**
+
+分析一首 4 分钟的歌（tempogram + chroma + ML 推理）约需**数秒到数十秒**。因此：
+
+- 必须**后台**跑，不能阻塞播放
+- 必须**持久化缓存**（分析结果进 SQLite，按 track id 索引）
+- **必须能在尚未分析完时优雅降级**
+
+#### 降级链（必需，不是可选）
+
+Spotify 自己说明这类功能**只对「为无缝切换而制作的音乐」效果最好**（house / techno / trance / disco），对 acoustic / rock / ballad 会退化。加上分析可能永远完不成（网络慢、格式怪、用户直接跳歌）：
+
+```
+1. 两首都已分析 + 速度接近 + 调性相容
+      → 完整过渡（节拍对齐 + 乐句对齐 + 调性匹配 + 时间拉伸）
+2. 都分析了但速度差太多
+      → 不做时间拉伸，只做乐句对齐的淡入淡出
+3. 只分析了一边
+      → 响度匹配的交叉淡入
+4. 都没分析
+      → 普通短交叉淡入
+```
+
+#### 成本评估（诚实说）
+
+**这是 v2 音频引擎里最大的一块，可能占其三分之一以上。** 它横跨三个子系统：
+
+```
+分析管线（新）→ 持久化缓存（数据库）→ 播放编排（改音频回调）
+```
+
+对照 §6.2 的实施顺序，它排在最后是对的——**它依赖前面全部**（时间拉伸、响度、以及 v1 预留的两槽队列）。
+
+### 18.4 v1 为此预留的东西
 
 | 预留项 | 位置 |
 |---|---|
@@ -2121,7 +2244,7 @@ v2 会有**自己的设计文档**——本文档是 v1 的，范围、里程碑
 | 决策 | 选择 | 被否决 | 关键理由 |
 |---|---|---|---|
 | 首发平台 | Linux | 其他 | 开发机即 Linux，反馈循环最短；内核占七成工作量且与平台无关 |
-| UI 技术栈 | 全 Rust，自建 UI runtime | Flutter / Tauri / Iced / Slint | 需要完全控制渲染管线做液态玻璃；不接受浏览器架构；不接受 GPL |
+| UI 技术栈 | 全 Rust，自建 UI runtime | Flutter / Tauri / Iced / Slint | 需要完全控制 pass 拓扑做液态玻璃（own-loop / 共享 backdrop / damage tracking / RenderTier）；不接受浏览器架构。（**原记录的「不接受 GPL」已作废**——项目即 GPLv3，见 §14.1；Slint 的出局理由改为纯技术性） |
 | 平台层 | SDL3 | winit | SDL3 的 IME 与 popup 支持更完整，移动端生命周期更成熟 |
 | 渲染层 | wgpu | SDL_GPU | Android GLES 兜底 + Rust 原生 shader 工具链 + 1.x 成熟度 |
 | UI 模式 | retained mode | immediate mode | 播放器需要动画状态、滚动状态、文本选择、列表虚拟化 |
@@ -2131,6 +2254,7 @@ v2 会有**自己的设计文档**——本文档是 v1 的，范围、里程碑
 | v1 歌词 | amll-ttml-db 打底 | 只走网易云 yrc | 一个 GET 拿到逐字 TTML，不碰接口、不需登录、效果更好 |
 | 音源抽象 | 独立 crate + 本地文件第二实现 | 只留 trait 边界 / 插件 ABI | 单一实现的抽象大概率是错的；插件 ABI 是大工程 |
 | 主题 | Glass 完整 + M3E 薄版 | 只做一套 / 两套都完整 | 薄版只需实现 ①②③ 三个差异点即可压弯抽象 |
+| **项目许可证** | **GPLv3** | 闭源专有 | **由用户确定。**本文档早期误按「闭源分发」推导 §14.1，据此错误否决了全部 GPL/AGPL 参考实现——该前提从未经用户确认。已更正 |
 | 文本引擎 | parley + swash | cosmic-text + glyphon / 自研 | parley 原生给「保留小数的逐字形 x/y/advance + cluster 映射」，正是逐字歌词要的；glyphon 的 Buffer 抽象在逐字动画下属层级错误 |
 | 文本光栅化 | swash（纯光栅化器） | skrifa + zeno / 自己写 | 能用，代价是字体解析两遍（实测影响很小） |
 | pass 编排 | 手写 200–300 行 | engawa / rend3 / bevy_render | engawa v0.1 未实现 compute/blit；rend3 维护模式；bevy 太重。只借 bevy 的阶段词汇表与异步 PipelineCache |
