@@ -145,6 +145,8 @@ edition.workspace = true
 [dependencies]
 sdl3.workspace = true
 wgpu.workspace = true
+# Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device
+pollster.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 log.workspace = true
@@ -174,9 +176,8 @@ edition.workspace = true
 
 [dependencies]
 dsls-platform = { path = "../crates/platform" }
+# main.rs 直接用 wgpu 类型建管线；SDL 的一切都经 dsls-platform
 wgpu.workspace = true
-sdl3.workspace = true
-pollster.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
