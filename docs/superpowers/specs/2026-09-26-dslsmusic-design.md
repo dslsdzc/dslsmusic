@@ -819,7 +819,31 @@ self.begin_frame();                                      // 再推进驱逐时�
 
 **这个设计很精妙：驱逐时钟只在「真的发生了霜化」的帧上走。**
 
-推论：**一个滚出屏幕的玻璃面板，它的链会无限期存活**（因为它不再产生「霜化帧」，时钟不走），重新出现时直接命中。这解决了「面板来回滚动的 thrashing」问题——比单纯的时间戳驱逐聪明。**不可见 ≠ 未使用。**
+守卫在两个地方，**都在 `begin_frame()` 之前**：`target_rect.is_empty()`（`size[0] == 0 || size[1] == 0`）以及源侧的 `clip_to` 返回 `None`（零面积/全出界）。
+
+**推论：「不可见」不推进时钟，「未使用」才推进。** 一个滚出屏幕的玻璃面板不再产生「霜化帧」，所以它的链存活，重新出现时直接命中。这解决了「面板来回滚动的 thrashing」。
+
+#### ⚠️ 但这个精妙有个重要的限定：计数器统计的是「霜化次数」，不是「渲染帧数」
+
+源码注释写的是 "Advanced once per `prepare`"，而 **`prepare` 是每 surface 一次**。
+
+**所以 `frame` 计数的是霜化操作次数。** 一帧内有 S 个玻璃表面时，计数器每个渲染帧推进 S，于是 `RETENTION_FRAMES = 8` 兑现成渲染帧是 **8 / S 帧**：
+
+| 同屏玻璃数 | 8 次霜化 ≈ |
+|---|---|
+| 1 | 8 帧 |
+| 3 | **≈ 2.7 帧** |
+| 8 | **1 帧** |
+
+**后果：「不可见 ≠ 未使用」这条保证，只在该 surface 是唯一霜化者时成立。** 面板 A 滚出屏幕、而面板 B 仍可见并霜化时，**B 的 `prepare` 照样推进共享计数器**，A 的链 8 次霜化后被驱逐。
+
+**含义：同屏多个玻璃元件时（tab bar + 侧边栏 + 浮动按钮在播放页很常见），实际保留窗口按元件数成比例缩短，拖拽 churn 比字面严重得多。**
+
+**我们的修正：** 二选一——按元件数放大 `RETENTION_FRAMES`，或者**给每个 surface 独立计数器**。后者更正确，且与 §9.7 上半部分要自己做的脏区追踪天然契合（每个 surface 已经需要登记自己的依赖集）。
+
+#### 另一个计数器：`generation`
+
+`frame` 驱动驱逐；`generation` 每次 `prepare` 递增并写进 `WgpuPrepared`，`record` 里断言它。它防的是「在 record 第一个 surface 前 prepare 了第二个，导致共享 scratch 被覆盖」——**如果我们照搬共享 scratch 池，这个防护必须一并照搬。**
 
 #### resize：真实行为与一个高价值改进
 
@@ -850,6 +874,37 @@ pub fn backdrop_uv_remap(source_region: &Region, clipped: &Region) -> ([f32; 2],
 **量化后是同一种问题，只是方向相反**：scratch 比区域**大**，`scale < 1`。
 
 > **同一个函数、同样的数学、零新增代码。** 只需把配对的第二个 `Region` 从「裁剪后的」换成「网格对齐的」。
+
+完整实现：
+
+```rust
+// 今天
+let clipped = request.source_region.clip_to(source_extent)?;   // 界内子矩形
+let key = PingPongKey { size: clipped.size, levels };
+let (off, scale) = backdrop_uv_remap(&request.source_region, &clipped);
+
+// 量化后 —— 只多一个 Region，函数调用参数换一下
+let clipped = request.source_region.clip_to(source_extent)?;
+let quantized = clipped
+    .quantize_up(GRID)                    // 同 origin，尺寸向上取整到网格
+    .clip_to(source_extent)               // 关键：取整后可能越界，必须再裁一次
+    .unwrap_or(clipped);
+let key = PingPongKey { size: quantized.size, levels };       // ← 键稳定，可复用
+let (off, scale) = backdrop_uv_remap(&clipped, &quantized);   // ← 同一个函数，参数换成 (实际区域, 分配区域)
+```
+
+**三个必须一并处理的点：**
+
+1. **取整后要再 `clip_to(source_extent)` 一次** —— 右下角可能超出源纹理，否则采样越界。（上面代码已含。）
+2. **pass 要 scissor 到实际使用区。** 纹理变大但真正处理的只有左上角子矩形；第一条 pass 本来就是「maps the scratch onto the source sub-rect」，scissor 是自然的。**不加则白付 fill rate。** Kawase 的 prefilter 同理。
+3. **内存上界**（最坏比值 `⌈w/G⌉·G/w × ⌈h/G⌉·G/h`）：
+
+| 区域 | G=16 | G=32 |
+|---|---|---|
+| 400×200 | 416×208 → **1.08×** | 416×224 → **1.17×** |
+| 100×50 | 112×64 → **1.43×** | 128×64 → **1.64×** |
+
+**小元件受网格影响大得多 —— 取 G=16 更稳；更激进可以只量化长边。**
 
 **这个改进直接写进 `ui-render` 的设计。**
 
@@ -1329,7 +1384,7 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | 3 | **网易云接口非官方，且上游会被法务抹掉** | 见下方专条 |
 | 4 | **无障碍成本** | v1 只建语义树（M3），不做三平台桥接。Windows UIA / Apple NSAccessibility / Linux AT-SPI2 是后置的专项工作 |
 | 5 | **CJK 字体必须自带** | Noto Sans SC（OFL 协议），逐字歌词要多字重，打包体积要有预期 |
-| 6 | **Rust 不等于轻** | Rustle 自称内存 250MB（对比 Electron 500MB+）。iced + wgpu + 大图缓存不便宜。backdrop texture 必须有明确生命周期和上限（§9.7） |
+| 6 | **Rust 不等于轻；backdrop scratch 是实打实的显存开销** | Rustle 自称内存 250MB（对比 Electron 500MB+）。**backdrop scratch 的具体量级（400×200 区域）**：高斯一条链 1.28 MB（`Rgba16Float` 640 KB × 2 张乒乓），拖拽峰值 8 条约 **10.2 MB**；Kawase 反而更省（1+1/4+1/16+… ≈ 1.333，N=6 时约 0.85 MB/链，峰值 ≈ 6.8 MB）。做尺寸量化再乘 1.08–1.17×。**这仅是 backdrop scratch**，不含背景纹理、目标 framebuffer 及我们自己的其他 GPU 资源。必须有明确生命周期和上限（§9.7） |
 | 7 | **没有热重载** | 自研 UI 框架最痛的开发体验问题。M3 之前必须先做 headless 渲染 PNG 的 golden test 工具 |
 | 8 | **逐字歌词吃性能** | AMLL 实测 60FPS 需 3.0GHz+，1080p 要 GTX 10 系以上。seek 时必须降级（§5.4） |
 | 9 | **ncm-api-rs 只有 11 commits** | eapi 加密正确性对照 `Cloud370/ncm-rs` 或 `ddy314/netease-music` 交叉验证 |
