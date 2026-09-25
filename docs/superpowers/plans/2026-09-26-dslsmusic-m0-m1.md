@@ -373,8 +373,10 @@ git commit -m "feat(platform): RenderTier 能力探测与软件适配器识别"
 - Produces:
   - `pub struct PlatformWindow`（持 SDL3 window + event pump）
   - `pub enum PlatformEvent { Resized(u32, u32), CloseRequested, None }`
-  - `pub struct GpuContext { pub device: wgpu::Device, pub queue: wgpu::Queue, pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub tier: RenderTier }`
-  - `pub fn init_gpu(window: &PlatformWindow) -> anyhow::Result<GpuContext>`
+  - `pub struct GpuContext<'a> { pub device: wgpu::Device, pub queue: wgpu::Queue, pub surface: wgpu::Surface<'a>, pub config: wgpu::SurfaceConfiguration, pub tier: RenderTier }`
+  - `pub fn init_gpu<'a>(window: &'a PlatformWindow) -> anyhow::Result<GpuContext<'a>>`
+
+> **生命周期约束**：`surface` 借自窗口，所以**在 `main` 里必须先声明 `window` 再声明 `gpu`**（Rust 的 drop 顺序是后声明先析构，这样 `gpu` 先于 `window` 释放）。顺序写反编译不过——这是好事，编译器会挡住。
 
 - [ ] **Step 1: 写 SDL3 窗口封装**
 
@@ -458,11 +460,12 @@ impl PlatformWindow {
 use crate::capability::{detect_tier, is_software_adapter, AdapterInfo, RenderTier};
 use crate::window::PlatformWindow;
 
-pub struct GpuContext {
+/// 生命周期参数 `'a` 借自窗口。**不要用 `transmute` 拉成 `'static`** ——
+/// 官方示例用的就是这个生命周期参数写法，二者语义等价但这个是安全的。
+pub struct GpuContext<'a> {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// `'static` 因为我们持有窗口的所有权层级高于 surface。
-    pub surface: wgpu::Surface<'static>,
+    pub surface: wgpu::Surface<'a>,
     pub config: wgpu::SurfaceConfiguration,
     pub tier: RenderTier,
 }
@@ -496,20 +499,14 @@ mod rwh_bridge {
     }
 }
 
-pub fn init_gpu(window: &PlatformWindow) -> anyhow::Result<GpuContext> {
+pub fn init_gpu<'a>(window: &'a PlatformWindow) -> anyhow::Result<GpuContext<'a>> {
     let instance = wgpu::Instance::new(
         wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
     );
 
-    // SAFETY: surface 的生命周期被约束在本进程内，窗口由调用方持有且不移动。
-    // 这是官方示例采用的模式 —— create_surface 需要一个 Send+Sync 的 target。
-    let surface = {
-        let target = rwh_bridge::SyncWindow(window.raw_window());
-        // 把窗口的借用转成 'static：调用方保证 window 活得比 GpuContext 长。
-        let target: rwh_bridge::SyncWindow<'static> =
-            unsafe { std::mem::transmute(target) };
-        instance.create_surface(target)?
-    };
+    // 官方示例的写法：surface 的生命周期绑定在窗口借用上，无需任何 unsafe 转换。
+    // 调用方必须保证 window 活得不比 GpuContext 短（在 main 里先声明 window）。
+    let surface = instance.create_surface(rwh_bridge::SyncWindow(window.raw_window()))?;
 
     let adapter = pollster::block_on(instance.request_adapter(
         &wgpu::RequestAdapterOptions {
