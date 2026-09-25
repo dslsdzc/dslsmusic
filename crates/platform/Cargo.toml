@@ -2,10 +2,13 @@
 name = "dsls-platform"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 sdl3.workspace = true
 wgpu.workspace = true
+# Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device
+pollster.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 log.workspace = true

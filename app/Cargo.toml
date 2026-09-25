@@ -2,12 +2,12 @@
 name = "dslsmusic"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 dsls-platform = { path = "../crates/platform" }
+# main.rs 直接用 wgpu 类型建管线；SDL 的一切都经 dsls-platform
 wgpu.workspace = true
-sdl3.workspace = true
-pollster.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true

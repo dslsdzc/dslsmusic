@@ -11,7 +11,7 @@ license = "GPL-3.0-or-later"
 # ── 平台层 ──
 sdl3 = { version = "0.20", features = ["raw-window-handle"] }
 wgpu = "30.0.1"
-pollster = "0.4"
+pollster = "1"
 raw-window-handle = "0.6"
 
 # ── 基础设施 ──
