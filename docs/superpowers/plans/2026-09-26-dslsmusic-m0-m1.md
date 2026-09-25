@@ -1760,6 +1760,16 @@ git commit -m "feat(provider-netease): 搜索与取流，含 response 解析与�
 - Create: `crates/audio/src/lib.rs`
 - Create: `crates/audio/src/decode.rs`
 - Create: `crates/audio/src/output.rs`
+- Create: `crates/audio/src/pcm.rs` — **v2 DSP 的挂载点**（设计文档 §6.1）
+
+> **关于 v1 留的两个钩子（设计文档 §6.1）——代价不对称，如实处理：**
+>
+> | 钩子 | v1 怎么处理 |
+> |---|---|
+> | **PCM graph 挂载点** | **实做。** 它便宜（一个 passthrough 调用点），而且**事后补要改解码循环** |
+> | **当前曲 + 下一曲两槽队列** | **只记为扩展点，不实现。** 真正贵的地方不在队列本身，而在**音频回调**——v2 做交叉淡入时回调要从两个 ring 同时取数并混合。那个改动 v1 没法「预留」，硬留就是写没人用的代码 |
+>
+> **v2 接入 `dsls-audio` 时必须知道：** `AudioEngine` 的 `producer` 字段要变成当前/预备两槽，且 `build_output_stream` 的闭包要从两路取数并按交叉淡入曲线混合。这不是加字段能解决的，是回调逻辑的改写。
 
 **Interfaces:**
 - Consumes: 无
@@ -1953,6 +1963,92 @@ impl AudioRingConsumer {
 > `Consumer::pop_slice` / `Observer::occupied_len`。
 > **实现时若签名对不上，以 `cargo doc -p ringbuf --open` 为准**，不要猜——但**不要退回加锁方案**。
 
+**同一个 Step 里再建 `crates/audio/src/pcm.rs`** —— v2 DSP 的挂载点：
+
+```rust
+//! PCM 处理链。**v2 的 DSP（EQ / 响度 / 变速 / 交叉淡入）都挂在这里。**
+//!
+//! v1 是空实现：`process` 是恒等变换，无 stage 时纯属循环开销（可被优化掉）。
+//! 留这个调用点的理由——它位于**解码与 ring 之间**，事后补要改解码循环。
+
+pub trait PcmStage: Send {
+    fn process(&mut self, samples: &mut [i16]);
+}
+
+#[derive(Default)]
+pub struct PcmGraph {
+    stages: Vec<Box<dyn PcmStage>>,
+}
+
+impl PcmGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// v2 用，例如 `graph.push(Box::new(EqStage::new(&config)))`
+    pub fn push(&mut self, stage: Box<dyn PcmStage>) {
+        self.stages.push(stage);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// 原地处理。stage 按 push 顺序依次作用。
+    pub fn process(&mut self, samples: &mut [i16]) {
+        for stage in &mut self.stages {
+            stage.process(samples);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Gain(f32);
+    impl PcmStage for Gain {
+        fn process(&mut self, samples: &mut [i16]) {
+            for s in samples.iter_mut() {
+                *s = ((*s as f32) * self.0)
+                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            }
+        }
+    }
+
+    #[test]
+    fn empty_graph_is_identity() {
+        let mut g = PcmGraph::new();
+        let mut s = [1i16, -2, 3, i16::MAX, i16::MIN];
+        let before = s;
+        g.process(&mut s);
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn stages_apply_in_order() {
+        let mut g = PcmGraph::new();
+        g.push(Box::new(Gain(2.0)));
+        g.push(Box::new(Gain(0.5)));
+        let mut s = [10i16, -20, 30];
+        g.process(&mut s);
+        assert_eq!(s, [10, -20, 30], "×2 再 ×0.5 应回到原值");
+    }
+
+    #[test]
+    fn gain_must_saturate_not_wrap() {
+        // 溢出回绕是音频里最刺耳的 bug 之一，必须饱和
+        let mut g = PcmGraph::new();
+        g.push(Box::new(Gain(100.0)));
+        let mut s = [1000i16, -1000];
+        g.process(&mut s);
+        assert_eq!(s, [i16::MAX, i16::MIN]);
+    }
+}
+```
+
+这三个测试在 `cargo test -p dsls-audio` 里一并跑（Step 5 的 Expected 会变成 7 passed）。
+
 - [ ] **Step 4: 写解码与引擎**
 
 `crates/audio/src/decode.rs`：
@@ -1965,11 +2061,14 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// 解码为交错的 i16 立体声（44100Hz 目标采样率，重采样留给后续 DSP 阶段）。
+/// 解码为交错的 i16 立体声（重采样留给后续 DSP 阶段）。
+///
+/// 回调取 `&mut [i16]` 而**不是** `&[i16]` —— 因为 PCM graph 的 DSP
+/// 要**原地**处理样本（设计文档 §6.1）。
 pub fn decode_to_i16(
     stream: Box<dyn symphonia::core::io::MediaSource>,
     ext_hint: Option<&str>,
-    on_samples: &mut dyn FnMut(&[i16]),
+    on_samples: &mut dyn FnMut(&mut [i16]),
 ) -> anyhow::Result<u32> {
     let mss = MediaSourceStream::new(stream, Default::default());
     let mut hint = Hint::new();
@@ -2008,7 +2107,7 @@ pub fn decode_to_i16(
         let decoded = decoder.decode(&packet)?;
         scratch.clear();
         push_interleaved_i16(&decoded, &mut scratch);
-        on_samples(&scratch);
+        on_samples(&mut scratch);
     }
     Ok(sample_rate)
 }
@@ -2046,8 +2145,10 @@ fn push_interleaved_i16(buf: &AudioBufferRef<'_>, out: &mut Vec<i16>) {
 ```rust
 pub mod decode;
 pub mod output;
+pub mod pcm;
 
 pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer};
+pub use pcm::{PcmGraph, PcmStage};
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -2285,8 +2386,11 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     // push_samples 需要 &mut（生产端是 !Sync）。闭包借用 engine，
     // 闭包结束后借用即释放，后面的 ring_available() 可以直接用。
     const CHUNK: usize = 4096;
+    // v1 是空图（零开销）；v2 的 EQ / 响度 / 变速都挂在这里
+    let mut pcm = dsls_audio::PcmGraph::new();
     dsls_audio::decode::decode_to_i16(Box::new(cursor), Some("mp3"), &mut |samples| {
-        for chunk in samples.chunks(CHUNK) {
+        for chunk in samples.chunks_mut(CHUNK) {
+            pcm.process(chunk);          // ← 解码与 ring 之间：DSP 的位置
             engine.push_samples(chunk);
         }
         // 背压：缓冲够满就退让，避免解码跑得比播放快太多
