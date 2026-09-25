@@ -1,8 +1,10 @@
 # dslsmusic 设计文档
 
 - 日期：2026-09-26
-- 状态：**已评审通过**。技术选型全部落定；三项产品/顺序决策经确认（见下方）
-- 未决项：见 §15（均为非阻塞的补充调研与待验证假设）
+- 状态：**一级架构选型已落定；若干 backend contract 与实现假设待 spike 验证**（§15.2、§17）
+- 未决项：见 §15。**本文档中所有「必须/Rgba16Float/零成本」一类的绝对表述均已按 §17 的能力分级改写**
+
+> **注意：不要把这句读成「技术选型全部落定」。** 已落定的是**一级架构**（SDL3 平台层 + wgpu 渲染层 + 自研 retained UI + 音源独立 crate）。下游还有三类 **implementation contract** 未定型，见 §17。
 
 **已确认的三项决策：**
 
@@ -147,7 +149,7 @@ dslsmusic/
 |---|---|---|
 | 语言 | Rust（全栈） | — |
 | 平台层 | **SDL3** | 提供 window / input / IME / popup / 移动端生命周期。IME 与 popup 都已验证可用（见 §11）。所有 SDL 调用包在 `platform/` trait 后面，应对 `sdl3` crate pre-1.0 风险 |
-| 渲染层 | **wgpu** | 否决 `SDL_GPU`：SDL 官方对 Android 的 Vulkan feature 要求态度是「Android will almost certainly hate this」，有人建议直接放弃 Android。wgpu 有 GLES 3.0 后端可兜底 Android；naga 是 Rust 原生 shader 工具链（写 WGSL，无 DXC / SPIRV-Cross 的 C 依赖）；且是 1.x 成熟生态 |
+| 渲染层 | **wgpu** | 否决 `SDL_GPU`：SDL 官方对 Android 的 Vulkan feature 要求态度是「Android will almost certainly hate this」，有人建议直接放弃 Android。wgpu 有 GLES 3.0 后端可兜底 Android；naga 是 Rust 原生 shader 工具链（写 WGSL，无 DXC / SPIRV-Cross 的 C 依赖）；生态成熟（Bevy / egui / iced 都在用）。**版本 30.0.1——注意 wgpu 没有 1.x，版本号是 0.19 → 22 → … → 30 这条线**（本文档早期版本误写为「1.x」） |
 | UI 模式 | **retained mode** | 否决 immediate mode（egui 式）：播放器需要动画状态、滚动状态、focus、文本选择、列表虚拟化、持久组件状态，immediate mode 全都做不了 |
 | 文本引擎 | **parley**（布局）+ **swash**（纯光栅化） | 见 §7.2。**不用 glyphon** |
 | 音频解码 | **symphonia** | 纯 Rust，mp3 / aac / flac / ogg / wav 全覆盖。格式不够用时换 ffmpeg 绑定，走 `dsls-audio` 抽象 |
@@ -231,8 +233,50 @@ dslsmusic/
 
 - 统一 item：`id / platform / artist / title / duration / album / artwork / source / lyric`
 - 音质统一四档：`low / standard / high / super`，各平台原始标识在 provider 内映射
-- **provider 未实现的方法返回空结果而非抛错**，单个 provider 异常不阻塞其他
-- 搜索用并发，单平台失败不影响整体
+- 搜索用并发，单个 provider 异常不影响整体
+
+#### ⚠️ 错误模型：不能把一切压成「空结果」
+
+MusicFree 的契约里有一条「**provider 未实现的方法返回空结果而非抛错**」。
+
+**这一条我们不要照搬。** 它会把下面这些完全不同的情况压成同一个 `[]`：
+
+```
+Unsupported / NotFound / EmptyResult / NotAuthenticated
+RateLimited / NetworkFailure / ProviderChanged / CopyrightUnavailable
+```
+
+**结果是 `source-resolver` 根本无从判断该不该 fallback** —— 「这首歌确实没有」和「这个音源根本不会这个接口」在它眼里一模一样。
+
+**正确契约：**
+
+```rust
+pub enum SourceError {
+    Unsupported,        // provider 根本没这个能力
+    NotFound,           // 有能力，但这个对象不存在
+    AuthRequired,       // 需要登录态
+    Unavailable,        // 有能力，但当前拿不到（版权/地区）
+    RateLimited,
+    Network(/* ... */),
+    Protocol(/* ... */),// 上游接口变了
+}
+
+pub struct CapabilitySet { /* 声明式能力位 */ }
+
+pub type SourceResult<T> = Result<Option<T>, SourceError>;
+```
+
+语义划分：
+
+| 返回 | 含义 |
+|---|---|
+| `Ok(Some(v))` | 拿到了 |
+| `Ok(None)` | **请求合法，但确实没有** |
+| `Err(Unsupported)` | **provider 没这个能力** |
+| `Err(Unavailable)` | **有能力，但当前拿不到** |
+| `Err(Protocol)` | **上游变了** ← 这一条对网易云尤其重要（§13.1） |
+
+**这对未来多音源特别重要**：只有区分出 `Unsupported`，resolver 才知道「换一个音源试」有没有意义；只有区分出 `Unavailable`，才知道该不该降音质重试。
 
 **音源获取优先链**（四级）：
 
@@ -270,27 +314,45 @@ pub struct LyricWord {
 
 ### 5.2 数据源优先级
 
-**主源：`amll-ttml-db`**（CC0-1.0，424 star，9429 commits）
+**产品策略：逐字质量优先。**
 
-社区维护的逐字 TTML 歌词库，按来源平台分目录（`ncm-lyrics/` / `qq-lyrics/` / `am-lyrics/` / `spotify-lyrics/` / `raw-lyrics/`）。每首歌同时提供 `.ttml` / `.lrc` / `.yrc` / `.qrc` / `.lys` / `.eslrc` 六种格式。
+> ⚠️ **更正一处自相矛盾：** 本文档早期版本一边把 `amll-ttml-db` 写成「主源」，一边把回退链写成 `… → provider → amll-ttml-db`——**那实际是把 AMLL 放在最低优先级**。现明确为质量优先。
 
-消费方式——**一个 HTTP GET**：
+**`amll-ttml-db`**（CC0-1.0，424 star，9429 commits）是社区维护的逐字 TTML 歌词库，按来源平台分目录（`ncm-lyrics/` / `qq-lyrics/` / `am-lyrics/` / `spotify-lyrics/` / `raw-lyrics/`）。每首歌同时提供 `.ttml` / `.lrc` / `.yrc` / `.qrc` / `.lys` / `.eslrc` 六种格式。
 
-```
-https://raw.githubusercontent.com/amll-dev/amll-ttml-db/refs/heads/main/ncm-lyrics/[歌曲ID].ttml
-```
-
-**这条的价值：v1 的歌词完全不碰网易云歌词接口、不需要登录、不受接口变动影响，效果还优于网易云官方客户端。** 成本几乎为零。官方要求署名。
-
-**回退链（五级）：**
+**回退链（六级，逐字质量优先）：**
 
 ```
-手动关联 → 本地 .lrc → 缓存 → provider → amll-ttml-db
+手动关联覆盖
+    ↓
+本地 TTML / YRC / LRC
+    ↓
+本地持久缓存
+    ↓
+amll-ttml-db（逐字 TTML）
+    ↓
+provider（网易云 yrc / lrc，§5.3）
+    ↓
+lrclib / 纯文本兜底
 ```
 
-**辅助源：** `lrclib`（免费、无需鉴权的同步歌词 API，只到行级，无逐字），作为网易云之外的兜底。
+#### ⚠️ 不要直连 `raw.githubusercontent.com`
 
-**注意：** amll-ttml-db 的 README 明确警告「Apple Music 自己的 TTML 分词和时间轴也不完全准确合理」，同时质量保证只覆盖有效的网易云 ID。不要盲目信任任何单一来源。
+**正式产品运行时不能每次直接请求 GitHub raw endpoint**——那是没有 SLA 的第三方服务，且受网络环境影响。
+
+正确形态是**三层**：
+
+```
+amll 索引 / 元数据（可自建镜像）
+        ↓
+本地持久缓存          ← 运行时主要命中这一层
+        ↓
+上游 fetch            ← 未命中才走
+```
+
+**只需要镜像 metadata / index，不需要镜像整个数据库。**
+
+**注意：** amll-ttml-db 的 README 明确警告「Apple Music 自己的 TTML 分词和时间轴也不完全准确合理」，且质量保证只覆盖有效的网易云 ID。**不要盲目信任任何单一来源。**
 
 ### 5.3 网易云 YRC 格式
 
@@ -321,7 +383,34 @@ Linn 的 `utils/lyric_parse.rs`（MIT）有容错解析实现和测试夹具，*
 
 ### 5.4 逐字渲染算法
 
-照搬 AMLL 的参数化设计，但渲染后端用 **SDF GPU 文字**而非 CSS mask（Rustle 已证明这条路在 wgpu 里可行）。
+照搬 AMLL 的参数化设计（下面的参数全部来自它），但渲染后端用 **swash alpha 图集 + per-instance 高亮**，而非 CSS mask。
+
+> ⚠️ **更正一处内部矛盾：** 本节曾写「渲染后端用 **SDF GPU 文字**」，而 §7.2 定的是 `parley → swash → SwashImage → glyph atlas`——**那是 CPU 光栅化的 alpha 图集，不是 SDF**。两者不是一件东西。现统一为图集路线。
+
+**为什么不用 SDF（虽然 Rustle 用的是它）：**
+
+| 考量 | 结论 |
+|---|---|
+| SDF 的核心价值 | 任意连续缩放范围、任意 outline、持续 scale 动画 |
+| 歌词的实际需求 | **字号只有寥寥几档**（正文 + 强调），缩放动画幅度约 ±5–10% |
+| 逐字高亮 | **与字形表示无关**——它是 per-instance 的颜色/进度，在 fragment shader 里做 |
+| 与已定决策的一致性 | `parley + swash` 天然产出 alpha bitmap，图集路线**零额外工作**；SDF 需要额外的距离场生成步骤 |
+| GLES 友好度 | 图集更好（§17） |
+
+**升级路径：MSDF。** 若 M5 实测发现缩放动画质量不够，再换。**但不是 v1。**
+
+逐字歌词需要的全部东西：
+
+```rust
+GlyphInstance {
+    rect,                 // 字形在屏幕上的位置与尺寸（parley 给）
+    uv,                   // 图集采样坐标
+    color,                // 逐字高亮的当前颜色
+    highlight_progress,   // 0.0–1.0，由时间轴驱动
+}
+```
+
+**shape 一次，字形位图也不每帧变；每帧只更新 instance 里的 `color` / `highlight_progress`。**
 
 **驱动方式（最容易踩的坑）：**
 
@@ -481,6 +570,26 @@ cluster 映射用 `Cluster::text_range()` / `Cluster::glyphs()`，「第 N 到�
 
 **纯中/日文歌词两者都够**——CJK 禁则由 UAX #14 的 CL/OP/NS 类别覆盖。但音乐库大概率有日韩多语言混排，日文歌词要 `line-break: strict` 时只有 parley 能 tailoring。**这个差异是真实价值。**
 
+#### ⚠️ 但这个能力依赖一个默认关闭的 feature
+
+**已核实**（parley 0.11.1 的 `Cargo.toml`）：
+
+```toml
+[features]
+complex-scripts = []
+default = ["system"]        # ← complex-scripts 不在里面
+```
+
+**`complex-scripts` 才是启用 CJK / 泰语 / 高棉语 / 老挝语 / 缅甸语词典式断行的开关**，不开则退回轻量 fallback。
+
+**必须钉死：**
+
+```toml
+parley = { version = "0.11", features = ["complex-scripts"] }
+```
+
+**不写这一行，上面整段「locale tailoring 优势」的论证就是空的**——文档承诺的能力和实际构建产物不是同一个东西。
+
 #### GLES 约束的交叉验证（好消息）
 
 **文本方案与「blur 走 fragment」零冲突。**
@@ -636,7 +745,18 @@ pub trait DesignSystem {
 
 ### 9.1 own-loop：唯一干净的捕获方案
 
-**整个 UI 场景渲染到一张 offscreen intermediate texture**（`usage = RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC`），然后模糊其中若干区域，最后合成到 display target。因为 scene texture 本来就在我们手里，**捕获这一步的成本是零**。
+**整个 UI 场景渲染到一张 offscreen intermediate texture**（`usage = RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC`），然后模糊其中若干区域，最后合成到 display target。
+
+**因为 scene texture 本来就在我们手里，capture copy cost ≈ 0。**
+
+> ⚠️ **更正：** 本节曾写「捕获这一步的成本是零」。**那只对 copy 成立，对 compositing 不成立。**
+>
+> ```
+> capture copy cost      ≈ 0     （不需要额外拷贝）
+> offscreen compositing  ≠ 0     （绝对不是零）
+> ```
+>
+> **本质是主动拿 bandwidth 换一个可采样的 backdrop。** 在 tile-based GPU（Arm 移动端、Apple TBDR）上尤其贵——post-processing 迫使 tile 内容落主存再读回。完整论证与 M0.5 的必测项见 **§17.8**。
 
 另一条路线是从 swapchain 用 `COPY_SRC` 拷区域到 offscreen（`backdrop_capture` 式），**只在我们不得不直接渲染到 swapchain 时才用**。
 
@@ -700,7 +820,11 @@ compute 留给 fragment 做不了的事（前缀和、GPU culling）。
 
 ### 9.6 格式与生命周期
 
-- 中间 target 用 **`Rgba16Float`（线性空间）**，**不要用 `-Srgb` 格式**。`backdrop-blur-wgpu` 源码注释明确写了 "sRGB targets are rejected for the gamma intermediate (they would double-decode)"。8-bit 会在大面积渐变上 banding
+> ⚠️ **本节曾把 `Rgba16Float` 写成硬要求。已按 §17 的能力分级改写——硬要求会排除 GLES 低端设备，而那正是我们选 wgpu 的理由。**
+
+- 中间 target 的**首选**是 **`Rgba16Float`（线性空间）**，**不要用 `-Srgb` 格式**（`backdrop-blur-wgpu` 源码注释："sRGB targets are rejected for the gamma intermediate (they would double-decode)"；8-bit 会在大面积渐变上 banding）
+- **但不是硬要求**：adapter 不支持时按 §17.3 降到 Tier B（`Rgba8Unorm` + dithering）或 Tier C。**检查点见 §17.4——不只看格式可用性，还要看 `BLENDABLE`**
+- **格式必须进 backdrop cache key** —— 不同 tier 的 scratch 不能混用（§17.5）
 - 合成用的 sampler：**ClampToEdge + linear**
 
 ### 9.7 backdrop cache 与 damage tracking
@@ -1368,20 +1492,44 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 | | 内容 | 出口标准 |
 |---|---|---|
-| **M0** | workspace 骨架 + SDL3 窗口 + wgpu 出三角形 | **验证 SDL3（Wayland）→ raw-window-handle → wgpu 这条路**；**断言拿到硬件 adapter 而非 llvmpipe**（§16.0 坑 2） |
-| **M0.5** | **最坏情况性能原型**：全屏模糊 + 十几个玻璃面板 + 一屏文字，不需要好看 | **在基准硬件上达到 60 fps**（§16）。顺带提前验证 Dual Kawase 移植、backdrop 捕获链路、text instance 上传——这些本来 M4 才做 |
-| **M1** | 网易云登录（扫码）+ 搜索 + 取流 + 出声 | **能用最丑的方框听到歌** |
-| **M2** | 本地文件 provider + 抽象被两个实现压过 | provider trait 定型 |
-| **M3** | UI runtime：树 / 布局 / 文本 / 滚动 / 手势 / 动画 | 列表页能滚、能点、动画能跑，中文正常显示，IME 可用 |
-| **M4** | 玻璃管线在播放页跑通（移植 Kyant0 的折射 + 高光 + 阴影三层） | 玻璃折射、高光、阴影达到预期效果 |
-| **M5** | 逐字歌词 + 导航转场 | 播放页完整 |
-| **M6** | M3E 薄版 + 热切换 | `DesignSystem` 抽象定型 |
+**排序原则：先做「便宜且高不确定性」的，再做「昂贵且能一票否决路线」的。**
 
-**M1 是关键节点。** 它把最大的不确定性（网易云接口）先排掉，而不是先投时间在你能控制的部分（渲染）上。
+> ⚠️ **本节经过一次重排。** 早期版本把 M1 称为「最关键节点、要最先排掉最大不确定性」，却又把昂贵的 GPU 性能原型插在它前面——**逻辑自相矛盾**。现按「便宜优先」重排。
 
-**M3 里必须做的一件事：** 建无障碍语义树骨架。语义树是 widget 组装时产生的，**事后补等于重写所有 widget**。v1 不需要三平台桥接，但可以用一个打印语义树的调试工具先占位。
+| | 内容 | 出口标准 |
+|---|---|---|
+| **M0** | workspace 骨架 + SDL3 窗口 + wgpu 出三角形 | **验证 SDL3（Wayland）→ raw-window-handle → wgpu 这条路**；**断言拿到硬件 adapter 而非 llvmpipe**（§16.0 坑 2）。参考 `sdl3` crate 自带的 `examples/raw-window-handle-with-wgpu/` |
+| **M1** | **音乐链路（纯 CLI，无 UI runtime）**：扫码登录 → 搜索 → 解析取流 → 出声 | **能用命令行听到歌。** 二维码直接输出成 PNG/终端字符画，搜索走 CLI 参数 |
+| **M2** | 本地文件 provider + 抽象被两个实现压过 | provider trait 与 `SourceError` 定型（§4.5） |
+| **M3** | **玻璃性能原型**：全屏模糊 + 十几个玻璃面板 + 一屏文字，不需要好看 | **在基准硬件上达到 60 fps**（§16）。顺带提前验证 Dual Kawase 移植、backdrop 捕获链路、text instance 上传；**必须专测 bandwidth / tile store-load（§17.8）**，不只看 shader ALU |
+| **M4** | UI runtime（拆 M4a–e，见下） | 列表页能滚、能点、动画能跑，中文正常显示，IME 可用 |
+| **M5** | 玻璃管线接入播放页（移植 Kyant0 折射 + 高光 + 阴影三层） | 玻璃折射、高光、阴影达到预期效果 |
+| **M6** | 逐字歌词 + 导航转场 | 播放页完整 |
+| **M7** | M3E 薄版 + 热切换 | `DesignSystem` 抽象定型 |
 
-**M3 之前必须先做的工具：** headless 渲染 PNG 的 golden test 工具。没有热重载的情况下，这是唯一能让人忍受的 UI 迭代方式（见 §13 风险 7）。
+**为什么 M1 不需要 UI runtime：** 它的唯一目的是验证**音乐链路**（登录态、eapi 加密、取流、解码、出声）。二维码输出成 PNG、搜索走 CLI，同样能验证整条链——**而且省掉整个 UI 依赖**。如果这条链走不通，UI 做得再好也没用。
+
+**为什么 M3（性能原型）排在 M1 之后而不是之前：** M1 便宜（几天）且是产品存在性的硬门槛；M3 昂贵。**先做便宜的。**
+
+**但 M3 不能晚过 M4** —— 它是一票否决整个「玻璃 + 自绘 UI」路线的验证点。若 M3 不达标，M4 之后的所有投入都要重估。
+
+#### M4 内部拆分（否则会长期停在「80%」）
+
+「UI Runtime」作为单个里程碑会两个月不动，必须拆：
+
+| | 内容 |
+|---|---|
+| **M4a** | tree + event + quad + text |
+| **M4b** | layout + input + focus + IME |
+| **M4c** | scroll + 虚拟列表 |
+| **M4d** | motion + navigation |
+| **M4e** | 无障碍语义树骨架 |
+
+出口标准仍是同一个 M4。
+
+**M4e 必须做（不能推迟）：** 语义树是 widget 组装时产生的，**事后补等于重写所有 widget**。v1 不需要三平台桥接，用一个打印语义树的调试工具先占位即可。
+
+**M4 之前必须先做的工具：** headless 渲染 PNG 的 golden test 工具。没有热重载的情况下，这是唯一能让人忍受的 UI 迭代方式（§13 风险 7）。
 
 ---
 
@@ -1414,11 +1562,13 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 
 ### 14.1 许可红线（硬约束——项目未来要闭源分发）
 
-| 许可 | 能否使用 | 说明 |
+| 类别 | 许可 | 义务 |
 |---|---|---|
-| WTFPL / MIT / Apache-2.0 / CC0 | ✅ 可以 | 需保留署名（Apache-2.0 / CC0 要求） |
-| **无 license** | ❌ 不可用 | 默认保留全部权利，不能抄任何代码 |
-| **GPL / AGPL** | ❌ 不可抄代码 | **传染性**，会把整个项目拖下水。只能读思路，且要谨慎 |
+| **宽松许可** | MIT / Apache-2.0 / BSD / WTFPL | ✅ 可用。Apache-2.0 需保留 NOTICE + 专利授权条款；MIT / WTFPL 仅需保留版权声明 |
+| **公共领域奉献** | **CC0** | ✅ 可用。**CC0 没有法律上的署名要求**（它是公共领域奉献，不是许可）。*amll-ttml-db 在社区规范上请求署名，但那是礼节不是义务* |
+| **弱文件级 copyleft** | **MPL-2.0** | ✅ **可用于闭源程序**。MPL 是 file-level copyleft——允许 MPL 代码与专有代码组成 Larger Work，**静态链接也不触发整体开源**。义务仅限于：对 **MPL 覆盖文件的修改**需提供对应源码。**需单独跟踪 Covered Software 及其修改** |
+| **强 copyleft** | GPL / AGPL | ❌ **不可抄代码**。传染性，会把整个项目拖下水。只能读思路，且要谨慎 |
+| **无 license** | NONE-DECLARED | ❌ **不可用**。默认保留全部权利，代码和 shader 文本都不能进库 |
 
 **明确标记为「不能碰代码」的：**
 
@@ -1570,11 +1720,43 @@ pub struct LiquidGlass {
 
 | 假设 | 验证时机 | 万一不成立的退路 |
 |---|---|---|
-| SDL3 → `raw-window-handle` → wgpu 在 Linux 可行 | **M0** | 桌面端退到 winit（移动端仍留 SDL3） |
-| 同上，在 **Android** 可行（走 SDL3 window properties 拿 `ANativeWindow`） | M0 之后尽早 | 需要实测，暂无干净退路——**这是最大的未验证风险** |
+| SDL3 → `raw-window-handle` → wgpu 在 Linux 可行 | **M0** | 换 winit 的 **Wayland** 后端（**换库不换协议**——本机 niri 是 Wayland-only，没有 X11 退路） |
+| 同上，在 **Android** 可行 | M3 之后 | ✅ **接口链已核实存在**（见下），风险已下调 |
 | parley 与渲染器的中立类型层能挡住 parley 的变动 | M3 | 换 cosmic-text，只改适配层（§7.2 第 4 条） |
 | `ncm-api-rs` 的 eapi 加密正确 | M1 | 对照 `Cloud370/ncm-rs` / `ddy314/netease-music` 交叉验证；最坏情况自己 vendor 加密实现 |
-| damage tracking 的收益值得复杂度 | M4 | backdrop cache 退化成「每帧全量重算 + last-frame-used 淘汰」 |
+| damage tracking 的收益值得复杂度 | M5 | backdrop cache 退化成「每帧全量重算 + last-frame-used 淘汰」 |
+
+#### SDL3 → wgpu 在 Android 的支持：已核实（风险下调）
+
+**本文档早期版本写「Android 暂无干净退路，这是最大的未验证风险」——写重了。** 已直接核查 `sdl3` 0.20.0 源码：
+
+```rust
+// src/sdl3/raw_window_handle.rs
+#[cfg(target_os = "android")]
+unsafe {
+    use self::raw_window_handle::AndroidNdkWindowHandle;
+    let window_properties = sys::video::SDL_GetWindowProperties(self.raw());
+    let handle = AndroidNdkWindowHandle::new(NonNull::new_unchecked(native_window));
+    Ok(WindowHandle::borrow_raw(RawWindowHandle::AndroidNdk(handle)))
+}
+```
+
+而且该 crate **自带 `examples/raw-window-handle-with-wgpu/`**，做的正是 `create_surface(&instance, &window)`。
+
+**所以接口链不是「理论上应该可以」，是现成的。**
+
+**仍然未验证的是生命周期那一层**（这些桌面模拟不了，必须真机）：
+
+```
+surface lost / recreate
+background → foreground 切换
+rotation / resize
+Vulkan 初始化失败 → GLES 重试（§17.6）
+IME + 软键盘
+ANativeWindow 生命周期
+```
+
+**Android bring-up checklist 必须包含一条**：SDL3 曾在 Android 上自行先创建 GL context，导致 Vulkan/GLES 初始化报 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`；处理方式是在窗口创建**前**设置 `SDL_VIDEO_EXTERNAL_CONTEXT=1`。
 
 ---
 
@@ -1727,6 +1909,119 @@ SDL3 的 **Wayland 后端是唯一路径**。这抬高了「SDL3 + Wayland + NVI
 | 动画化 blur 半径 | Chromium 实测每个经过的半径都编译一个新 shader（§9.8） |
 | 每个玻璃面板各做一次 blur | 必须共享 backdrop（§9.7） |
 | 全量布局每帧跑 | 只应在 resize 时发生 |
+
+---
+
+## 17. RenderTier：能力分级（本项目最大的剩余结构性缺口）
+
+### 17.1 这个缺口是怎么来的
+
+我们**为了 Android GLES 兜底才选了 wgpu**（§3）。但选定之后，那条理由**没有贯彻到下游设计**——§9.6 一度写下「中间 target 用 `Rgba16Float`，不要用 sRGB」这种绝对要求，而这条要求**恰好会把 GLES 低端设备排除掉**。
+
+**自己否掉了自己选 wgpu 的理由。** 这是当前文档最大的结构性漏洞，本节专门补上。
+
+### 17.2 核心原则
+
+```
+没有 RGBA16F
+  → Glass quality 降一级        ✅ 正确
+
+没有 RGBA16F
+  → 设备不能运行 dslsmusic      ❌ 错误
+```
+
+**渲染管线必须服从 adapter 的实际能力，而不是反过来。** 所有「必须用 X 格式」的要求一律改写成分级。
+
+### 17.3 三级能力档
+
+| | Tier A（完整） | Tier B（降级） | Tier C（最低） |
+|---|---|---|---|
+| 中间格式 | `Rgba16Float`（线性） | `Rgba8Unorm` + dithering | 无中间格式，预模糊静态 backdrop |
+| 模糊精度 | 全精度，4–6 级金字塔 | 降精度，dithering 抑制 banding | 半分辨率或预处理 |
+| 色散 | 7 通道 | 3 通道（RGB） | 关闭 |
+| 折射 | 完整 | 简化 profile | 关闭，仅模糊 + tint |
+| 目标设备 | 桌面独显、现代 iOS/Android | 低端 Android、老集显 | 极低端 / 软件渲染 |
+
+**Tier B 的关键是 dithering** —— `Rgba8Unorm` 在大面积渐变上会 banding，这是它相对 16F 的主要劣势，而 dithering 能补掉大部分。
+
+### 17.4 能力查询（不是猜测，是查询）
+
+```rust
+// 格式支持
+let features = adapter.get_texture_format_features(format);
+
+// 关键：不只看「能不能渲染/采样」，要看 BLENDABLE
+// —— 能渲染不代表能混合，后者是更严的要求
+let can_blend = features.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
+```
+
+**检查点不只是「格式是否可用」，还有混合支持。** 这是比格式可用性更严的约束，容易漏。
+
+### 17.5 必须贯穿的下游位置
+
+`RenderTier` 一旦确定，必须同时约束以下全部——**任何一处漏掉都会在低端设备上炸**：
+
+| 位置 | 受影响内容 |
+|---|---|
+| 中间纹理格式 | §9.6 |
+| blur 金字塔级数与格式 | §9.2 / §9.5 |
+| shader 变体 | 折射/色散的通道数、`textureLod` 可用性 |
+| backdrop cache key | **格式进 key**（不同 tier 的 scratch 不能混用） |
+| backend 选择与重试 | Android：Vulkan 初始化失败 → 回退 GLES（§17.6） |
+| 降级阶梯 | §16.6 第二组的触发条件 |
+
+### 17.6 Android backend 重试
+
+Android 上 Vulkan 可能因驱动问题初始化失败。正确行为是**回退 GLES 而不是崩溃**：
+
+```
+尝试 Vulkan → 失败 → 尝试 GLES → 失败 → Tier C / 明确报错
+```
+
+**并且必须在启动时断言拿到的是硬件 adapter：**
+
+> `llvmpipe` / `lavapipe` 出现在 Vulkan 设备列表里（本机实测就有）。若 wgpu 选中软件光栅化，**性能慢两个数量级且不报错**。见 §16.0 坑 2。
+
+### 17.7 本项目的执行策略：在桌面上模拟低能力
+
+**不单独做早期 Android spike。** 用 wgpu 的 downlevel limits 在桌面上模拟：
+
+```rust
+// M0 起就在 GLES 能力集下开发
+let device = adapter.request_device(&DeviceDescriptor {
+    required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+    ..default()
+});
+```
+
+**收益：从写第一行渲染代码起就撞上 `Rgba16Float` 这类问题，而不是等到 M4。** 成本几乎为零——不需要 Android 工具链、不需要 NDK 交叉编译、不需要真机。
+
+**真机验证仍然必须做**（surface lost/recreate、前后台、旋转、IME、ANativeWindow 生命周期——桌面模拟不了），但排在 M2 之后。
+
+### 17.8 ⚠️ 但 own-loop 不是零成本（更正 §9.1）
+
+§9.1 曾写「捕获这一步的成本是零」。**这句必须更正：**
+
+```
+capture copy cost        ≈ 0     （不需要额外拷贝）
+offscreen compositing    ≠ 0     （绝对不是零）
+```
+
+**尤其在 tile-based GPU 上（Arm 移动端、Apple TBDR）。** 移动 GPU 上全屏 image 的写回/重新读取非常昂贵：post-processing 会迫使 tile 内容落到主存、再从主存读回来。跨 render pass 保存并重新读取纹理会发生 tile memory → system memory → texture cache 的往返。
+
+**所以本质是：主动拿 bandwidth 换一个可采样的 backdrop。**
+
+路线依然正确（这是实现折射的前提），但 M0.5 的性能原型**必须专门测这一项**：
+
+```
+external-memory bandwidth
+tile store/load
+1080p / 1440p
+Rgba16Float vs Rgba8
+full scene intermediate vs partial backdrop
+```
+
+**而不是只看 shader ALU 耗时。** 在桌面独显上这项通常不是瓶颈，但它是 Android 上最可能翻车的地方——而我们的 Tier 设计就是为了它。
 
 ---
 
