@@ -1764,7 +1764,7 @@ git commit -m "feat(provider-netease): 搜索与取流，含 response 解析与�
 **Interfaces:**
 - Consumes: 无
 - Produces:
-  - `pub struct AudioEngine`，`AudioEngine::new() -> Result<Self>`、`play_url(&mut self, url: &str) -> Result<()>`、`stop(&mut self)`
+  - `pub struct AudioEngine`（`!Sync`）、`AudioEngine::new() -> Result<Self>`、`push_samples(&mut self, &[i16])`、`ring_available(&self) -> usize`、`xrun_count(&self) -> u64`
   - `pub fn xrun_count(&self) -> u64`（硬指标，必须为 0）
 
 - [ ] **Step 1: 写失败的测试**
@@ -1777,31 +1777,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_buffer_preserves_order() {
-        let mut rb = RingBuffer::new(8);
-        rb.push_slice(&[1, 2, 3]);
+    fn preserves_order() {
+        let ring = AudioRing::new(8);
+        let (mut prod, mut cons) = ring.split();
+        prod.push_samples(&[1, 2, 3]);
         let mut out = [0i16; 3];
-        assert_eq!(rb.pop_slice(&mut out), 3);
+        assert_eq!(cons.pop_samples(&mut out), 3);
         assert_eq!(out, [1, 2, 3]);
     }
 
     #[test]
-    fn ring_buffer_reports_underrun_when_empty() {
-        let mut rb = RingBuffer::new(8);
+    fn counts_underrun_when_empty() {
+        let ring = AudioRing::new(8);
+        let (_prod, mut cons) = ring.split();
         let mut out = [0i16; 4];
-        assert_eq!(rb.pop_slice(&mut out), 0);
-        assert_eq!(rb.underruns, 1);
+        assert_eq!(cons.pop_samples(&mut out), 0);
+        assert_eq!(cons.underruns(), 1);
+        // 回调必须填满整块缓冲 —— 没数据时填静音，绝不能留垃圾值（那是爆音）
+        assert_eq!(out, [0i16; 4]);
     }
 
     #[test]
-    fn ring_buffer_drops_oldest_on_overflow() {
-        // 溢出不 panic —— 回调线程里 panic = 音频线程死掉
-        let mut rb = RingBuffer::new(4);
-        rb.push_slice(&[1, 2, 3, 4, 5, 6]);
+    fn counts_overflow_and_keeps_oldest() {
+        // ringbuf 的语义：环满之后**新数据被丢弃**（不是挤掉最旧的）
+        let ring = AudioRing::new(4);
+        let (mut prod, mut cons) = ring.split();
+        prod.push_samples(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(prod.overflows(), 1, "6 个样本推进容量 4 的环，应记一次溢出");
         let mut out = [0i16; 4];
-        assert_eq!(rb.pop_slice(&mut out), 4);
-        assert_eq!(out, [3, 4, 5, 6], "应保留最新的数据");
-        assert!(rb.overflows > 0);
+        assert_eq!(cons.pop_samples(&mut out), 4);
+        assert_eq!(out, [1, 2, 3, 4], "ringbuf 保留先到的数据");
+    }
+
+    #[test]
+    fn partial_underrun_still_fills_silence() {
+        let ring = AudioRing::new(8);
+        let (mut prod, mut cons) = ring.split();
+        prod.push_samples(&[7, 8]);
+        let mut out = [99i16; 4];
+        assert_eq!(cons.pop_samples(&mut out), 2);
+        assert_eq!(out, [7, 8, 0, 0], "尾部必须补静音，不能保留 out 原值");
+        assert_eq!(cons.underruns(), 1, "取不满也算一次 underrun");
     }
 }
 ```
@@ -1814,7 +1830,7 @@ cargo test -p dsls-audio
 
 Expected: 编译失败（crate 尚不存在）。
 
-- [ ] **Step 3: 建 crate 并写 RingBuffer**
+- [ ] **Step 3: 建 crate 并写 AudioRing（无锁）**
 
 `crates/audio/Cargo.toml`：
 
@@ -1833,6 +1849,8 @@ symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "isomp4", "ogg"
 # 已核实：reqwest 最新稳定版是 0.13.5
 reqwest = { version = "0.13", features = ["stream", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# 无锁 SPSC 环形缓冲。**音频回调线程里绝不允许加锁**（设计文档 §16.2 / 本计划 Global Constraints）
+ringbuf = "0.4"
 anyhow.workspace = true
 log.workspace = true
 ```
@@ -1840,74 +1858,100 @@ log.workspace = true
 `crates/audio/src/output.rs` 的 `mod tests` **之前**插入：
 
 ```rust
-/// 无锁环形缓冲。**音频回调线程侧只调用 `pop_slice`，绝不分配、不加锁。**
-#[derive(Debug)]
-pub struct RingBuffer {
-    buf: Vec<i16>,
-    read: usize,
-    write: usize,
-    len: usize,
-    pub underruns: u64,
-    pub overflows: u64,
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+/// 无锁 SPSC 环形缓冲，用 `AudioRing::split()` 拆成生产端与消费端。
+///
+/// **消费端在音频回调线程里使用：无锁、无分配、无 IO**（设计文档 §16.2）。
+/// 原计划用 `Mutex<Vec<i16>>`，那会在实时线程里加锁 —— 已废弃。
+pub struct AudioRing {
+    capacity: usize,
 }
 
-impl RingBuffer {
+impl AudioRing {
     pub fn new(capacity: usize) -> Self {
-        Self {
-            buf: vec![0; capacity],
-            read: 0,
-            write: 0,
-            len: 0,
-            underruns: 0,
-            overflows: 0,
+        Self { capacity }
+    }
+
+    pub fn split(self) -> (AudioRingProducer, AudioRingConsumer) {
+        let (prod, cons) = HeapRb::<i16>::new(self.capacity).split();
+        let overflows = Arc::new(AtomicU64::new(0));
+        let underruns = Arc::new(AtomicU64::new(0));
+        (
+            AudioRingProducer {
+                inner: prod,
+                overflows: Arc::clone(&overflows),
+                underruns: Arc::clone(&underruns),
+            },
+            AudioRingConsumer { inner: cons, underruns },
+        )
+    }
+}
+
+/// 生产端 —— 解码线程使用。`!Sync` 但 `Send`。
+pub struct AudioRingProducer {
+    inner: HeapProd<i16>,
+    overflows: Arc<AtomicU64>,
+    underruns: Arc<AtomicU64>,
+}
+
+impl AudioRingProducer {
+    /// 推入样本。**环满时新数据被丢弃并计一次溢出**，绝不阻塞、绝不分配。
+    pub fn push_samples(&mut self, data: &[i16]) {
+        let pushed = self.inner.push_slice(data);
+        if pushed < data.len() {
+            self.overflows.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// 生产者侧（解码线程）。
-    pub fn push_slice(&mut self, data: &[i16]) {
-        for &s in data {
-            if self.len == self.buf.len() {
-                // 满 → 丢最旧的，不阻塞生产者
-                self.read = (self.read + 1) % self.buf.len();
-                self.len -= 1;
-                self.overflows += 1;
-            }
-            self.buf[self.write] = s;
-            self.write = (self.write + 1) % self.buf.len();
-            self.len += 1;
-        }
+    /// 当前环内可读样本数（供背压判断）。
+    pub fn available(&self) -> usize {
+        self.inner.occupied_len()
     }
 
-    /// 消费者侧（音频回调）。返回实际写入 `out` 的样本数。
-    pub fn pop_slice(&mut self, out: &mut [i16]) -> usize {
-        let n = out.len().min(self.len);
-        if n == 0 {
-            self.underruns += 1;
-            // 回调必须填满缓冲，否则是爆音。填静音。
-            for s in out.iter_mut() {
-                *s = 0;
+    pub fn overflows(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+}
+
+/// 消费端 —— **音频回调线程使用**。`!Sync` 但 `Send`。
+pub struct AudioRingConsumer {
+    inner: HeapCons<i16>,
+    underruns: Arc<AtomicU64>,
+}
+
+impl AudioRingConsumer {
+    /// 取样本填满 `out`。**取不满时尾部补静音并计一次 underrun**。
+    /// 返回实际取到的样本数。永不阻塞、永不分配。
+    pub fn pop_samples(&mut self, out: &mut [i16]) -> usize {
+        let n = self.inner.pop_slice(out);
+        if n < out.len() {
+            for slot in out.iter_mut().skip(n) {
+                *slot = 0;
             }
-            return 0;
-        }
-        for slot in out.iter_mut().take(n) {
-            *slot = self.buf[self.read];
-            self.read = (self.read + 1) % self.buf.len();
-        }
-        self.len -= n;
-        // 尾部补静音
-        for slot in out.iter_mut().skip(n) {
-            *slot = 0;
+            self.underruns.fetch_add(1, Ordering::Relaxed);
         }
         n
     }
 
-    pub fn available(&self) -> usize {
-        self.len
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
     }
 }
 ```
 
-> **这个实现只在「单生产者 + 单消费者 + 且宿主是独占式回调」下成立。** 若后续要真正无锁（多生产者），换 `ringbuf` crate 的 `HeapRb`。v1 先用这个简单版本，但**接口形状与无锁版一致**，替换时不改调用方。
+> **用到的 `ringbuf` 0.4 API**：`HeapRb::new` / `Split::split` / `Producer::push_slice` /
+> `Consumer::pop_slice` / `Observer::occupied_len`。
+> **实现时若签名对不上，以 `cargo doc -p ringbuf --open` 为准**，不要猜——但**不要退回加锁方案**。
 
 - [ ] **Step 4: 写解码与引擎**
 
@@ -2003,19 +2047,16 @@ fn push_interleaved_i16(buf: &AudioBufferRef<'_>, out: &mut Vec<i16>) {
 pub mod decode;
 pub mod output;
 
-pub use output::RingBuffer;
+pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer};
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
-};
 
 pub struct AudioEngine {
     _stream: cpal::Stream,
-    ring: Arc<Mutex<RingBuffer>>,
-    xruns: Arc<AtomicU64>,
+    /// 生产端留在这里（解码线程用）。`HeapProd` 是 `!Sync`，所以
+    /// `AudioEngine` 也 `!Sync` —— 它在单线程里使用，没有问题。
+    producer: AudioRingProducer,
 }
 
 impl AudioEngine {
@@ -2027,34 +2068,26 @@ impl AudioEngine {
         let config = device.default_output_config()?;
         log::info!("音频输出: {} @ {}Hz", device.name()?, config.sample_rate().0);
 
-        let ring = Arc::new(Mutex::new(RingBuffer::new(44100 * 2 * 4))); // ~4 秒缓冲
-        let xruns = Arc::new(AtomicU64::new(0));
+        // ~4 秒缓冲（立体声 44.1kHz）。**split 之后消费端移进回调，全程无锁。**
+        let (mut producer, mut consumer) = AudioRing::new(44100 * 2 * 4).split();
 
-        let ring_cb = Arc::clone(&ring);
-        let xruns_cb = Arc::clone(&xruns);
         let channels = config.channels() as usize;
-        let mut scratch = Vec::<i16>::new();
+        // ⚠️ 回调内**绝不分配**：这里一次性预分配足够容量，
+        //    回调里的 resize 就不会触发重新分配（回调缓冲远小于 8192 帧）。
+        let mut scratch: Vec<i16> = Vec::with_capacity(8192 * 2);
 
         let stream = device.build_output_stream(
             &config.into(),
             move |out: &mut [f32], _| {
-                scratch.clear();
                 let frames = out.len() / channels;
                 scratch.resize(frames * 2, 0); // 引擎内部固定立体声
-                let n = {
-                    let mut rb = match ring_cb.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    rb.pop_slice(&mut scratch)
-                }
-                if n == 0 {
-                    xruns_cb.fetch_add(1, Ordering::Relaxed);
-                }
+                consumer.pop_samples(&mut scratch);
+
                 for (i, slot) in out.iter_mut().enumerate() {
-                    let src = i / channels; // 上混：立体声 → N 声道
-                    *slot = scratch.get(src * 2 + (i % 2).min(1)).copied().unwrap_or(0) as f32
-                        / i16::MAX as f32;
+                    let frame = i / channels;
+                    let ch = (i % channels).min(1);
+                    // 上混：立体声 → N 声道
+                    *slot = scratch[frame * 2 + ch] as f32 / i16::MAX as f32;
                 }
             },
             |err| log::error!("音频流错误: {err}"),
@@ -2062,24 +2095,28 @@ impl AudioEngine {
         )?;
         stream.play()?;
 
-        Ok(Self { _stream: stream, ring, xruns })
+        Ok(Self { _stream: stream, producer })
     }
 
     /// 供解码线程推送样本。
-    pub fn push_samples(&self, data: &[i16]) {
-        if let Ok(mut rb) = self.ring.lock() {
-            rb.push_slice(data);
-        }
+    pub fn push_samples(&mut self, data: &[i16]) {
+        self.producer.push_samples(data);
+    }
+
+    pub fn ring_available(&self) -> usize {
+        self.producer.available()
     }
 
     /// **硬指标：必须为 0**（设计文档 §16.2）。
     pub fn xrun_count(&self) -> u64 {
-        self.xruns.load(Ordering::Relaxed)
+        self.producer.underruns()
     }
 }
 ```
 
-> **注意**：上面的回调里用了 `Mutex`。**这在实时线程里是不理想的**，但 v1 先用它把链路跑通——**因为在单线程写入 + 极短临界区的条件下，Linux 上 `std::sync::Mutex` 的实际表现可接受**。M1 的出口标准是「能出声」，**M2 之后必须换成真正的无锁 ring（`ringbuf::HeapRb`）**。这一条记进 §16.2 的待办。
+> **为什么用 `ringbuf` 而不是自己写或加锁**：`HeapRb` 是无锁 SPSC 环，
+> 消费端在回调里**不加锁、不分配、不阻塞**，满足本计划的 Global Constraints。
+> 自己拿 `Mutex<Vec<i16>>` 会在实时线程里加锁 —— 那是 xrun 的头号来源。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -2093,7 +2130,7 @@ Expected: 3 passed。
 
 ```bash
 git add crates/audio
-git commit -m "feat(audio): RingBuffer + symphonia 解码 + cpal 输出"
+git commit -m "feat(audio): 无锁 AudioRing + symphonia 解码 + cpal 输出"
 ```
 
 ---
@@ -2240,21 +2277,20 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     let url = client.stream_url(&track.id, q).await?;
     println!("得到地址（{} 字符）", url.len());
 
-    let engine = AudioEngine::new()?;
+    let mut engine = AudioEngine::new()?;
     let bytes = reqwest::get(&url).await?.bytes().await?;
     println!("已下载 {} KB，开始播放…（Ctrl-C 停止）", bytes.len() / 1024);
 
     let cursor = std::io::Cursor::new(bytes.to_vec());
-    let engine_ref = &engine;
-    // ⚠️ 分块推送。整块 push 会在锁内逐样本循环，长时间持有 ring 的锁 →
-    //    音频回调拿不到锁 → xrun。必须把单次持锁时间压到远小于一个回调周期。
+    // push_samples 需要 &mut（生产端是 !Sync）。闭包借用 engine，
+    // 闭包结束后借用即释放，后面的 ring_available() 可以直接用。
     const CHUNK: usize = 4096;
     dsls_audio::decode::decode_to_i16(Box::new(cursor), Some("mp3"), &mut |samples| {
         for chunk in samples.chunks(CHUNK) {
-            engine_ref.push_samples(chunk);
+            engine.push_samples(chunk);
         }
         // 背压：缓冲够满就退让，避免解码跑得比播放快太多
-        while engine_ref.ring_available() > 44100 * 2 * 3 {
+        while engine.ring_available() > 44100 * 2 * 3 {
             std::thread::sleep(Duration::from_millis(20));
         }
     })?;
@@ -2357,7 +2393,7 @@ M0 与 M1 全部完成当且仅当：
 
 | 遗留项 | 处理时机 |
 |---|---|
-| 音频回调里的 `Mutex` 必须换成无锁 ring | M2 之后（§16.2） |
+| `ringbuf` 0.4 的实际 API 签名需在 Task 8 实现时对照 `cargo doc` | Task 8 |
 | 网易云 eapi 加密正确性未交叉验证 | M2，对照 `ddy314/netease-music` |
 | 未做 Android 真机验证 | M3 之后 |
 | 未做 `downlevel_webgl2_defaults()` 的 Tier B/C 路径实测 | M3 |

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/platform", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# ── 平台层 ──
+sdl3 = { version = "0.20", features = ["raw-window-handle"] }
+wgpu = "30.0.1"
+pollster = "0.4"
+raw-window-handle = "0.6"
+
+# ── 基础设施 ──
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"

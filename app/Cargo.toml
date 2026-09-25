@@ -1,0 +1,13 @@
+[package]
+name = "dslsmusic"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dsls-platform = { path = "../crates/platform" }
+wgpu.workspace = true
+sdl3.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
