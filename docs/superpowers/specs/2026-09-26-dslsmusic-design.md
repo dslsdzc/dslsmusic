@@ -726,12 +726,77 @@ vec2 offset = n * (w / sd);                      // 圆形下与原始公式恒�
 | | argui / Kyant（启发式） | liquid-glass-studio（物理） |
 |---|---|---|
 | 折射模型 | `circleMap` 深度斜坡 + SDF 梯度法线 | Snell–Descartes 真实折射 |
-| 色散 | 7 通道加权采样 | RGB 三次独立采样（N_R=0.98 / N_G=1.0 / N_B=1.02） |
-| 成本 | 几次 MAD + 1 次纹理采样（无色散）或 7 次（全色散） | 额外 `asin`/`sin`/`tan`/`pow` 各一次，**加每像素两次 LCH 色彩空间往返** |
+| 色散 | 7 通道加权采样，**只碰 1 张纹理** | RGB 采样，**6 次跨 2 张纹理**（3 次清晰 + 3 次模糊，再按 `blurMixRate` 混合） |
+| 默认采样成本 | **1 次**（默认 `chromatic_aberration: 0.0`，要色散才 7 次） | **恒定 6 次 + 双纹理绑定** |
+| 额外数学 | 几次 MAD | `asin`/`sin`/`tan`/`pow` + **LCH 色彩空间往返** |
 
-**瓶颈不在 Snell 数学，在 LCH 往返。** `asin`/`sin`/`tan` 在现代 GPU 上各约 1 个 SFU 周期，可以忽略；但 LCH 转换需要 `atan2` + 立方根级别的运算，**每像素两次**，这才是真正贵的地方。
+**结论：argui 严格更便宜。** 移动端上这是决定性的——不想要色散就一次采样，而 studio 无论如何都要绑两张纹理跑 6 次采样。
 
-**结论：以 argui/Kyant 的 SDF 路线为主，只从 studio 摘两样——superellipse SDF 和 Fresnel。**
+**瓶颈不在 Snell 数学，在 LCH 色彩空间往返。** `asin`/`sin`/`tan` 在现代 GPU 上各约 1 个 SFU 周期，可以忽略；真正贵的是 LCH 转换。朴素往返的代价是：
+
+> **9 次分数幂 `pow` + 1 次 `atan2` + 1 次 `sqrt`，约 40–60 ALU 周期/像素。**
+
+（`SRGB_TO_LCH` 里 3 次 `pow(x, 2.4)` + 3 次 `pow(x, 0.3333)`；`LCH_TO_SRGB` 里 3 次 `pow(x, 0.4167)`。）
+
+**但这里有一条重要的实施经验：** studio 的 Fresnel 代码里，`SRGB_TO_LCH` 的参数**只依赖 `u_tint` 这个 uniform，完全帧恒定** → 可以整个提到 CPU 或一个 1×1 预计算 pass，**逐像素成本为零**。而 `LCH_TO_SRGB` 里**只有 L 逐像素变化**，C 和 H 帧恒定 → `atan2` 可以提成帧常量，逐像素只剩 `x³` + 15 flops + 3 次 `pow`。
+
+优化后 ≈ 3 次 `pow` + 25 flops（约 15 周期），比朴素版省 60–75%。**而且这 3 次 `pow` 还可以直接省掉**——见下方 Fresnel 部分。
+
+**最终选择：以 argui/Kyant 的 SDF 路线为主，只从 studio 摘两样——superellipse SDF 和 Fresnel。**
+
+#### 从 studio 摘取的两样
+
+**A. superellipse 圆角 SDF**（Apple 连续曲率的关键）
+
+```wgsl
+fn superellipseCornerSDF(p_in: vec2f, r: f32, n: f32) -> f32 {
+  let p = abs(p_in);
+  let v = pow(pow(p.x, n) + pow(p.y, n), 1.0 / n);
+  return v - r;
+}
+
+fn roundedRectSDF(p_in: vec2f, center: vec2f, width: f32, height: f32,
+                  cornerRadius: f32, n: f32) -> f32 {
+  let p = p_in - center;
+  let cr = cornerRadius * u.u_dpr;
+  let d = abs(p) - vec2f(width, height) * u.u_dpr * 0.5;
+  var dist: f32;
+  if (d.x > -cr && d.y > -cr) {                       // 只在圆角区域走 superellipse
+    let cornerCenter = sign(p) * (vec2f(width, height) * u.u_dpr * 0.5 - vec2f(cr));
+    dist = superellipseCornerSDF(p - cornerCenter, cr, n);
+  } else {                                            // 直边区域走标准 SD
+    dist = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));
+  }
+  return dist;
+}
+```
+
+`n` 由 `u_shapeRoundness` 控制：**n=2 是椭圆，n→∞ 趋近方角，Apple 的连续曲率约在 n≈4~5**。
+
+**关键细节：只在圆角象限用 superellipse，直边仍用标准 SDF。** 否则会破坏梯度连续性，**折射方向会在直边处扭曲**。
+
+**B. Fresnel**
+
+原版：
+
+```wgsl
+let fresnelFactor = clamp(
+  pow(1.0 + merged * u_resolution1x.y / 1500.0 * pow(500.0 / u_refFresnelRange, 2.0)
+      + u_refFresnelHardness,
+      5.0),
+  0.0, 1.0);
+```
+
+`merged` 是 SDF 值（内部为负），所以离边缘越近 `fresnelFactor` 越大。结构上等价于 `pow(1 - NdotV, 5)` 的 Schlick 近似，**但用 SDF 距离替代了法线点积——这比真算法线便宜且更稳**（SDF 梯度在边缘处不会退化）。
+
+**建议改写掉 LCH**：Fresnel 本来就是个边缘高光，不需要感知均匀性。
+
+```wgsl
+let fres = fresnelFactor * u_refFresnelFactor * 0.7 * length(normal);
+outColor = mix(outColor, vec4f(linearTint + vec3f(fres * 0.2), 1.0), fres);
+```
+
+在线性 RGB 里给 tint 加量，而不是抬高感知亮度。视觉差异是 LCH 版在不同色相上提亮更均匀、RGB 版会把高饱和色更快推向白——但这里 `fresnelFactor` 被 clamp 到 [0,1] 又乘了 0.7，是边缘一圈的细微高光，**肉眼看不出差别**。
 
 #### 实施路径
 
@@ -939,7 +1004,7 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **argui** | MIT/Apache-2.0 ✅ | WGSL 移植参考、`argui-layout/src/paint/effects.rs` 看 effect 怎么接进 paint 流程 |
 | **Reimagined-Glass** | 见仓库 | **玻璃 shader 第一参考资料**：通用 SDF 法线/厚度/offset 推导 + 中轴线接缝 + mip 选择（§9.10） |
 | **Hyprland** `src/render/shaders/glsl/blur1.glsl` | GPL ⚠️ | dual Kawase 降采样参考实现 + **vibrancy/saturation 逐级施加**的技巧（§9.5）。**只读思路** |
-| **`backdrop-blur-wgpu`** | — | **最贴近我们需求的架构参考**：两阶段 `prepare` → `record` 的 seam trait（因为 wgpu 走 Queue 上传而 glow 是 immediate mode）、按 target format 懒建 pipeline、sRGB 拒绝、Backdrop-Root rule、last-frame-used 淘汰。**GitHub 主页 404，只抄设计不依赖**。注意它的 wgpu 后端目前只有可分离 Gaussian，dual Kawase 还是 TODO |
+| **`backdrop-blur-wgpu`** | 见 crate | **最贴近我们需求的架构参考**：两阶段 `prepare` → `record` 的 seam trait（因为 wgpu 走 Queue 上传而 glow 是 immediate mode）、按 target format 懒建 pipeline、sRGB 拒绝、Backdrop-Root rule、last-frame-used 淘汰。**注意它的 wgpu 后端目前只有可分离 Gaussian，dual Kawase 还是 TODO**。⚠️ **GitHub 主页 404——但源码可从 crates.io CDN 直接取**：`https://static.crates.io/crates/backdrop-blur-wgpu/backdrop-blur-wgpu-0.2.0.crate`（已验证可下载解包） |
 | **Bevy render graph** | MIT/Apache ✅ | 阶段划分词汇表 + 异步 PipelineCache（§9.11）。不引入依赖 |
 | **SIGGRAPH 2015** Marius Bjørge "Bandwidth-Efficient Rendering" + three.js PR #33920 | — | dual Kawase 原始出处与工程数据（§9.2） |
 | **Slint** box shadow 缓存 | GPLv3 ⚠️ | `SkiaBoxShadowCache` / `FemtovgBoxShadowCache` 的模糊纹理复用思路。**只读思路不抄代码** |
