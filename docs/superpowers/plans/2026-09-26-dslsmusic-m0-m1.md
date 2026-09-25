@@ -120,7 +120,10 @@ env_logger = "0.11"
 
 ```toml
 [toolchain]
-channel = "stable"
+# 固定到具体版本，而不是 "stable" —— 后者的实际含义是「用你本机装的
+# 那个 stable」，既不提供可复现性（新 stable 会静默编出不同的代码），
+# 又会让旧 stable 用户撞上难以理解的失败。本机实测为 1.96.1。
+channel = "1.96"
 components = ["rustfmt", "clippy"]
 ```
 
@@ -182,9 +185,10 @@ log.workspace = true
 //! 建管线。让渲染收敛到 `ui-render` 是后续目标，不是当前的不变量。
 
 pub mod capability;
-
-pub use capability::RenderTier;
 ```
+
+**注意：这里不要写 `pub use capability::RenderTier;`** —— `RenderTier` 是 Task 2
+才创建的类型，现在写这行是硬编译错误。Task 3 会重写本文件并补上完整的重导出。
 
 - [ ] **Step 4: 建 app 骨架**
 
@@ -2523,6 +2527,7 @@ git commit -m "feat(m1): CLI 端到端串联 —— 扫码登录 / 搜索 / 取�
 M0 与 M1 全部完成当且仅当：
 
 - [ ] 仓库根有 `LICENSE`（GPLv3 全文），且 workspace `license = "GPL-3.0-or-later"`
+- [ ] `cargo deny check licenses` 通过（GPLv3 兼容性审计；**需要网络**，本机 `cargo metadata --offline` 因缺 android_system_properties 缓存而失败）
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --workspace -- -D warnings` 无告警
 - [ ] 运行 `cargo run -p dslsmusic` 弹出窗口、显示三角形、日志显示 `RenderTier: A` 且适配器**不是** llvmpipe
