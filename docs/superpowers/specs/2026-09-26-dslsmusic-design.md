@@ -833,7 +833,25 @@ self.begin_frame();                                      // 再推进驱逐时�
 
 **上游 v1 没有任何缓解措施。我们的改进：把 texture 分配尺寸量化到 16px 或 32px 网格。** 这样拖动时只有跨越网格边界才新建链，其余帧全部命中。
 
-> **这个改进实现极简、价值很大，直接写进 `ui-render` 的设计。**
+**量化 `key.size`，不是量化请求区域。** 而且 UV 的问题**已经被现成机制解决了**——这正是它「实现极简」的原因：
+
+```rust
+pub fn backdrop_uv_remap(source_region: &Region, clipped: &Region) -> ([f32; 2], [f32; 2]) {
+    let [sx, sy] = [source_region.origin[0] as f32, source_region.origin[1] as f32];
+    let [sw, sh] = [source_region.size[0] as f32, source_region.size[1] as f32];
+    let [cx, cy] = [clipped.origin[0] as f32, clipped.origin[1] as f32];
+    let [cw, ch] = [clipped.size[0] as f32, clipped.size[1] as f32];
+    ([(sx - cx) / cw, (sy - cy) / ch], [sw / cw, sh / ch])
+}
+```
+
+这个函数**是纯几何的、接受两个任意 `Region`**，而且**今天已经在处理「scratch 尺寸 ≠ 请求区域」的情况**——用在**部分离屏**场景：`clip_to` 把部分出界的区域裁到界内子矩形，scratch 只装界内那部分，于是 `clipped ⊂ source_region`，`scale > 1`。
+
+**量化后是同一种问题，只是方向相反**：scratch 比区域**大**，`scale < 1`。
+
+> **同一个函数、同样的数学、零新增代码。** 只需把配对的第二个 `Region` 从「裁剪后的」换成「网格对齐的」。
+
+**这个改进直接写进 `ui-render` 的设计。**
 
 #### Static 策略不检测「背后内容没变」——它不检测
 
@@ -958,6 +976,65 @@ vec2 offset = n * (w / sd);                      // 圆形下与原始公式恒�
 优化后 ≈ 3 次 `pow` + 25 flops（约 15 周期），比朴素版省 60–75%。**而且这 3 次 `pow` 还可以直接省掉**——见下方 Fresnel 部分。
 
 **最终选择：以 argui/Kyant 的 SDF 路线为主，只从 studio 摘两样——superellipse SDF 和 Fresnel。**
+
+#### 为什么走启发式：保真度论证（不只是性能）
+
+上面是性能账。**但更重要的结论是：物理折射在保真度维度上也是偏离的。**
+
+**总依据：Apple 官方定性是「digital meta-material」，不是真实材质的模拟。用物理正确的 Snell 去建模，是在建模一个 Apple 明确说没有建模的东西。**
+
+**张力 1：物理折射引入尺寸依赖，而 Apple 明确要求尺寸无关。**
+
+Apple 原文：Regular 变体 "**works at any size over any content**"。
+
+物理链条：真实玻璃的折射由厚度 `t` 和曲率半径 `R` 决定，位移量 ≈ `t · tan(θT − θI)`。
+
+- 位移量与厚度成正比 → 玻璃「多厚」直接决定折射多强
+- 曲率决定法线分布 → 圆角半径越小，边缘法线旋转越快，折射带越窄越强
+- 所以一块 **32px 高的胶囊按钮**和一块 **800px 高的侧边栏**，用同一组物理参数，**边缘折射带的视觉宽度完全不同**（前者几乎看不出，后者很夸张）
+
+要让它尺寸无关，只能：(a) 按尺寸逐档调厚度/曲率——那就不是物理了，是伪装成物理的启发式；(b) 把厚度定义成「相对尺寸的比例」——这等于直接承认折射强度是**设计参数**，物理外衣被剥掉。
+
+**反观启发式**：`circleMap(1 - (-sd)/height) * amount` 里 `height` 是**折射高度（一个设计令牌）**，位移量由 `amount` 直接给定，**与元素尺寸解耦**。这正是 Apple 要的性质。
+
+**张力 2：Apple 的 lensing 是「响应式」的，折射强度是设计参数而非材料常数。**
+
+Apple 原文：lensing 是 "**responsive lensing along its edges**"，且淡入淡出是「**折射强度的渐变**」（materialize in/out）——折射强度**必须能被动画驱动**。
+
+**物理模型的问题：Snell 公式里 IOR 是材料常数。** 玻璃是 1.5 就是 1.5，没有「这帧折射强度 0.3、下帧 0.8」这种旋钮。所以必须引入一个非物理的缩放因子——studio 实际就是这么做的：
+
+```wgsl
+let thetaT = safeAsin(1.0 / u_refFactor * sin(thetaI));   // u_refFactor 是 uniform，不是常数
+```
+
+**一旦乘了这个因子，就已经回到启发式了**——只是额外付了 `asin`/`sin`/`tan`/`pow` 的钱，换来一个同样非物理的结果。
+
+**张力 3：物理只覆盖四层里一层的真子集。**
+
+| Apple 层 | 物理折射能提供吗 |
+|---|---|
+| Lensing（折射 + 聚焦） | 部分——**聚焦（focus）物理模型没有对应物** |
+| Highlights（响应几何的环境光） | **完全不能** |
+| Shadow / grounding（感知背后内容） | **完全不能** |
+| Interaction illumination（触摸内发光 + 蔓延） | **完全不能** |
+
+第 1 层做得再物理，也拿不到另外三层。**投入产出比很差。**
+
+#### 公平地说：物理路线的真实优势是什么
+
+**它更自洽、更少魔法数——但不是「更像 Apple」。**
+
+| | 启发式 | 物理 |
+|---|---|---|
+| 边缘带 | 手工塑形，如 `pow(edge, 10.0) * bevelDepth` | 一套公式免费得到 |
+| 色散 | 手工塑形，如 `centered.x * centered.y / (halfW * halfH)`（四角最强） | 自然得出 |
+| 泛化性 | 为圆角矩形调的参数未必能推到 squircle / blob | 对任意形状成立 |
+
+**一个有意思的佐证**：Apple 设计师**确实在工业设计工作室做了不同透明度/透镜特性的真实玻璃**来对照（Macworld 报道）。但目的是**用来告知一个被设计出来的材质**，不是用来模拟它。
+
+> **真实玻璃是参考，不是目标函数。**
+
+**唯一值得从物理路线拿的，是它的「自洽性」思路**——用一套公式覆盖所有形状，而不是给每种形状手调常数。落到实现就是：**用 SDF 梯度（对任意形状成立）而不是给圆角矩形特调的 bevel 项**。`argui` 的 `glass_gradient` 正是这么做的。
 
 #### 从 studio 摘取的两样
 
