@@ -719,6 +719,20 @@ vec2 offset = n * (w / sd);                      // 圆形下与原始公式恒�
 - **一个半径需要 127 次光线模拟**（受 SVG displacement map 分辨率限制）
 - 若预烘焙 displacement map：`RG = 128 + Normal × 127`，B 固定 0，A 固定 255（零向量 = RGBA(127,127,0,255)）；所有向量除以最大位移模长归一化，另存 `maximumDisplacement` 还原
 
+#### 路线选择：启发式 SDF 赢过物理折射
+
+有两条实现路线，调研结论是**走启发式**：
+
+| | argui / Kyant（启发式） | liquid-glass-studio（物理） |
+|---|---|---|
+| 折射模型 | `circleMap` 深度斜坡 + SDF 梯度法线 | Snell–Descartes 真实折射 |
+| 色散 | 7 通道加权采样 | RGB 三次独立采样（N_R=0.98 / N_G=1.0 / N_B=1.02） |
+| 成本 | 几次 MAD + 1 次纹理采样（无色散）或 7 次（全色散） | 额外 `asin`/`sin`/`tan`/`pow` 各一次，**加每像素两次 LCH 色彩空间往返** |
+
+**瓶颈不在 Snell 数学，在 LCH 往返。** `asin`/`sin`/`tan` 在现代 GPU 上各约 1 个 SFU 周期，可以忽略；但 LCH 转换需要 `atan2` + 立方根级别的运算，**每像素两次**，这才是真正贵的地方。
+
+**结论：以 argui/Kyant 的 SDF 路线为主，只从 studio 摘两样——superellipse SDF 和 Fresnel。**
+
 #### 实施路径
 
 **从上游 Kyant0 移植算法**（Apache-2.0，需保留署名），以 `ExtraBinoss/argui` 的 WGSL 移植作为**翻译参考**——它已经趟过一遍（预乘 alpha 处理、法线退化防护、边界采样 clamp）。
@@ -930,13 +944,46 @@ window / input / mouse / touch / keyboard / **IME** / DPI / display / clipboard 
 | **SIGGRAPH 2015** Marius Bjørge "Bandwidth-Efficient Rendering" + three.js PR #33920 | — | dual Kawase 原始出处与工程数据（§9.2） |
 | **Slint** box shadow 缓存 | GPLv3 ⚠️ | `SkiaBoxShadowCache` / `FemtovgBoxShadowCache` 的模糊纹理复用思路。**只读思路不抄代码** |
 
-### 14.4 关于 argui 的重要说明
+### 14.4 关于 argui：抄 WGSL，不取依赖
 
-`ExtraBinoss/argui` 是一个 Rust UI 框架，**架构和我们设计的几乎完全一致**（retained tree / flex-grid 布局 / 文本整形 + IME / 无障碍语义 / 多窗口 / 热重载 / 移动端入口），且已经有 `liquid_glass.wgsl`。
+`ExtraBinoss/argui` 是一个 **29 个 crate** 的 Rust UI workspace（11.6 MB），架构和我们设计的几乎完全一致：`argui-layout`（taffy）、`argui-text`（cosmic-text）、`argui-widgets`、`argui-animation`、`argui-accessibility`（AccessKit）、`argui-theme`、`argui-devtools`、`argui-render`、`argui-paint`、`argui-android` / `argui-ios`。
 
-**但它不能作为基座依赖：** 仓库创建于 2026-09-01，提交集中在 09-05 到 09-20，**十五天大的单人项目**，32 star，1 fork。风险等级比已被否决的 vello 更高。
+**这是和我们直接竞争的完整运行时，不是可插拔的效果库。**
 
-**正确用法：** 作为**参考实现**读（许可干净，MIT/Apache-2.0），shader 算法从上游 Kyant0 移植。不要依赖。
+#### 三条否决理由（比「太年轻」更硬）
+
+1. **`argui-effects` 不是独立 crate。** 它的依赖是 `argui-paint` + `argui-render`（`scroll` feature 再加 `argui-ui`）。**用它就等于接入 argui 的整条 paint/render 管线**，而不是单独拿一个效果。
+2. **`wgpu = "=30.0.1"` 是精确锁。** 下游消费者会被强行钉死在某个 wgpu **补丁版本**上，和我们自己的 wgpu 版本必然打架。这是对下游最不友好的依赖形式。
+3. **bus factor = 1。** 创建 2026-09-01，最后提交 2026-09-25，版本 **0.3.2**（pre-1.0），32 star，1 fork，无生态、无第三方使用记录、无安全审计历史。迭代速度是「每天重构」。
+
+#### 正确用法：抄 shader（Apache-2.0 允许，代价只是保留署名）
+
+| 文件 | 内容 |
+|---|---|
+| `crates/argui-effects/src/shaders/effects/liquid_glass.wgsl` | 主 shader，85 行 |
+| `crates/argui-effects/src/shaders/effects/liquid_glass_blur.wgsl` | H/V 两轴共用，靠 `glass_blur_axis(uv, source, vec2(1,0))` 参数化 |
+| `crates/argui-effects/src/liquid_glass.rs` | 参数结构体 + 默认值 |
+| `crates/argui-effects/LICENSE-android-liquid-glass` | **必须一并保留** |
+
+参数结构（可直接照搬）：
+
+```rust
+pub struct LiquidGlass {
+    pub refraction: f32,             // 逻辑像素
+    pub chromatic_aberration: f32,
+    pub blur: f32,                   // 高斯 sigma，0–16，0 保持锐利
+    pub highlight: f32,
+    pub edge_width: f32,
+    pub saturation: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub depth_effect: bool,          // 径向深度是否混入折射法线
+    pub tint: [f32; 4],              // 线性 RGB + tint 量；alpha 不改变源覆盖
+}
+// 默认：refraction: 38.0, chromatic_aberration: 0.0, blur: 8.0, tint: [0,0,0,0.272]
+```
+
+注意它的 shader 是**注入式 ABI**（`argui_effect(uv, source, backdrop)` + `argui_param_f32(N)` 编号取值），**不是可直接使用的文件**——移植的是数学，不是文件。
 
 ---
 
