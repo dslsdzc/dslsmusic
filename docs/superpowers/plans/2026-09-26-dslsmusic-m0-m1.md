@@ -1678,8 +1678,14 @@ git commit -m "feat(provider-api): Quality 扩到 5 档保真度梯度，新增 
   - `NeteaseClient::qr_check(&self, key: &str) -> Result<QrState, SourceError>`
   - `pub fn extract_music_u(cookie: &str) -> Option<String>` ★ 纯函数，可单测
 
-> **注意**：这里刻意**不用** `anyhow::Result`。音源层对外一律是 typed
-> `SourceError`（设计文档 §4.5），`anyhow` 只允许出现在 `app` 的边界。
+> **注意**：这里刻意**不用** `anyhow::Result`。**音源层（`provider-*`）对外一律是
+> typed `SourceError`**（设计文档 §4.5），因为音源抽象是第三方实现要绑上去的边界，
+> 错误类型必须是可穷尽匹配的。
+>
+> ⚠️ **不要说成「`anyhow` 只允许出现在 `app` 的边界」——那句话是假的。**
+> `crates/platform` 一直在用 `anyhow`，而且**是有意的**：平台层面向 app 内部，
+> 不是别人要实现的抽象。**一句为假的约束会让后来的代理去「修」对的东西。**
+>
 > Task 9 按本块的签名调用，Task 7 在此之上追加方法。
 
 - [ ] **Step 1: 写失败的测试**
@@ -2034,7 +2040,9 @@ impl NeteaseClient {
         // 所以「读 body.cookie」的写法在这里不适用。
         //
         // 传原始条目进去，由 `session_cookie` 负责拼装与清洗。
-        Ok(crate::qr_login::QrState::from_code(code, &resp.cookie))
+        // **不要再包一层 `Ok(..)`** —— `from_code` 自己返回 `Result`，
+        // 包了就是 `Result<Result<..>>`，E0308。
+        crate::qr_login::QrState::from_code(code, &resp.cookie)
     }
 }
 
