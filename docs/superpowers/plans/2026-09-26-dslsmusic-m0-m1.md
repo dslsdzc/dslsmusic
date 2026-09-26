@@ -1221,7 +1221,7 @@ git commit -m "feat(m0): 帧时间测量基建（avg/p50/p95/p99/max）"
   - `pub type SourceResult<T> = Result<Option<T>, SourceError>`
   - `pub struct CapabilitySet`（bitflags 或 HashSet）
   - `pub enum Quality { Low, Standard, High, Super }`
-  - `pub struct Track { pub id: String, pub title: String, pub artist: String, pub album: String, pub duration_ms: u64 }`
+  - `pub struct Track { pub id: String, pub platform: String, pub title: String, pub artist: String, pub album: String, pub duration_ms: u64 }`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1518,10 +1518,18 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
 **Interfaces:**
 - Consumes: `dsls-provider-api`
 - Produces:
+  - `pub const PLATFORM: &str = "netease"` —— 平台标识的唯一来源
   - `pub enum QrState { WaitingScan, WaitingConfirm, Confirmed { cookie: String }, Expired }`
-  - `pub async fn begin_qr_login(client: &ApiClient) -> anyhow::Result<(String, Vec<u8>)>`（返回 key + PNG 字节）
-  - `pub async fn poll_qr_login(client: &ApiClient, key: &str) -> anyhow::Result<QrState>`
+  - `impl QrState { pub fn from_code(code: i64, raw_cookie: &str) -> Self }`
+  - `NeteaseClient::new(cookie: Option<String>) -> Self`、`with_cookie(String) -> Self`
+  - `NeteaseClient::qr_key(&self) -> Result<String, SourceError>`
+  - `NeteaseClient::qr_image(&self, key: &str) -> Result<Vec<u8>, SourceError>`（PNG 字节）
+  - `NeteaseClient::qr_check(&self, key: &str) -> Result<QrState, SourceError>`
   - `pub fn extract_music_u(cookie: &str) -> Option<String>` ★ 纯函数，可单测
+
+> **注意**：这里刻意**不用** `anyhow::Result`。音源层对外一律是 typed
+> `SourceError`（设计文档 §4.5），`anyhow` 只允许出现在 `app` 的边界。
+> Task 9 按本块的签名调用，Task 7 在此之上追加方法。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1742,6 +1750,12 @@ base64 = "0.22"
 pub mod client;
 pub mod qr_login;
 
+/// 本 provider 的平台标识。
+///
+/// `Track::platform` 与 `MusicSource::name()` **必须共用这一个值**——
+/// 两者若各写一份字面量，会在跨音源路由时静默分叉（设计文档 §4.5）。
+pub const PLATFORM: &str = "netease";
+
 pub use client::NeteaseClient;
 pub use qr_login::{QrState, extract_music_u};
 ```
@@ -1808,6 +1822,8 @@ mod tests {
         assert_eq!(tracks[0].artist, "歌手A / 歌手B");
         assert_eq!(tracks[0].album, "专辑X");
         assert_eq!(tracks[0].duration_ms, 245000);
+        // platform 是路由键，不是装饰：resolver 靠它找回正确的 provider
+        assert_eq!(tracks[0].platform, PLATFORM);
     }
 
     #[test]
@@ -1864,6 +1880,7 @@ Expected: 编译失败，`cannot find function parse_search_tracks`。
 `crates/provider-netease/src/parse.rs` 的 `mod tests` **之前**插入：
 
 ```rust
+use crate::PLATFORM;
 use dsls_provider_api::{Quality, SourceError, Track};
 use serde_json::Value;
 
@@ -1896,7 +1913,14 @@ pub fn parse_search_tracks(body: &Value) -> Result<Vec<Track>, SourceError> {
                 .unwrap_or_default()
                 .to_string();
             let duration_ms = s.get("dt").and_then(|v| v.as_u64()).unwrap_or(0);
-            Some(Track { id: id.to_string(), title, artist, album, duration_ms })
+            Some(Track {
+                id: id.to_string(),
+                platform: PLATFORM.to_string(),
+                title,
+                artist,
+                album,
+                duration_ms,
+            })
         })
         .collect())
 }
@@ -1926,6 +1950,13 @@ pub fn parse_stream_url(body: &Value, _q: Quality) -> Result<String, SourceError
 }
 
 pub use quality_to_br as br_for_quality;
+```
+
+`crates/provider-netease/src/lib.rs` 追加一行（**这一步就是本任务 `Files:` 里承诺的 lib.rs 修改**——
+不声明 `pub mod parse;`，上面的测试文件根本不会被编译）：
+
+```rust
+pub mod parse;
 ```
 
 - [ ] **Step 4: 在 client.rs 追加方法**
