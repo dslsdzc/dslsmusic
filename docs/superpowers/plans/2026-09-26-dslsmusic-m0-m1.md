@@ -1227,6 +1227,8 @@ git commit -m "feat(m0): 帧时间测量基建（avg/p50/p95/p99/max）"
 - Produces:
   - `pub enum SourceError { Unsupported, NotFound, AuthRequired, Unavailable, RateLimited, Network(String), Protocol(String) }`
   - `pub type SourceResult<T> = Result<Option<T>, SourceError>`
+    ⚠️ 语义已于 2026-09-26 收口：**「查到了但没结果」= `Ok(Some(空集合))`；
+    `Ok(None)` = 「本 provider 不处理」，与 `Err(Unsupported)` 等价**（设计文档 §4.5）
   - `pub struct CapabilitySet`（bitflags 或 HashSet）
   - `pub enum Quality { Low, Standard, High, Super }` —— ⚠️ **Task 5b 会把它扩到 5 档**
     并改名（`Super` → `Lossless`，新增 `HiRes`）；Task 7 起请以 Task 5b 的为准

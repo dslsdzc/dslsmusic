@@ -583,6 +583,7 @@ pub type SourceResult<T> = Result<Option<T>, SourceError>;
 | `Ok(None)` | **本 provider 不处理这个请求**（= 没这个能力） |
 | `Err(Unsupported)` | **同上**，另一种拼写 |
 | `Err(Unavailable)` | **有能力，但当前拿不到** |
+| `Err(Protocol)` | **上游变了** ← 这一条对网易云尤其重要（§13.1） |
 
 > **⚠️ 这里改正一处早先的定义冲突**（Task 7 复审发现，2026-09-26）。
 > 本表原先把 `Ok(None)` 定义成「请求合法，但确实没有」——**那个定义与
@@ -601,7 +602,6 @@ pub type SourceResult<T> = Result<Option<T>, SourceError>;
 >
 > `Ok(None)` 与 `Err(Unsupported)` 语义等价、只是两种拼写，这是 `Option` 带来的
 > 冗余，**不是需要区分的两种情况**——早先的测试注释把它当成两种，那是错的。
-| `Err(Protocol)` | **上游变了** ← 这一条对网易云尤其重要（§13.1） |
 
 **这对未来多音源特别重要**：只有区分出 `Unsupported`，resolver 才知道「换一个音源试」有没有意义；只有区分出 `Unavailable`，才知道该不该降音质重试。
 
@@ -623,7 +623,7 @@ pub type SourceResult<T> = Result<Option<T>, SourceError>;
 | 层 | 缺口 |
 |---|---|
 | **机制** | `Capability` 没有 `#[non_exhaustive]`，加变体会破坏外部穷尽 `match`——**而 resolver 正是要 match 它的那个**。`#[async_trait]` 本身支持带默认实现的 async 方法，所以加方法不破坏实现者 |
-| **形状①** | `SourceResult<T> = Result<Option<T>, SourceError>` 是**查询形状**——「请求合法但确实没有」是合法答案。**写操作没有「什么都没有」**：`Ok(None)` 对一次上传毫无意义。写路径要的是 `Result<(), SourceError>` |
+| **形状①** | `SourceResult<T> = Result<Option<T>, SourceError>` 是**查询形状**——「查到了但没结果」是合法答案（用 `Ok(Some(空集合))` 表达，见 §4.5 的收口）。**写操作没有「什么都没有」**：`Ok(None)` 对一次上传毫无意义。写路径要的是 `Result<(), SourceError>` |
 | **形状②** | 错误模型没有写失败变体，**且有个谓词会主动作恶**：配额/空间不足最自然的归类是 `Unavailable`，而 `should_retry_lower_quality()` 对它返回 true——**于是一次永不可能成功的上传会触发整条音质降级链** |
 | **形状③** | `CapabilitySet` 是路由词汇表，**没有任何写名词**；界面若按 `supports(Capability::Upload)` 分流会发现没有方法可调 |
 
