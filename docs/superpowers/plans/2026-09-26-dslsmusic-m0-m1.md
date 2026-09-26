@@ -1259,8 +1259,11 @@ mod tests {
         // 这两种拼写语义相同，值当然不同 —— 断言它们不同是在钉「两种拼写都存在」，
         // 不是在说它们是要区分的两种情况
         assert_ne!(not_handled, unsupported);
-        assert_eq!(empty, Ok(None));
         assert!(matches!(unsupported, Err(SourceError::Unsupported)));
+        // ⚠️ 这里**不要**再写 `assert_eq!(empty, Ok(None))` ——
+        // `empty` 现在就是 `Ok(Some(vec![]))`，那个断言必失败。
+        // 它是收口前那版测试的残留（实现者逐字照抄实跑取证：
+        // left: Ok(Some([])) / right: Ok(None)）。
     }
 
     #[test]
@@ -1414,8 +1417,19 @@ impl SourceError {
     }
 }
 
-/// **关键契约**：`Ok(None)` 表示「请求合法，但确实没有」，
-/// 与 `Err(Unsupported)`「provider 没这个能力」是两回事。
+/// **关键契约**（语义已于 2026-09-26 收口，见设计文档 §4.5）：
+///
+/// | 值 | 含义 | resolver 该做什么 |
+/// |---|---|---|
+/// | `Ok(Some(v))` | 拿到了。**`v` 可以是空集合**＝查到了但没结果 | 用它；**不要**换音源 |
+/// | `Ok(None)` | **本 provider 不处理这个请求** | **换一个音源试** |
+/// | `Err(Unsupported)` | **同上**，另一种拼写 | 同上 |
+/// | `Err(Unavailable)` / `Err(RateLimited)` | 有能力，但当前拿不到 | 降档重试 |
+///
+/// ⚠️ **`Ok(None)` 与 `Err(Unsupported)` 语义等价** —— 这是 `Option` 带来的冗余，
+/// **不是需要区分的两种情况**。早先的注释把「`Ok(None)`＝确实没有」与
+/// 「`Err(Unsupported)`＝没这个能力」当成两回事，**那是错的**：
+/// 它会让 `Ok(None)` 与 `Ok(Some(空集合))` 撞车，而这两者导向**相反的动作**。
 pub type SourceResult<T> = Result<Option<T>, SourceError>;
 
 // （此处原有一个 `const _: () = { fn _t(_: SourceResult<Track>) {} };` 块，
@@ -2307,7 +2321,10 @@ mod tests {
 
     #[test]
     fn empty_result_is_ok_not_error() {
-        // Ok(None) / 空列表 与 Err(Unsupported) 必须区分（设计文档 §4.5）
+        // **空结果 = `Ok(Some(空集合))`，不是 `Ok(None)`**（设计文档 §4.5 收口后）：
+        //   「查到了但没结果」→ resolver **不该**换音源
+        //   「本 provider 不处理」→ **应该**换音源
+        // 本条钉的是前者：空列表必须走 `Ok(Some(..))` 这条边。
         let body = json!({"result": {"songs": []}});
         assert_eq!(parse_search_tracks(&body).unwrap().len(), 0);
     }
