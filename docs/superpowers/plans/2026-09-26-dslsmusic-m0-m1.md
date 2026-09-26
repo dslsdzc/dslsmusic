@@ -21,6 +21,7 @@
 - **登录只做只读路径**（扫码 / UID），**绝不调用签到、打卡、云盘上传类接口**（设计文档 §4.4）。
 - **音频回调线程内禁止分配内存、加锁、IO**（设计文档 §16.2）。
 - 平台：Linux（Wayland/niri）为主，**无 X11 退路**。
+- **任何依赖 `log` 输出的验证命令必须带 `RUST_LOG=info`。** `env_logger` 在无此环境变量时默认 Error 级，`log::info!` / `log::warn!` 会被静默丢弃——**命令会「成功」但打不出任何东西，Expected 因此不可达**。（Task 3 实测踩到，同一根因在计划里有 3 处。）
 - **本项目是 GPLv3** —— 因此 GPL-3.0 / AGPL-3.0 的参考实现**可用**（此前被错误否决），但**非商业许可（如 PolyForm NC）与 GPLv3 不兼容，绝不可用**；无 license 的同样不可用（§14.1）。
 
 ---
@@ -1048,7 +1049,8 @@ Expected: 4 passed。
 - [ ] **Step 6: 运行并观察真实数据**
 
 ```bash
-cargo run -p dslsmusic 2>&1 | grep "帧时间" | head -5
+# 必须带 RUST_LOG=info，否则 log::info! 被 env_logger 丢弃，grep 什么都找不到
+RUST_LOG=info cargo run -p dslsmusic 2>&1 | grep "帧时间" | head -5
 ```
 
 Expected: 每 300 帧输出一行，`p99` 应接近 `avg`（空载场景不该有长尾）。**若 p99 明显高于 avg，说明有卡顿源，这是 M3 要重点查的对象。**
@@ -2517,7 +2519,7 @@ Expected:
 - [ ] **Step 5: 端到端验证 —— 出声**
 
 ```bash
-cargo run -p dslsmusic -- play "周杰伦 晴天"
+RUST_LOG=info cargo run -p dslsmusic -- play "周杰伦 晴天"
 ```
 
 Expected:
@@ -2558,7 +2560,7 @@ M0 与 M1 全部完成当且仅当：
 - [ ] `cargo deny check licenses` 通过（GPLv3 兼容性审计；**需要网络**，本机 `cargo metadata --offline` 因缺 android_system_properties 缓存而失败）
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --workspace -- -D warnings` 无告警
-- [ ] 运行 `cargo run -p dslsmusic` 弹出窗口、显示三角形、日志显示 `RenderTier: A` 且适配器**不是** llvmpipe
+- [ ] `RUST_LOG=info cargo run -p dslsmusic` 弹出窗口、显示三角形、日志显示 `RenderTier: A` 且适配器**不是** llvmpipe
 - [ ] 日志出现帧时间统计行
 - [ ] `cargo run -p dslsmusic -- login` 能完成扫码并落地 session
 - [ ] `cargo run -p dslsmusic -- play "<歌名>"` **能出声**，结束时 `xrun 计数 = 0`
