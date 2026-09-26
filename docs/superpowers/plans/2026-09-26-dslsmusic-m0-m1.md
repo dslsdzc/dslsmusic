@@ -3285,12 +3285,20 @@ fn fill_from_ring<T>(
 
     while frame < total_frames {
         let want_frames = (total_frames - frame).min(cap_frames);
-        let got = consumer.pop_raw(&mut scratch[..want_frames * 2]);
-        // ⚠️ `got` **可能是奇数**（环里恰好剩半个立体声帧）。
-        // 直接 `got / 2` 会丢掉那一个样本，**并让它后面的所有 L/R 整体错位**
-        // ——听感是**声道互换**，比丢一个样本难查得多。
-        // ⇒ 奇数时**只取整帧**，剩下的那半个样本当作饿死（下面会记一次 underrun，
-        //    `starved` 会置位并 break，不会带着错位继续跑）。
+        let want = want_frames * 2;
+        // ⚠️ **只取整帧。** 环里可能装着**奇数**个样本：push 端按任意边界切分
+        //    同一个立体声流是合法的（先推 `[L0,R0,L1]`，再推 `[R1,L2,R2]`）。
+        //    按 `available()` 把 pop 长度**向下取到偶数**，那**半个样本就留在环里**，
+        //    下一次回调自然接在它后面。
+        //
+        //    ⚠️ **反过来是错的，而且不可恢复**：直接 pop 奇数个再 `got / 2`
+        //    会把那半个样本**丢掉** —— 而它后面的样本还在环里
+        //    ⇒ 此后**所有 L/R 配对整体错位**，听感是**声道互换**，
+        //    且永远回不来。**比丢一个样本难查得多。**
+        let avail = consumer.available();
+        // `want` 本身是偶数，只有 `avail` 更小时才可能算出半个帧 ⇒ 清掉最低位。
+        let n = want.min(avail) & !1;
+        let got = consumer.pop_raw(&mut scratch[..n]);
         let got_frames = got / 2;
 
         for f in 0..want_frames {
