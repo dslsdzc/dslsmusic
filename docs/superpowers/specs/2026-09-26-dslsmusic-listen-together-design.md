@@ -72,6 +72,54 @@
 - **不要为了凑三个把「云村自习室」算进来。** 官方把它定位为「音乐+社交」**独立产品**，
   其文案全文**没有「一起听」**（全量扫描里 `自习室`=0、`云圈`=0）。
 
+#### 端点层：**两套路径**（已查清）
+
+来源：`MiaoSIKI/YesPlayMusic-listen-together-support` 的 `src/utils/listenTogether.js`（1287 行）
+—— **一个同时实现了双人与多人的真实代码**。真实性佐证：它**独立使用了
+`code === 488 → 房间失效`**，而 488 只在我们从**官方 PC bundle** 挖出的代码里出现过；
+换一个未公开错误码，编造的实现不会恰好命中。
+
+**多人族端点（`multi/match/*`）**：
+`ack`（加入）/ `status/get` / `heartbeat` / `exit`（`exitType=NORMAL_END`）/
+`song/operate`（`operate:1` = SONG_ADD）
+
+**与那 9 个的重合只有 `play/command/report` 一个。** 其余 8 个要么双人独有
+（`room/create`、`room/check`），要么多人换名另起（加入/退出/状态/心跳/列表变更）。
+
+> **⚠️ 多人没有建房接口 —— 靠接受邀请进入。**
+> 这对模式 2 是个**产品级限制**（见 §4.2）。
+
+| | 双人 | 多人 |
+|---|---|---|
+| `roomId` 形状 | 普通串 | **`32位hex_13位时间戳`** |
+| 成员字段 | `roomUsers[]` | `multiLtRoomUserAgg.onlineUserInfos[]` |
+| 响应外层 | — | 多包一层 `multiLtRoomSnapshot{...}` |
+| 邀请参数名 | `inviterId` | **`inviterUid`** |
+| 分享链接 | `/share/` | `/multishare/index.html` |
+| `chatRoomId` | ✅ | ✅（**NIM 是共用基础设施**） |
+
+**⭐ 最关键的差异：心跳语义相反。**
+
+| | 双人 | 多人 |
+|---|---|---|
+| `heartbeat` 载荷 | `{roomId, songId, playStatus, progress}` | `{roomId}` |
+| 语义 | **上报**（响应不带状态） | **拉取**（房间当前歌曲来自响应 `roomPlaySongInfo`） |
+| 间隔 | 20s | 8s |
+
+代码注释原文：「多人群房的权威队列来自 heartbeat 的 `roomSongInfo`，
+**不再轮询 legacy `sync/playlist`**」—— **这就是为什么 `sync/playlist/get` 对多人直接跳过。**
+
+**⇒ 实现层结论：端点层两套，代码层一套。** 该实现是一个 service class +
+一个 `_multi` 布尔标志，约 **10 处 `if (this._multi)`** 分叉到平行端点集。
+**是「同一份骨架、两条端点路径」，不是「一套接口加个参数」。**
+
+> **⚠️ 依据强度（照录调研判断）**：`multi/match/*` 是**双源第三方一致**
+> （该实现 + WaveForge），官方 bundle **间接支持**（`/api/listen/together/` 前缀、
+> `music_listenTogether_multi_invite` 业务名），但**没有官方来源直接展示过这 5 条路径**；
+> 官方 PC 端因不支持多人而查不到（`multi/*` 命中 0，**这不算反证**）。
+> **⇒ 视为「双源第三方证实、官方未直接确认」。**
+> **建议落地前先做一次实机抓包**（小号建多人房，抓 `multi/match/ack` 真实流量）。
+
 **「一起听」与「多人一起听」是两个不同的东西：**
 
 - **[自验] 两个不同的 deep-link action**，在官方 PC 客户端的 **3 个独立 chunk
@@ -104,6 +152,18 @@
 > 负结果**，因为 PC 端根本不支持多人（见下）。
 >
 > **⇒ 多人的控制模型，目前是空的。落地前必须实测。**
+>
+> **⚠️ 而且现在有了反向证据**：上面那个**真做了双人+多人**的实现里，
+> **接口里根本没有 `isOwner` 字段** —— 服务端只给 `creatorId`，客户端自己算一个
+> `togetherOwner` **纯用于展示**。该实现**没有任何 owner 拦截**，双人和多人
+> **都是任何成员可加歌/置顶**。
+>
+> **[推断] 真正的权限判定只可能在服务端** —— 佐证是多人 `song/operate` 会返回
+> `{result:false, failedMsg}`，说明服务端**有能力拒绝**。
+>
+> **⇒ 所以「房主独控」不仅未证实，而且有证据表明它至少不是客户端强制的。**
+> **按「任何成员都可操作、服务端可能拒绝」来设计**，比按「房主独控」安全：
+> 前者遇到服务端拒绝时还有退路，后者会让 UI 假装有权限、然后被服务端打回。
 
 > **方法论注记**：曾有子代理用「官方 PC 客户端里 `房主` 命中 0」来反证轮流说。
 > 复现确认了 0 命中，**但这个负结果没有证明力**——因为 **PC 端根本不支持多人**（见下）。
@@ -515,7 +575,7 @@ macOS 端**连双人都不支持**（「3.0版本暂不支持」）。
 | 5 | `listentogether_heatbeat` | `/api/listen/together/heartbeat` | eapi | 写 |
 | 6 | `listentogether_play_command` | `/api/listen/together/play/command/report` | eapi | **仅上报** |
 | 7 | `listentogether_sync_list_command` | `/api/listen/together/sync/list/command/report` | eapi | **仅上报** |
-| 8 | `listentogether_sync_playlist_get` | `/api/listen/together/sync/playlist/get` | eapi | **读 —— 唯一的状态读** |
+| 8 | `listentogether_sync_playlist_get` | `/api/listen/together/sync/playlist/get` | eapi | **读 —— ⚠️ 仅双人**（多人**不用它**，多人的状态来自 `multi/match/heartbeat` 的响应，见 §3） |
 | 9 | `listentogether_end` | `/api/listen/together/end/v2` | eapi | 写 |
 
 **两个命名陷阱**：模块名是 `heatbeat`（**拼错**），线上路径是 `heartbeat`（拼对）；`end` 实际是 `/end/v2`。
