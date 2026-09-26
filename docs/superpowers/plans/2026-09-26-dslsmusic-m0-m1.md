@@ -1584,10 +1584,20 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
         //    → **E0004 编译失败**。这是唯一能堵住「在 HiRes 之上再加一档
         //    会静默通过」的办法，且不需要 strum 之类的枚举反射依赖。
         //
-        //    ⚠️ **绝不能写 `_ => {}` 通配臂** —— 一写检查就静默失效。
+        //    ⚠️⚠️ **必须逐个列出变体。以下两种写法都会让检查静默失效：**
+        //
+        //        _ => {}                    // 通配臂
+        //        other => panic!(...)       // ← 这个更阴：`other` 是**绑定模式**，
+        //                                   //   它匹配一切，所以 match 永远穷尽，
+        //                                   //   加第 6 个变体**不会**编译失败。
+        //
+        //    后者看起来像「其余情况」，读起来也对，但它不是穷尽性检查。
+        //    （实现者实测：加第 6 档后这种写法照样 PASS。）
         match q {
             Quality::Low => {}
-            other => panic!("降级链的终点必须是 Low，实际是 {other:?}"),
+            Quality::Standard | Quality::High | Quality::Lossless | Quality::HiRes => {
+                panic!("降级链的终点必须是 Low，实际是 {q:?}")
+            }
         }
     }
 
