@@ -20,3 +20,36 @@ wgpu.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+# ── Task 9：CLI 端到端串联 ──
+dsls-provider-api = { path = "../crates/provider-api" }
+dsls-provider-netease = { path = "../crates/provider-netease" }
+dsls-audio = { path = "../crates/audio" }
+
+# 只有 `login` / `play` 两个子命令需要它（provider 是 async trait），
+# **dsls-audio 是同步的，tokio 不进那个 crate**（见 crates/audio/Cargo.toml）。
+# `time` 是 `play` 收尾等缓冲播完用的；`macros` 是 `#[tokio::main]`。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# 下载播放地址的字节。⚠️ **刻意用 0.12 而不是更新的 0.13**，三个理由：
+#   1. `ncm-api-rs` 钉死 reqwest ^0.12（已核实其 Cargo.toml：`version = "0.12"`）。
+#      用 0.13 会让依赖树里**同时存在两份 reqwest**；而 0.13 的 `rustls` feature
+#      是 `__rustls-aws-lc-rs`（已核实 0.13.5 的 features2 表），会新拖进
+#      aws-lc-sys 那一大坨 C 编译；0.12 这条走 ring —— **已经在树里了**。
+#   2. §18.10「依赖裁剪」是约束不是偏好：0.12 + 与 ncm-api-rs 相同的 feature 集
+#      ⇒ **一个 crate 都不新增**（feature 取并集，我们是它的子集）。
+#   3. 计划里写的 `features = ["stream", "rustls-tls"]` 在 0.13 上**编译不过**：
+#      0.13 把 `rustls-tls` 改名成了 `rustls`（0.12 才有 `rustls-tls`）。
+# ⚠️ `default-features = false` 是必须的：0.12 的 default 含 `default-tls`
+#    = native-tls = openssl-sys，本仓库没有它。
+# ⚠️ **不开 `stream`**：这里是全量下载到内存再解码 —— `decode_to_i16` 要的是
+#    `MediaSource`（`Read` + **`Seek`**），流式响应不可 seek。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# 子命令 + 位置参数 + `--help`。这个规模上手写 argv 解析已经不划算。
+clap = { version = "4", features = ["derive"] }
+
+# `~/.config/dslsmusic/session` 的定位。std 没有可移植的 config_dir
+# （Windows 是 %APPDATA%、macOS 是 ~/Library/Application Support）——
+# 本项目要铺五平台，手写三份 cfg 分支不划算。
+dirs = "7"
