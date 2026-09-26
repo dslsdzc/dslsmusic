@@ -2809,9 +2809,12 @@ cpal = "0.18"
 # 已核实：现在能解码 WAV 纯属默认 feature 没被关掉——一旦有人加
 # `default-features = false`，WAV 会**静默失效**（能打开文件、解不出样本）。
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "isomp4", "ogg", "vorbis", "wav", "pcm"] }
-# 已核实：reqwest 最新稳定版是 0.13.5
-reqwest = { version = "0.13", features = ["stream", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# ⚠️ **刻意不声明 `reqwest` 与 `tokio`。** 它们在本 crate 里**零使用**：
+#   - 下载是 `app`（Task 9）的事 —— 它自己声明 reqwest，然后把 `Cursor` 交进来
+#   - 本 crate 是**同步**的（解码循环 + cpal 回调）；Task 9 的 `tokio::time::sleep`
+#     在 `app` 里，不在 `dsls-audio` 里
+# `reqwest` 尤其重（拖着 rustls + hyper + 一整棵 TLS 树）。
+# **这正是设计文档 §18.10「依赖裁剪」要的那件事。**
 # 无锁 SPSC 环形缓冲。**音频回调线程里绝不允许加锁**（设计文档 §16.2 / 本计划 Global Constraints）
 # 已核实："0.4" 解析到 0.4.8。**不要写死 =0.4.9——那个版本已被 yank。**
 # 最新是 0.5.2；本计划按 0.4 的 API 写（traits::{Producer,Consumer,Observer,Split}
