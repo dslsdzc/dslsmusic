@@ -6,7 +6,7 @@ pub mod model;
 
 pub use capability::{Capability, CapabilitySet};
 pub use error::{SourceError, SourceResult};
-pub use model::{Quality, Track};
+pub use model::{AudioEffect, Quality, Track};
 
 use async_trait::async_trait;
 
