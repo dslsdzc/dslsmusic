@@ -1166,9 +1166,10 @@ pub fn percentile(sorted: &[f32], p: f32) -> f32 {
 /// 供后续 GPU timestamp 查询使用；GLES 后端不支持时回退到 CPU 计时（设计文档 §16.5）。
 ///
 /// 注意 `target_fps = 0` 会返回 `inf`。v1 无调用方，等它有了调用方再补测试与守卫。
-pub fn frame_budget_ms(target_fps: u32) -> f32 {
-    1000.0 / target_fps as f32
-}
+// ⚠️ 这里原本还有个 `pub fn frame_budget_ms(target_fps: u32) -> f32 { 1000.0 / target_fps }`
+// —— **已删除**（最终复审，2026-09-27）：**全仓零调用方**，且它的文档声称的
+// 「GPU timestamp 查询 / GLES 回退 CPU 计时」**两件事一件都没实现**。
+// **一个零调用方 + 文档说谎的函数，比没有它更糟**：读者会以为它带着那两个能力。
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
@@ -1930,7 +1931,9 @@ dsls-provider-api = { path = "../provider-api" }
 # 单版本 crate 的长期风险是真的 —— 缓解手段是把它整个包在我们自己的
 # NeteaseClient 后面（本任务就是这么做的），换实现时改动能收敛在这里。
 ncm-api-rs = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# ⚠️ **刻意没有 `tokio`** —— 它在 `src/` 里**零引用**（本 crate 只做扫码登录，是同步的）。
+# 计划里那句「Task 7/8 的伏笔」**已过期**：那两个任务都落地了，也没用上它。
+# **本项目第三次「声明了但零使用」**（前两次：Task 6 的 `anyhow`、Task 8 的 `reqwest`+`tokio`）。
 async-trait = "0.1"
 log.workspace = true
 serde_json = "1"
@@ -3701,10 +3704,22 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     let q = match quality {
         "low" => Quality::Low,
         "standard" => Quality::Standard,
+        // ⚠️⚠️ **`"high"` 这一臂不能少 —— 它是 clap 的 `default_value`。**
+        // 本计划早先只有 `_ => High` 兜底（那是对的），后来把它换成
+        // `other => bail!` 时**忘了给 `"high"` 补一臂** ⇒ 照抄的话，
+        // **不带 `--quality` 的每一次 `play` 都会在这个 match 上 bail**，
+        // 而默认值恰恰就是 `"high"`。
+        //
+        // **这类错误的形态是新的（第 8 类）**：语法合法、**编译通过**、
+        // **只在运行时炸**、**炸的是默认路径**、**零自动信号**。
+        // 前 7 类（过不了 fmt / 永远不可能通过的测试 / 伪装成穷尽的 match /
+        // E0308 / 物理上做不到 / 孤儿行 / 函数体编译不过）**至少会编译报错或测试变红**。
+        "high" => Quality::High,
         "lossless" => Quality::Lossless,
         "hires" => Quality::HiRes,
         // ⚠️ **未知值硬报错，不静默降级。** 静默 `_ => High` 会让
         //    `--quality lossles`（少个 s）**悄悄播 320k** —— 用户以为要的是无损。
+        //    **但这个 `bail!` 只有在上面每一档都显式列过之后才是对的。**
         other => anyhow::bail!(
             "未知音质 {other:?}；可用: low / standard / high / lossless / hires"
         ),
@@ -3741,7 +3756,12 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("本音源不支持取流（Unsupported）"))?;
     println!("得到地址（{} 字符）", url.len());
 
-    let mut engine = AudioEngine::new()?;
+    // ⚠️ **签名在 Task 10 已变** —— 是 `new(desired_rate)`，不是 `new()`（E0061）。
+    // 而且 Task 11 之后还有 `new_on(id, rate)` 这条「显式指定设备」的路
+    // （CLI 的 `--device` / `DSLS_AUDIO_DEVICE` 用）。见 `app/src/main.rs`：
+    //   Some(id) => AudioEngine::new_on(id, src_rate)?,
+    //   None     => AudioEngine::new(src_rate)?,
+    let mut engine = AudioEngine::new(src_rate)?;
     // ⚠️ **必须查状态码。** `reqwest` 对 4xx/5xx **不报错** ——
     //    403 的 HTML 错误页会被原样喂给解码器，报出来的是「解码失败」，
     //    而真正的原因是「地址失效」。错误信息会指向完全错误的方向。
