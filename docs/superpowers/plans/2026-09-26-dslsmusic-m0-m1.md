@@ -3392,6 +3392,99 @@ git commit -m "feat(audio): 无锁 AudioRing + symphonia 解码 + cpal 输出"
 
 ---
 
+## Task 11: 设备独占（Linux） + 能力模型 + `snd-aloop` 回环验证
+
+> **为什么有这个任务**（用户的裁决链）：
+> ① 用户说「**不是最省而是最好**」⇒ 音质最优优先。
+> ② Task 10 做完后，实现者量到一条：**那 184 秒里，44.1kHz 是 PipeWire 在重采样**
+>    ⇒ **`is_passthrough() == true` 只代表「我们没动」，系统照样动。**
+> ③ 用户说「**连 ③ 一起**」⇒ 设备独占访问。
+>
+> **而这个任务最值的地方是它带一个判据** —— 今天整场都在说
+> 「**声音对不对完全没验证，因为没有回环采集**」，而 Linux 上有 `snd-aloop`。
+
+**Files:**
+- Create: `crates/audio/src/output_path.rs`（能力模型 + 设备选择）
+- Create: `crates/audio/examples/loopback_verify.rs`（回环验证）
+- Modify: `crates/audio/src/lib.rs`、`crates/audio/Cargo.toml`（若需）
+- Modify: `app/src/main.rs`（打印输出路径）
+
+### A. 能力模型（**这是本任务的核心，不是设备选择**）
+
+```rust
+/// 我们实际拿到了哪条输出路径。
+///
+/// ⚠️ **`Exclusive` 不等于「逐位精确」** —— 它只表示「**我们直接对硬件写，
+///   系统混音器不在我们和设备之间**」。真正的逐位精确还需要：
+///   格式与源一致、采样率与源一致、且**设备本身不做处理**（某些声卡有内部 DSP）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputPath {
+    /// 直接打开硬件设备（Linux 上是 `hw:`）。**系统不介入。**
+    Exclusive { device: String, rate: u32 },
+    /// 经系统混音器（`default`）。**系统可能替我们重采样。**
+    Shared { device: String, rate: u32 },
+}
+```
+
+**必须暴露 + 必须在 CLI 打印**，并写明上面那段边界。
+
+### B. Linux 实现：选 `hw:` 设备
+
+**已核实**（cpal 的 ALSA 后端源码）：`Host::devices()` **确实枚举 `hw:CARD=<name>,DEV=<n>`**
+（源码注释：`Add hw:/plughw: for all physical devices with numeric index`）。
+而 `default` 是**虚拟设备**（源码原话：`"default" is a virtual ALSA device that
+redirects to the configured default`）⇒ 走 PipeWire/Pulse。
+
+**做法**：把 `default_output_device()` 对应的**物理卡**映射到它的 `hw:` 名字；
+找到 ⇒ 以**源采样率**打开它（`Exclusive`）；找不到/打不开 ⇒ 退回 `default`（`Shared`）。
+
+⚠️ **`hw:` 是独占的**：别的进程（含 PipeWire）占着设备时**打开会失败**。
+所以「打不开」是**常态而非异常** —— 必须**优雅退回 `Shared` 并如实报告**，
+**绝不能因此不出声**（设计文档 §17 的原则，这是第 6 次现身）。
+
+### C. 其它平台：**降级，并记录**
+
+| 平台 | 现状 |
+|---|---|
+| **Linux** | ✅ 本任务做 |
+| **Windows** | ❌ **cpal 只走共享模式**，WASAPI 独占要换/加后端 |
+| **macOS** | ❌ cpal 不暴露 hog mode |
+| **Android / iOS** | ❓ 未核实 |
+
+**⇒ 一律返回 `Shared`，并在 UI 上如实说明。不要假装。**
+
+### D. ⭐ `snd-aloop` 回环验证 —— **本任务真正的判据**
+
+**已核实本机有 `snd-aloop`**（`/lib/modules/.../snd-aloop.ko.zst`，GPL，
+description: `A loopback soundcard`），**未加载**。
+
+```
+（用户预先执行）sudo modprobe snd-aloop
+        ↓
+写 hw:Loopback,0  ──▶  snd-aloop  ──▶  从 hw:Loopback,1 录回来
+        ↓
+**逐位比对**：录回来的样本 vs 我们本应输出的样本
+```
+
+**这能验证的**（今天一直是空白）：重采样算法对不对、格式转换对不对、
+声道处理对不对、以及**我们确实是把数据写进设备的那一方**。
+
+**⚠️ 它验证不了的（必须写清，不许夸大）**：
+- 它验证的是**我们这条路径**，**不是「到扬声器的最终路径」**
+  —— 声卡内部可能还有 DSP/混音
+- 它**不能**证明「你听到的是逐位精确的」；那需要**硬件级采集**
+
+**没有 `snd-aloop` 时必须优雅跳过**（打印怎么加载它），而不是失败。
+
+### E. 验收
+
+1. **`OutputPath` 在 CLI 上如实打印**（含那段边界警告）
+2. **`snd-aloop` 回环验证跑通**：一个已知信号（例如方波/正弦/伪随机）
+   经我们的完整路径后**逐位一致**（或在重采样路径上**在声明的容差内**）
+3. **`hw:` 被占用时优雅退回 `Shared`** —— 用一个占位进程实测
+
+---
+
 ## Task 10: 采样率对齐 —— 按源率建流，设备不支持才重采样
 
 > **为什么有这个任务**：Task 9 的实现者量出来一个缺陷 —— **`dsls-audio` 不重采样**：
