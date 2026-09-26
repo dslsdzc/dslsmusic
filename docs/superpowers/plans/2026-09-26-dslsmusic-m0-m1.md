@@ -1668,7 +1668,9 @@ git commit -m "feat(provider-api): Quality 扩到 5 档保真度梯度，新增 
 - Produces:
   - `pub const PLATFORM: &str = "netease"` —— 平台标识的唯一来源
   - `pub enum QrState { WaitingScan, WaitingConfirm, Confirmed { cookie: String }, Expired }`
-  - `impl QrState { pub fn from_code(code: i64, raw_cookies: &[String]) -> Self }`
+  - `impl QrState { pub fn from_code(code: i64, raw_cookies: &[String]) -> Result<Self, SourceError> }`
+    ⚠️ **是 `Result` 不是裸 `QrState`** —— 803 但拿不到会话 cookie 时必须是 `Err`，
+    否则调用方只 `match` 变体就会写成空串 cookie（详见 Step 3 的说明）
     ⚠️ 是 `&[String]` 不是 `&str` —— `login_qr_check` 给的是 `ApiResponse.cookie`
     那个 `Vec<String>`。在调用点先 `join` 会把「清洗 Set-Cookie 属性」的责任
     从 `session_cookie` 漏到调用方。
@@ -1713,28 +1715,52 @@ mod tests {
         assert_eq!(extract_music_u("__csrf=x; MUSIC_U=tail"), Some("tail".to_string()));
     }
 
+    // ⚠️ `from_code` 返回 `Result`，所以下面每条都要 `Ok(..)` 包一层 ——
+    //    不包就是 `Result<QrState, _>` 与 `QrState` 比，E0308。
+
     #[test]
     fn maps_code_801_to_waiting_scan() {
-        assert_eq!(QrState::from_code(801, &[]), QrState::WaitingScan);
+        assert_eq!(QrState::from_code(801, &[]), Ok(QrState::WaitingScan));
     }
 
     #[test]
     fn maps_code_802_to_waiting_confirm() {
-        assert_eq!(QrState::from_code(802, &[]), QrState::WaitingConfirm);
+        assert_eq!(QrState::from_code(802, &[]), Ok(QrState::WaitingConfirm));
     }
 
     #[test]
     fn maps_code_800_to_expired() {
-        assert_eq!(QrState::from_code(800, &[]), QrState::Expired);
+        assert_eq!(QrState::from_code(800, &[]), Ok(QrState::Expired));
     }
 
     #[test]
     fn maps_code_803_to_confirmed_with_cookie() {
-        let s = QrState::from_code(803, &["MUSIC_U=tok; __csrf=y".to_string()]);
         assert_eq!(
-            s,
-            QrState::Confirmed { cookie: "MUSIC_U=tok; __csrf=y".to_string() }
+            QrState::from_code(803, &["MUSIC_U=tok; __csrf=y".to_string()]),
+            Ok(QrState::Confirmed { cookie: "MUSIC_U=tok; __csrf=y".to_string() })
         );
+    }
+
+    #[test]
+    fn confirmed_without_session_cookie_is_a_protocol_error() {
+        // ★ 803 承诺带 cookie。没带到**绝不能**当成登录成功 ——
+        // 否则调用方会写一个空串会话，症状与「登录成功但仍是游客」一模一样。
+        let err = QrState::from_code(803, &[]).unwrap_err();
+        assert!(matches!(err, dsls_provider_api::SourceError::Protocol(_)));
+        assert!(err.is_upstream_changed());
+    }
+
+    #[test]
+    fn unknown_code_is_a_protocol_error() {
+        // 400 / 999 都不是「二维码过期」。折成 Expired 会误导用户，
+        // 而且 is_upstream_changed() 在这条路径上永不触发。
+        for code in [400, 999, 200] {
+            let err = QrState::from_code(code, &[]).unwrap_err();
+            assert!(
+                matches!(err, dsls_provider_api::SourceError::Protocol(_)),
+                "状态码 {code} 应映射为 Protocol，实际 {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1814,8 +1840,12 @@ image = { version = "0.25.9", default-features = false, features = ["png"] }
 
 > **⚠️ 这里刻意没有 `anyhow`。** 本 crate 对外一律 typed `SourceError`
 > （见上面 Interfaces 块末尾的说明）——把 `anyhow` 放进音源层，
-> 与「`anyhow` 只允许出现在 `app` 的边界」这条硬约束**方向相反**。
+> 与「**音源层对外一律 typed `SourceError`**」这条约束**方向相反**。
 > M1 里 `dsls-provider-netease` 一次都用不到它。
+>
+> ⚠️ **不要把这句说成「`anyhow` 只允许出现在 `app` 的边界」——那是假的。**
+> `crates/platform` 一直在用它且是有意的（平台层面向 app 内部，不是别人要实现的
+> 抽象）。**一句为假的约束会让后来的代理去「修」对的东西。**
 >
 > `serde_json` 目前 0 引用，但 Task 7 的 `parse.rs` 要用（`Value` + `json!`），**保留**。
 > `tokio` / `async-trait` / `log` 同理，都是 Task 7/8 的伏笔。
@@ -2104,15 +2134,13 @@ pub use client::NeteaseClient;
 pub use qr_login::{QrState, extract_music_u, session_cookie};
 ```
 
-> **⚠️ `Confirmed { cookie: "" }` 的契约（复审者与实现者都提过）**：
-> 若上游返回 `803` 但 `Set-Cookie` 里没有 `MUSIC_U`，
-> `session_cookie` 返回 `None`，`from_code` 会落到 `unwrap_or_default()`，
-> 得到一个**空串 cookie 的 `Confirmed`**。
+> **⚠️ `Confirmed` 的会话 cookie 契约**：若上游返回 `803` 但 `Set-Cookie` 里
+> 没有 `MUSIC_U`，`from_code` **返回 `Err(Protocol)`，不返回 `Confirmed`**。
 >
-> **调用方必须显式判空**——空串喂给 `create_client` 的后果与裸 token 一样
-> （`cookie_to_json` 丢弃它），症状还是「登录成功但仍是游客」，只是更隐蔽。
-> **Task 9 的 `login()` 里已经有这条判空**（`if cookie.is_empty() { bail }`）；
-> 本任务补一条测试把契约钉住，让它不至于只活在调用方。
+> 这样「登录成功但拿不到会话」就不可能被忽略——早先的写法是
+> `unwrap_or_default()` 折成空串 cookie，调用方只 `match` 变体就会写盘，
+> 症状与「登录成功但仍是游客」一模一样，且更隐蔽。
+> **Task 9 里因此不需要再判空**（那条守卫已成不可达的死代码，已删）。
 
 - [ ] **Step 4: 运行测试确认通过**
 
