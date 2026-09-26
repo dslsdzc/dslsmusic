@@ -119,11 +119,25 @@ impl NeteaseClient {
 ///
 /// 两条路径都试，谁先命中用谁。顺序是 `顶层 → /data`，且**每一步都先
 /// `as_str()` 再进 `or_else`**（理由见 `qr_key` 里的注释，复审 Minor 8）：
-/// 只有在顶层这个键**根本不存在**或**不是字符串**（含 `null`）时才轮到 fallback。
+/// 只有在顶层这个键**不存在**、**不是字符串**（含 `null`）或**是空串**时
+/// 才轮到 fallback。
+///
+/// ⚠️ **空串一律当「没有」**（复审 Minor N3）。上游发
+/// `{"code":200,"unikey":""}` 时旧实现返回 `Some("")`，`qr_key` 的
+/// `ok_or_else` 不会触发，于是一路走到 `qr_image("")`，把内容为
+/// `https://music.163.com/login?codekey=` 的二维码渲染给用户 —— **一张扫不出
+/// 任何东西的图，而错误要到好几步之后才暴露**。同一个文件里 `qr_image` 对
+/// `qrurl` 已经有 `.filter(|s| !s.is_empty())` 守卫，这里补齐这个不对称。
 fn pick_unikey(body: &Value) -> Option<&str> {
+    // ⚠️ 两条路径**各自**都要过一遍非空，而不是只在收尾过滤一次：空串与 `null`
+    // 同类（键存在但不可用），所以顶层发 `""` 时该轮到 fallback。收尾过滤会把
+    // `/data` 里那个**能用的** key 一起挡掉，然后报「未返回 unikey」——
+    // 而 unikey 其实就在 body 里。
     body.get("unikey")
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .or_else(|| body.pointer("/data/unikey").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
 }
 
 /// 从 JSON 值里读一个整数状态码，**容忍字符串数字**。
@@ -240,6 +254,34 @@ mod tests {
         // 两条路径都没有 → None（调用方据此报 Protocol 错）
         assert_eq!(pick_unikey(&serde_json::json!({"code": 200})), None);
         assert_eq!(pick_unikey(&serde_json::json!({"unikey": null})), None);
+    }
+
+    #[test]
+    fn pick_unikey_treats_an_empty_string_as_absent() {
+        // ★ 回归测试（复审 Minor N3）。实测旧行为：上游发
+        // `{"code":200,"unikey":""}` 时返回 `Some("")`，`qr_key` 的
+        // `ok_or_else` 不触发 → `Ok("")` → `qr_image("")` 渲染出内容为
+        // `https://music.163.com/login?codekey=` 的二维码 —— **扫不出任何东西**，
+        // 且错误要到好几步之后才暴露。空串和「没有 unikey」一样没用。
+        assert_eq!(
+            pick_unikey(&serde_json::json!({"code": 200, "unikey": ""})),
+            None
+        );
+        // 空串与 `null` 同类：键存在但不可用 → 轮到 fallback，
+        // 而不是把 `/data` 里那个能用的 key 一起挡掉。
+        assert_eq!(
+            pick_unikey(&serde_json::json!({"unikey": "", "data": {"unikey": "x"}})),
+            Some("x")
+        );
+        // `/data` 一侧的空串同样不算数 —— 否则 `Some("")` 会从这条路径漏出去
+        assert_eq!(
+            pick_unikey(&serde_json::json!({"data": {"unikey": ""}})),
+            None
+        );
+        assert_eq!(
+            pick_unikey(&serde_json::json!({"unikey": null, "data": {"unikey": ""}})),
+            None
+        );
     }
 
     #[test]

@@ -182,9 +182,13 @@ mod tests {
                 matches!(r, Err(SourceError::Protocol(_))),
                 "803 但没有可用 MUSIC_U（{raw:?}）必须报协议错，实得 {r:?}"
             );
-            // 这条才是重点：修好之前 `is_upstream_changed()` 在这条路径上
-            // **永不触发**，上游变了也没有任何信号指向它。
-            assert!(r.unwrap_err().is_upstream_changed());
+            // 选 `Err(Protocol)` 而不是某个 `QrState` 变体，正是为了让
+            // `is_upstream_changed()` 在这条路径上真的会触发（修好之前它**永不触发**，
+            // 上游变了没有任何信号指向它）。
+            // ⚠️ 这里**不要**再补一句 `assert!(r.unwrap_err().is_upstream_changed())`：
+            // 该方法的实现就是 `matches!(self, SourceError::Protocol(_))`
+            // （`provider-api/src/error.rs:46-48`），被上面那条 `matches!` 完全蕴含，
+            // **不可能独立失败**（复审 Minor N4）。
         }
     }
 
@@ -199,7 +203,8 @@ mod tests {
                 matches!(r, Err(SourceError::Protocol(_))),
                 "未知状态码 {code} 必须报协议错，实得 {r:?}"
             );
-            assert!(r.unwrap_err().is_upstream_changed());
+            // `is_upstream_changed()`（= `matches!(self, Protocol(_))`）被上面这条
+            // `matches!` 完全蕴含，再断言一次不可能独立失败，故不写（复审 Minor N4）。
         }
     }
 

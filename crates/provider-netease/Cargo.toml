@@ -6,9 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# ⚠️ 这里**刻意没有 `anyhow`**：音源层对外一律 typed `SourceError`（设计文档 §4.5），
-# `anyhow` 只允许出现在 `app` 的边界。作为一条声明了的依赖，它与这条约束方向相反，
-# 且是一条活隐患 —— 任何人往这个 crate 里写 `use anyhow::Result` 都没有工具会报错。
+# ⚠️ 这里**刻意没有 `anyhow`**：**音源层（`provider-*`）对外一律是 typed
+# `SourceError`**（设计文档 §4.5）—— 音源抽象是**第三方实现要绑上去的边界**，
+# 错误类型必须可穷尽匹配；`anyhow::Error` 是不透明类型，与这条约束方向相反。
+# 作为一条声明了的依赖它就是一条活隐患：任何人往这个 crate 里写
+# `use anyhow::Result` 都没有工具会报错。
+#
+# ⚠️ 这条约束的范围**只有 `provider-*`**，**不是**「`anyhow` 只允许出现在 `app`
+# 的边界」（那句话是假的）。`crates/platform` 一直在用 `anyhow`，而且**是有意的**：
+# 平台层面向 app 内部，不是别人要实现的抽象。**不要去「修」它。**
 dsls-provider-api = { path = "../provider-api" }
 # 已核实：全 crate 只有 0.1.0 一个发布版本（2026-04-07，作者 imsyy/SPlayer）。
 # 保持 "0.1"（= ^0.1 = >=0.1.0,<0.2.0）而不是 =0.1.0：
