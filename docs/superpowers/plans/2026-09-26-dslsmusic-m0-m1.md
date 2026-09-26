@@ -1111,13 +1111,31 @@ impl FrameMetrics {
 }
 
 /// 输入必须已升序排序。
+///
+/// 用**线性插值**（Hazen 估计 / Hyndman & Fan type 5）：`pos = p·n − 0.5`。
+///
+/// ⚠️ **不要用纯取整下标**。本计划早先用的是 `((n-1) as f32 * p).round()`，
+/// 它通不过自己的测试：对「99×8ms + 1×100ms」，`(99 * 0.99).round() = 98`
+/// → 返回 `sorted[98] = 8.0ms`，**恰好漏掉它该抓的那一帧**——而 §16.5 里
+/// p99 存在的唯一理由就是抓这种长尾。
+/// （n=100 时 p50 要求下标 49、p99 要求下标 99，任何纯取整公式都无法同时
+/// 满足这两条。）
 pub fn percentile(sorted: &[f32], p: f32) -> f32 {
     if sorted.is_empty() {
         return 0.0;
     }
+    let n = sorted.len();
     let p = p.clamp(0.0, 1.0);
-    let idx = ((sorted.len() - 1) as f32 * p).round() as usize;
-    sorted[idx]
+    let pos = p * n as f32 - 0.5;
+    if pos <= 0.0 {
+        return sorted[0];
+    }
+    let hi = pos.floor() as usize;
+    if hi + 1 >= n {
+        return sorted[n - 1];
+    }
+    let frac = pos - hi as f32;
+    sorted[hi] * (1.0 - frac) + sorted[hi + 1] * frac
 }
 
 /// 供后续 GPU timestamp 查询使用；GLES 后端不支持时回退到 CPU 计时（设计文档 §16.5）。
