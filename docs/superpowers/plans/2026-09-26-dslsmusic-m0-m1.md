@@ -176,14 +176,22 @@ sdl3.workspace = true
 wgpu.workspace = true
 # Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device
 pollster.workspace = true
-raw-window-handle.workspace = true
-# Task 3 的 window.rs / gpu.rs 公开接口返回 anyhow::Result
-# ⚠️ 待定：platform 原本只有 thiserror，像是刻意让本层用类型化错误、
-#    由 app 层用 anyhow。若确认如此，应改公开签名为自定义 Error 并去掉
-#    anyhow —— 那是 API 变更，不在 Task 3 范围内。
+# 公开接口返回 anyhow::Result。
+# **这是显式选择，不是漂移**：M0–M1 里 platform 的错误全是启动期致命错误
+# （SDL init / 窗口创建 / adapter / device / create_surface），调用方除了
+# 报错退出没有别的动作，类型化错误枚举不会被产出。
+# 若将来要改类型化（device lost、显示器热插拔、适配器/音频设备切换都会
+# 变成可恢复的），需同时改 `init_gpu` 与 `PlatformWindow::new` 的签名。
 anyhow.workspace = true
-thiserror.workspace = true
 log.workspace = true
+
+# ── 已删除的两个依赖，勿再加回 ──
+# thiserror：同上的理由，M0–M1 不产出类型化错误（推迟，非否决）
+# raw-window-handle：代码一律走 `wgpu::rwh`（wgpu 的无条件重导出），
+#   直接依赖它**既买不到版本对齐**（cargo 按各自 semver 解析），
+#   **反而制造陷阱**：后来者若写 `use raw_window_handle::HasWindowHandle`，
+#   实现的会是「直接依赖解析到的那个版本」的 trait，不再保证与 wgpu 的
+#   同版本 —— 那正是我们要避免的「两份 trait」错误。
 ```
 
 `crates/platform/src/lib.rs`：
@@ -452,6 +460,21 @@ pub struct PlatformWindow {
     /// （经 `raw_window()`），而且是**全程共享借用**，所以 `poll_events`
     /// 拿不到 `&mut self`。用内部可变性只让 event_pump 可变，公开签名
     /// 保持 `&self` 不变。
+    ///
+    /// ## ⚠️ 下游契约（后续所有任务都要遵守）
+    ///
+    /// 由此派生出一条**长期规则**：`PlatformWindow` 上任何需要改状态的
+    /// 公开方法**都不能再用 `&mut self`** —— sdl3 里 `set_title` /
+    /// `set_fullscreen` / `set_min_size` / 光标 / 剪贴板**全部**是
+    /// `&mut self`。它们必须走内部可变性（再包一个 `RefCell`/`Cell`），
+    /// 或者保证在有 `GpuContext` 存活时不可达。
+    ///
+    /// **这不是假想风险**：本项目迟早要做「窗口标题跟随当前曲目」，
+    /// 那正好会撞上这一条。
+    ///
+    /// 另：任何调用点都必须把 `window` 声明在 `gpu` **之前**（借用检查器
+    /// 强制，绕不过去）。`main.rs` 的 `let window = ...` 去掉 `mut`
+    /// 已经是这条契约的第一个表现。
     event_pump: std::cell::RefCell<sdl3::EventPump>,
 }
 
@@ -488,6 +511,11 @@ impl PlatformWindow {
     /// 收 `&mut` 会与它冲突（E0502）。可变性由 `RefCell` 提供。
     pub fn poll_events(&self) -> PlatformEvent {
         let mut result = PlatformEvent::None;
+        // ⚠️ 真需要这个标志位：同一个 pump 批次里可能**两个事件都来**，
+        //    而 or-pattern 只能决定单次匹配内的绑定顺序，**不构成两个
+        //    事件之间的优先级**。没有它的话，若 PixelSizeChanged 之后
+        //    又来了 Resized，物理值会被逻辑值覆盖。
+        let mut got_pixel_size = false;
         let self_id = self.window.id();
         for event in self.event_pump.borrow_mut().poll_iter() {
             match event {
@@ -497,11 +525,21 @@ impl PlatformWindow {
                 }
                 Event::Window {
                     window_id,
-                    win_event: WindowEvent::PixelSizeChanged(w, h)
-                        | WindowEvent::Resized(w, h),
+                    win_event: WindowEvent::PixelSizeChanged(w, h),
                     ..
                 } if window_id == self_id => {
                     result = PlatformEvent::Resized(w as u32, h as u32);
+                    got_pixel_size = true;
+                }
+                Event::Window {
+                    window_id,
+                    win_event: WindowEvent::Resized(w, h),
+                    ..
+                } if window_id == self_id => {
+                    // 物理像素优先：已拿到 PixelSizeChanged 就不被逻辑值覆盖
+                    if !got_pixel_size {
+                        result = PlatformEvent::Resized(w as u32, h as u32);
+                    }
                 }
                 _ => {}
             }
@@ -629,7 +667,13 @@ pub fn init_gpu<'a>(window: &'a PlatformWindow) -> anyhow::Result<GpuContext<'a>
         .iter()
         .find(|f| f.is_srgb())
         .unwrap_or(&caps.formats[0]);
-    let (width, height) = window.size();
+    // ⚠️ 必须用 size_in_pixels()（SDL_GetWindowSizeInPixels，物理像素），
+    // **不是 size()**（SDL_GetWindowSize，逻辑点）。SurfaceConfiguration
+    // 的 width/height 是物理像素，而 resize 路径用的是物理的
+    // PixelSizeChanged —— 用逻辑尺寸会让首次 configure 与之后每一次都
+    // 不一致（scale != 1.0 时），swapchain 被合成器放大变模糊，
+    // 并产生 VK_SUBOPTIMAL_KHR（见 main.rs 对 Suboptimal 的处理）。
+    let (width, height) = window.size_in_pixels();
 
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -772,6 +816,15 @@ fn main() -> anyhow::Result<()> {
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 continue;
             }
+            // ⚠️ Suboptimal 携带一个**完全可用**的纹理，在 Linux/Vulkan 上
+            // 直接来自 VK_SUBOPTIMAL_KHR。把它当致命错误会让「任何使
+            // swapchain extent 变陈旧的窗口/缩放变化」直接杀掉进程。
+            // 正确做法：重新配置，然后**照常渲染这一帧**。
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                f
+            }
+            // Validation 是真正无法继续的状态，bail 合理
             other => anyhow::bail!("取 surface texture 失败: {other:?}"),
         };
 
@@ -946,6 +999,16 @@ pub mod metrics;
 ```
 
 `app/src/main.rs` 顶部改为 `use dslsmusic::metrics;`，并删掉 `mod metrics;`。
+
+> ⚠️ **实现前必读**：`app/src/main.rs` 里有**三条 `continue` 路径**
+> （`Timeout|Occluded` 一条、`Outdated|Lost` 一条、以及 `Suboptimal` 一条），
+> 它们都在 `begin_frame()` 之后、`end_frame()` 之前跳出循环。
+> **真实的 `FrameMetrics` 会看到未配对的 `begin_frame`。**
+> 你的实现必须容忍这一点——例如把 `begin_frame` 只当作「记下起点」，
+> 而让 `end_frame` 成为唯一的样本产出点；**或**把配对责任移到调用方。
+> 选一种并在文档注释里写清楚，不要让「未配对」变成隐式的样本丢失。
+>
+> （Task 3 的占位实现是空函数，所以这个问题当时不显形。）
 
 - [ ] **Step 4: 写实现**
 
