@@ -71,28 +71,32 @@ mod tests {
 
     #[test]
     fn unsupported_is_distinguishable_from_empty() {
-        // ⚠️ 收口后的语义（设计文档 §4.5，Task 7 复审发现的定义冲突）：
+        // ⚠️ **本测试只有编译期内容，一条运行时断言都没有。** 这不是漏写 ——
+        // 这里曾经有 5 条 `assert_*!` / `matches!`（Task 7 复审 M1 逐条查过），
+        // 它们比的**全是本函数两三行前自己绑定的字面量**：
+        // `Ok(Some([])) != Ok(None)` 由 `Option` 的 `PartialEq` 保证、
+        // `Ok(_) != Err(_)` 由 `Result` 的 `PartialEq` 保证 —— **都是 std 的 derive**。
+        // ⇒ **没有任何实现改动能让它们变红**（反证：这个测试根本做不了变异测试，
+        // 因为没有可改的实现）。它们给出的只是「测过了」的错觉，已全部删除。
+        //
+        // 收口后的语义（设计文档 §4.5，Task 7 复审发现的定义冲突）：
         //   「查到了但没结果」= Ok(Some(空集合))   ← resolver **不该**换音源
         //   「本 provider 不处理」= Ok(None) 或 Err(Unsupported) ← **应该**换音源
-        //
-        // 下面这条断言钉的是「resolver 能看出这两类不同」。
         // 注意 Ok(None) 与 Err(Unsupported) **语义等价**（Option 带来的两种拼写），
         // 不是需要区分的两种情况 —— 早先的注释把它们当成两种，那是错的。
-        let empty: SourceResult<Vec<Track>> = Ok(Some(Vec::new()));
-        let not_handled: SourceResult<Vec<Track>> = Ok(None);
-        let unsupported: SourceResult<Vec<Track>> = Err(SourceError::Unsupported);
-
-        assert_ne!(empty, not_handled, "「没结果」与「不处理」必须可区分");
-        assert_ne!(empty, unsupported, "「没结果」与「不处理」必须可区分");
-        // 这两种拼写语义相同，值当然不同 —— 断言它们不同是在钉「两种拼写都存在」，
-        // 不是在说它们是要区分的两种情况
-        assert_ne!(not_handled, unsupported);
-        // ⚠️ 计划里这一行原文是 `assert_eq!(empty, Ok(None));` —— **照抄会失败**
-        // （实测 `left: Ok(Some([])) / right: Ok(None)`）：`empty` 在收口后已经
-        // 改成 `Ok(Some(空集合))`，但这一行的主语还是旧定义里的 `empty`。
-        // 它要钉的是「不处理的拼写就是 `Ok(None)`」，所以主语应当是 `not_handled`。
-        assert_eq!(not_handled, Ok(None));
-        assert!(matches!(unsupported, Err(SourceError::Unsupported)));
+        //
+        // 本测试真正的内容是**下面三个绑定的类型标注**：别名若被改成
+        // `Result<T, SourceError>`（少了 `Option`）或 `Option<Result<T, SourceError>>`
+        // （顺序反了），这三行**直接编译失败**。值不参与任何检查，所以刻意用 `_` 命名。
+        //
+        // ⚠️ 这里早先写着「这条断言钉的是 resolver 能看出这两类不同」——**那句是假的**。
+        // 让 resolver 分得出来的是 `SourceResult` 的**形状**（空集合装在哪、
+        // 哪个变体表示不处理），而形状由这三个绑定钉住，**不由任何断言钉住**。
+        // 「该不该换音源」这类判断要在运行时测，就该测**真函数**
+        // （`should_try_next_provider` 那种），而不是把字面量互相比一遍。
+        let _empty: SourceResult<Vec<Track>> = Ok(Some(Vec::new()));
+        let _not_handled: SourceResult<Vec<Track>> = Ok(None);
+        let _unsupported: SourceResult<Vec<Track>> = Err(SourceError::Unsupported);
     }
 
     #[test]
