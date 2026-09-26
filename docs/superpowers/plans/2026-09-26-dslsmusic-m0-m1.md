@@ -1568,19 +1568,6 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
     /// **(b)** 从**最高档**起步逐级降，必须正好 4 步落到 `Low`。
     #[test]
     fn ladder_is_exactly_the_five_fidelity_tiers() {
-        // 这个函数的唯一作用是**编译期的穷尽性检查**，没有运行期效果。
-        // 它不调用任何东西，所以不会被执行 —— 加变体时它会先编译失败。
-        #[allow(dead_code)]
-        fn exhaustive_check(q: Quality) {
-            match q {
-                Quality::Low
-                | Quality::Standard
-                | Quality::High
-                | Quality::Lossless
-                | Quality::HiRes => {}
-            }
-        }
-
         let mut q = Quality::HiRes;
         let mut steps = 0usize;
         while let Some(next) = q.lower() {
@@ -1590,8 +1577,39 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
             assert!(steps < 16, "降级链出现环");
             q = next;
         }
-        assert_eq!(q, Quality::Low, "降级链的终点必须是 Low");
         assert_eq!(steps, 4, "HiRes→Low 应正好 4 步（5 档）");
+
+        // ⭐ **终点断言故意写成穷尽 `match`，不加辅助函数、不加 `#[allow]`。**
+        //    给 `Quality` 加第 6 个变体而没列进这里 → 这个 `match` 不穷尽
+        //    → **E0004 编译失败**。这是唯一能堵住「在 HiRes 之上再加一档
+        //    会静默通过」的办法，且不需要 strum 之类的枚举反射依赖。
+        //
+        //    ⚠️ **绝不能写 `_ => {}` 通配臂** —— 一写检查就静默失效。
+        match q {
+            Quality::Low => {}
+            other => panic!("降级链的终点必须是 Low，实际是 {other:?}"),
+        }
+    }
+
+    /// 单调性：每一档严格低于上一档。
+    ///
+    /// **它不是上面那条的复述。** 上面只查「几步到 Low」；若把 `lower()` 的
+    /// **声明顺序**写反（例如把 `Quality::Low => None` 挪到最前），
+    /// 只有这一条会失败。（复审用变异测试确认过：6 组变异里，
+    /// 「声明顺序反转」那一组**只有它 FAIL**。）
+    #[test]
+    fn lower_is_strictly_decreasing() {
+        let mut q = Quality::HiRes;
+        let mut steps = 0usize;
+        while let Some(next) = q.lower() {
+            assert!(next < q, "lower() 必须严格下降：{q:?} -> {next:?}");
+            q = next;
+            steps += 1;
+            // 防死循环。**这不是对梯子形状的断言** —— `lower()` 是总函数，
+            // 理论上能配出环，而测试挂死比断言失败难查得多。
+            assert!(steps < 16, "降级链出现环");
+        }
+        assert_eq!(q, Quality::Low, "链的终点必须是最低档");
     }
 ```
 
@@ -1661,7 +1679,11 @@ pub enum AudioEffect {
     Sky,
     /// 杜比全景声。⚠️ 需要 `os=pc`，**与 `Vivid` 互斥**
     Dolby,
-    /// 臻品音质。⚠️ 需要 `os=android` + `appver=9.5.61`，**与 `Dolby` 互斥**
+    /// 臻音全景声。⚠️ 需要 `os=android` + `appver=9.5.61`，**与 `Dolby` 互斥**
+    ///
+    /// ⚠️ **中文名的证据弱，落地前需外部核实**：`vivid` 被 api-enhanced 自己的
+    /// 枚举、ncm-api-rs 文档、SPlayer 的 `song.ts` 联合类型**全部排除在外**，
+    /// 只有 api-enhanced 文档与 SPlayer 的 UI 配置表提到它。
     Vivid,
 }
 ```
@@ -1678,7 +1700,10 @@ pub use model::{AudioEffect, Quality, Track};
 cargo test -p dsls-provider-api
 ```
 
-Expected: 全过（原 11 条 + 1 条新 = 12 条；两条改名的算在原有 11 里）。
+Expected: 全过（原 11 条 + 2 条新 = **13 条**：新增 `ladder_is_exactly_the_five_fidelity_tiers`
+与 `confirmed_without_session_cookie_is_a_protocol_error` 之外的那条阶梯测试；
+`lower_walks_the_five_fidelity_tiers_to_none` 是**改名**自原有测试，不增计数）。
+⚠️ 以实际运行结果为准 —— 实现者报的 12 条与本算式不一致，复审时确认过差异来源。
 
 - [ ] **Step 5: 提交**
 
