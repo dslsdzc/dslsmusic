@@ -88,4 +88,85 @@ mod tests {
         let e = SourceError::Protocol("yrc 字段消失".into());
         assert!(e.is_upstream_changed());
     }
+
+    #[test]
+    fn only_unsupported_justifies_trying_another_provider() {
+        // 只有 Unsupported 说明「换一个音源有意义」——其余理由换音源都无济于事
+        assert!(SourceError::Unsupported.should_try_next_provider());
+
+        for e in [
+            SourceError::NotFound,
+            SourceError::AuthRequired,
+            SourceError::Unavailable,
+            SourceError::RateLimited,
+            SourceError::Network("x".into()),
+            SourceError::Protocol("x".into()),
+        ] {
+            assert!(
+                !e.should_try_next_provider(),
+                "{e:?} 不应被当作「该换音源」"
+            );
+        }
+    }
+
+    #[test]
+    fn only_unavailable_and_rate_limited_justify_lowering_quality() {
+        assert!(SourceError::Unavailable.should_retry_lower_quality());
+        assert!(SourceError::RateLimited.should_retry_lower_quality());
+
+        for e in [
+            SourceError::Unsupported,
+            SourceError::NotFound,
+            SourceError::AuthRequired,
+            SourceError::Network("x".into()),
+            SourceError::Protocol("x".into()),
+        ] {
+            assert!(
+                !e.should_retry_lower_quality(),
+                "{e:?} 不应被当作「降音质能解决」"
+            );
+        }
+    }
+
+    #[test]
+    fn only_protocol_counts_as_upstream_change() {
+        assert!(SourceError::Protocol("yrc 字段消失".into()).is_upstream_changed());
+
+        for e in [
+            SourceError::Unsupported,
+            SourceError::NotFound,
+            SourceError::AuthRequired,
+            SourceError::Unavailable,
+            SourceError::RateLimited,
+            SourceError::Network("x".into()),
+        ] {
+            assert!(!e.is_upstream_changed(), "{e:?} 不是协议变化");
+        }
+    }
+
+    #[test]
+    fn display_strings_are_non_empty_and_distinct() {
+        // 这些串会出现在日志与用户可见的错误提示里，不能是空的、也不该互相撞车
+        let all = [
+            SourceError::Unsupported,
+            SourceError::NotFound,
+            SourceError::AuthRequired,
+            SourceError::Unavailable,
+            SourceError::RateLimited,
+            SourceError::Network("网络细节".into()),
+            SourceError::Protocol("协议细节".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            let s = e.to_string();
+            assert!(!s.trim().is_empty(), "{e:?} 的 Display 是空的");
+            seen.insert(s.clone());
+        }
+        // 七个变体应有七个不同的串（Network/Protocol 带 payload，天然不同）
+        assert_eq!(
+            seen.len(),
+            all.len(),
+            "有变体的 Display 串互相撞车：{seen:?}"
+        );
+    }
 }

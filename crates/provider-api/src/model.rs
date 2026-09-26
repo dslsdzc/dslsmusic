@@ -45,3 +45,31 @@ pub struct Track {
     /// 毫秒
     pub duration_ms: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_chains_down_to_none() {
+        // 降级链必须能一路走到最低档，且最低档返回 None
+        assert_eq!(Quality::Super.lower(), Some(Quality::High));
+        assert_eq!(Quality::High.lower(), Some(Quality::Standard));
+        assert_eq!(Quality::Standard.lower(), Some(Quality::Low));
+        assert_eq!(Quality::Low.lower(), None, "最低档不应能再降");
+    }
+
+    #[test]
+    fn lower_is_strictly_decreasing() {
+        // 单调性：每一档严格低于上一档。用 Ord 验证，而不是硬编码顺序。
+        let mut q = Quality::Super;
+        let mut steps = 0;
+        while let Some(next) = q.lower() {
+            assert!(next < q, "lower() 必须严格下降：{q:?} -> {next:?}");
+            q = next;
+            steps += 1;
+            assert!(steps <= 8, "降级链不可能这么长，疑似循环");
+        }
+        assert_eq!(q, Quality::Low, "链的终点必须是最低档");
+    }
+}
