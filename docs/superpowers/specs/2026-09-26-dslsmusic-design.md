@@ -3037,6 +3037,102 @@ MKL sgemm **35–50 GFLOP/s（4 线程）**。
 
 ---
 
+### 18.7 空间音频 / 杜比全景声：**评估过，不做**（卡点是技术，不是许可）
+
+用户 2026-09-26 提出。**结论：现在做不了，而且卡的不是许可，是我们解不了。**
+
+#### ① 我们甚至不知道它返回什么格式
+
+**没有任何可采信的实测/抓包证据。** 流传最广的「杜比 = EAC3 in MP4」
+**出自一条代码注释**；追它的两个引用项目是**同一血脉**（一个是 fork、
+一个注释写「对齐原版 Python 实现」）⇒ **独立证据数 = 1**。
+
+**反证**：严肃逆向客户端 `chaunsin/netease-cloud-music` 把常量**注释掉了**：
+`// LevelDolby 杜比 暂时未知`。
+
+#### ② 就算它是 AC-4，**整个开源生态都解不了**
+
+三条硬证据（全部实测/源码核实）：
+
+1. `oxideav-ac4` 自己的 docs.rs **承认**它 "**emits a silent S16 AudioFrame**"、
+   "Full decode is weeks of work" —— **是解析器骨架，不是解码器**
+2. **FFmpeg `allcodecs.c` grep `ac4` 零命中**（有 `ff_ac3_decoder`/`ff_eac3_decoder`）；
+   Changelog 里只有 AC-4 的 **muxer/demuxer**
+3. 本机 `ffmpeg -decoders` 实测：有 `ac3`/`eac3`/`truehd`，**无 `ac4`**
+
+**⇒ 不是「Rust 解不了」，是「没人解得了」。**
+
+#### ③ 升级 symphonia 也没用
+
+本地 **0.5.5** 源码核实：无 `ac3`/`eac3`/`ac4`。**0.6.1 也没有。**
+多声道方面：FLAC 最多 8 声道 ✅；AAC 5.1 结构在，但**正确性未验证**。
+
+#### ④ 两条附带结论
+
+- **下混不该套固定矩阵**：AC-3 比特流**自带** `dmixmod` / `ltrtcmixlev` /
+  `ltrtsurmixlev` 等下混元数据（`ac3dec.h:115-121` 已核实）。
+  BS.775-4(12/2022) 是现行版，但**系数表拿不到** —— **不许编系数。**
+- **【推断】Atmos 的价值在渲染器，不在码流。** 耳机/内置喇叭**必然下混**，
+  用户**听不出与 lossless 的区别**。真实受益者是多声道功放用户，
+  而那批人不会拿第三方网易云客户端当播放源。
+
+#### ⇒ 下一步不是写代码，是**抓一次真实响应**
+
+```
+level=dolby 且 os=pc  →  看响应里的 type / channelLayout
+                      →  对拿到的文件跑 file + ffprobe
+```
+
+**在那之前，任何空间音频架构都是空中楼阁。**
+
+---
+
+### 18.8 音频裁剪 + 铃声制作：**做，但只导出 WAV**
+
+用户 2026-09-26 提出。结论：**做**，且**不需要新依赖**。
+
+#### ① 只做 WAV —— 自写 44 字节头就够
+
+已构造性验证（`data` 偏移 36、payload 起始 44、RIFF size = len−8）。
+**零新依赖**即可覆盖：
+
+| 平台 | 覆盖情况 |
+|---|---|
+| **Linux 事件音** | ✅ freedesktop 规范**原文明确接受 WAV/PCM** |
+| **Android 铃声** | ✅ |
+| **Windows 系统声音** | ✅ |
+| **iOS** | ⚠️ 见下 |
+
+#### ② 两个「找不到」要写进需求
+
+1. **Apple 从未公开 `.m4r` 规格**（`AVFileType` 里 `m4r` 命中 **0** 次）
+2. **第三方 App 无法程序化设铃声**（私有 `TLToneManager` + 审核指南 2.5.1）
+
+**⇒ iOS 官方唯一路径是 GarageBand 手动转 —— 项目一行 AAC 代码都不用写。**
+和我们早先的判断一致：**iOS 上「铃声制作」降级为「导出文件 + 引导用户」。**
+
+⚠️ **来源矛盾如实记录**：官方只说 **30 秒**，社区流传 40 秒，**未解决**。
+
+#### ③ 许可红线（如果要加编码器）
+
+| 库 | 许可 | 判定 |
+|---|---|---|
+| **`fdk-aac`** | NOTICE 原文含 "**NO PATENT LICENSE**" + "only for purposes authorized by appropriate patent licenses" —— **带专利限制的专有许可** | ❌ **与 GPL-3.0-or-later 硬冲突**，包装 crate 写 MIT/Apache **都救不了** |
+| **`mp3lame-encoder`** | **LGPL-3.0**（独立复核），底层 LAME 3.100 = LGPL-2.0-or-later | ✅ 兼容 |
+
+⚠️ **别开 `mp3lame-encoder` 的 `decoder` feature** —— README 原文：那是 "under GPL"。
+⚠️ 它的 `build.rs` **自己打印** "Cross-compilation may not be supported" ——
+**交叉编译风险真实存在**（而我们要铺五平台）。
+
+#### ④ 实测
+
+三个编码器本机编译 + `ffprobe` 验证均可产出可解码文件，体积 **+0.5～0.7 MB/个**。
+
+**⇒ 建议：v1 只做「裁剪 + 导出 WAV」。** 加 mp3 是可选增强（LGPL 兼容，
+但要承担交叉编译风险），AAC 直接排除。
+
+---
+
 ## 附录 A：决策记录
 
 | 决策 | 选择 | 被否决 | 关键理由 |
