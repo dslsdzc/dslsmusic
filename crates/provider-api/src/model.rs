@@ -59,7 +59,11 @@ pub enum AudioEffect {
     Sky,
     /// 杜比全景声。⚠️ 需要 `os=pc`，**与 `Vivid` 互斥**
     Dolby,
-    /// 臻品音质。⚠️ 需要 `os=android` + `appver=9.5.61`，**与 `Dolby` 互斥**
+    /// 臻音全景声。⚠️ 需要 `os=android` + `appver=9.5.61`，**与 `Dolby` 互斥**
+    ///
+    /// ⚠️ **中文名的证据弱，落地前需外部核实**：`vivid` 被 api-enhanced 自己的
+    /// 枚举、ncm-api-rs 文档、SPlayer 的 `song.ts` 联合类型**全部排除在外**，
+    /// 只有 api-enhanced 文档与 SPlayer 的 UI 配置表提到它。
     Vivid,
 }
 
@@ -95,28 +99,67 @@ mod tests {
         assert_eq!(Quality::Low.lower(), None);
     }
 
-    /// 钉住**档位总数**。加档位却忘了接进 `lower()` 的话，这条会失败。
+    /// 钉住**保真度梯度就是这 5 档、且是一条直线**。
+    ///
+    /// ⚠️ **不要从 `Low` 起步往下数。** `lower()` 是**向下降级**的，
+    /// 从最低档起步循环体一次都不进，`steps` 恒为 1 ——
+    /// **那条测试无论实现怎么写都不可能通过。**（本计划的初稿正是这么写的，
+    /// 实现者实测 `left: 1, right: 5` 才发现。）
+    ///
+    /// ⚠️ **也不要只从 `HiRes` 起步数个数。** 那样「在 `HiRes` **之上**
+    /// 再加一档」会**静默通过**，与这条测试自称的用途不符。
+    ///
+    /// 所以用两件事合起来钉：
+    /// **(a)** 一个**穷尽 `match`** —— 加变体而没列进这里，`match` 会因为
+    /// 不穷尽而**编译失败**（`Quality` 虽标了 `#[non_exhaustive]`，
+    /// 但那只约束**下游** crate，crate 内部的 `match` 仍是穷尽的）；
+    /// **(b)** 从**最高档**起步逐级降，必须正好 4 步落到 `Low`。
     #[test]
-    fn ladder_has_exactly_five_rungs() {
-        let mut n = 1;
+    fn ladder_is_exactly_the_five_fidelity_tiers() {
         let mut q = Quality::HiRes;
+        let mut steps = 0usize;
         while let Some(next) = q.lower() {
-            n += 1;
+            steps += 1;
+            // 防死循环（不是对梯子形状的断言）：`lower()` 是总函数，
+            // 理论上可以配出环，跑测试时挂死比断言失败更难查。
+            assert!(steps < 16, "降级链出现环");
             q = next;
         }
-        assert_eq!(n, 5, "保真度梯度应为 5 档；加档位时必须同时更新 lower()");
+        assert_eq!(steps, 4, "HiRes→Low 应正好 4 步（5 档）");
+
+        // ⭐ **终点断言故意写成穷尽 `match`，不加辅助函数、不加 `#[allow]`。**
+        //    5 个变体**逐个列出**：给 `Quality` 加第 6 个变体而没列进这里 →
+        //    这个 `match` 不穷尽 → **E0004 编译失败**。这是唯一能堵住
+        //    「在 `HiRes` 之上再加一档会静默通过」的办法，且不需要 strum
+        //    之类的枚举反射依赖。
+        //
+        //    ⚠️ **绝不能加通配臂** —— 无论是 `_ => {}` 还是绑定臂
+        //    `other => ...`，都会让这个检查**静默失效**（实测：6 档下照样 PASS）。
+        match q {
+            Quality::Low => {}
+            Quality::Standard | Quality::High | Quality::Lossless | Quality::HiRes => {
+                panic!("降级链的终点必须是 Low，实际是 {q:?}")
+            }
+        }
     }
 
+    /// 单调性：每一档严格低于上一档。
+    ///
+    /// **它不是上面那条的复述。** 上面只查「几步到 Low」；若把 `lower()` 的
+    /// **声明顺序**写反（例如把 `Quality::Low => None` 挪到最前），
+    /// 只有这一条会失败。（复审用变异测试确认过：6 组变异里，
+    /// 「声明顺序反转」那一组**只有它 FAIL**。）
     #[test]
     fn lower_is_strictly_decreasing() {
-        // 单调性：每一档严格低于上一档。用 Ord 验证，而不是硬编码顺序。
         let mut q = Quality::HiRes;
-        let mut steps = 0;
+        let mut steps = 0usize;
         while let Some(next) = q.lower() {
             assert!(next < q, "lower() 必须严格下降：{q:?} -> {next:?}");
             q = next;
             steps += 1;
-            assert!(steps <= 8, "降级链不可能这么长，疑似循环");
+            // 防死循环。**这不是对梯子形状的断言** —— `lower()` 是总函数，
+            // 理论上能配出环，而测试挂死比断言失败难查得多。
+            assert!(steps < 16, "降级链出现环");
         }
         assert_eq!(q, Quality::Low, "链的终点必须是最低档");
     }
