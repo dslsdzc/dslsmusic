@@ -1785,11 +1785,21 @@ git commit -m "feat(provider-netease): 扫码登录状态机 + cookie 提取"
 - Modify: `crates/provider-netease/src/lib.rs`
 
 **Interfaces:**
-- Consumes: Task 6 的 `NeteaseClient`
+- Consumes: Task 6 的 `NeteaseClient`；Task 5 的 `MusicSource` / `SourceResult` / `CapabilitySet` / `Capability`
 - Produces:
   - `pub fn parse_search_tracks(body: &serde_json::Value) -> Result<Vec<Track>, SourceError>` ★
   - `pub fn parse_stream_url(body: &serde_json::Value, quality: Quality) -> Result<String, SourceError>` ★
-  - `NeteaseClient::search(&self, kw, limit)`、`NeteaseClient::stream_url(&self, id, quality)`
+  - **`impl MusicSource for NeteaseClient`** —— 本 crate 对外的**唯一**取数入口
+  - `NeteaseClient` 增加 `capabilities: CapabilitySet` 字段
+
+> **⚠️ 本任务刻意不提供固有方法 `search` / `stream_url`。**
+>
+> 理由：同名方法会**遮蔽** trait 方法（Rust 的固有方法优先级更高），
+> 结果是 CLI 静默走固有版本、**trait impl 永不执行**——这比不实现更糟，
+> 因为它看起来被验证过了。
+>
+> **整个 M1 里 `MusicSource` 只有一份定义。** 裁决记录见
+> `.superpowers/sdd/progress.md`。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1864,6 +1874,29 @@ mod tests {
         let err = parse_stream_url(&body, Quality::High).unwrap_err();
         assert!(matches!(err, dsls_provider_api::SourceError::Unavailable));
     }
+
+    #[test]
+    fn rejects_url_below_requested_quality() {
+        // 要无损、只给 128k —— 必须拒绝，否则是静默降档
+        let body = json!({
+            "data": [{"url": "https://m8.music.126.net/low.mp3", "br": 128000, "code": 200}]
+        });
+        let err = parse_stream_url(&body, Quality::Super).unwrap_err();
+        assert!(matches!(err, dsls_provider_api::SourceError::Unavailable));
+        // 这条断言是关键：它保证降档链真的可执行（Task 5 审查的重点）
+        assert!(err.should_retry_lower_quality());
+    }
+
+    #[test]
+    fn accepts_when_br_absent() {
+        // br 缺失时不拒绝：拒绝一个能播的 URL 让用户直接听不到歌，
+        // 代价远大于音质低于预期。这是有意的不对称取舍。
+        let body = json!({"data": [{"url": "https://m8.music.126.net/x.mp3", "code": 200}]});
+        assert_eq!(
+            parse_stream_url(&body, Quality::Super).unwrap(),
+            "https://m8.music.126.net/x.mp3"
+        );
+    }
 }
 ```
 
@@ -1935,18 +1968,39 @@ fn quality_to_br(q: Quality) -> u32 {
     }
 }
 
-pub fn parse_stream_url(body: &Value, _q: Quality) -> Result<String, SourceError> {
+/// 从 `song/url/v1` 响应里取出可播放 URL，**并核对实际档位**。
+///
+/// `want` 是**精确档位要求**，不是「取所能及的最高档」——这是 Task 5 的
+/// `MusicSource::stream_url` 文档定下的契约，也是
+/// `should_retry_lower_quality()` 唯一有意义的来源。
+pub fn parse_stream_url(body: &Value, want: Quality) -> Result<String, SourceError> {
     let data = body
         .get("data")
         .and_then(|v| v.as_array())
         .ok_or_else(|| SourceError::Protocol("song/url 响应缺少 data".into()))?;
 
     let first = data.first().ok_or(SourceError::Unavailable)?;
-    match first.get("url").and_then(|v| v.as_str()) {
-        Some(u) if !u.is_empty() => Ok(u.to_string()),
+
+    let url = match first.get("url").and_then(|v| v.as_str()) {
+        Some(u) if !u.is_empty() => u,
         // url 为 null / 空：有能力但当前拿不到（版权、地区、需要 VIP）
-        _ => Err(SourceError::Unavailable),
+        _ => return Err(SourceError::Unavailable),
+    };
+
+    // ⚠️ 档位核对。**直接返回低档 URL 是静默的谎言**——调用方会以为
+    // 拿到了无损，实际听到的是 320k。返回 Unavailable 才能让 resolver
+    // 走 `Quality::lower()` 的显式降级链，把「降档」这件事告诉用户。
+    //
+    // 不对称取舍（有意为之）：`br` **缺失时不拒绝**。拒绝一个本可播放的
+    // URL 会让用户直接听不到歌；接受一个无法核实的 URL 最坏只是音质
+    // 低于预期。前者的代价大得多。
+    if let Some(got) = first.get("br").and_then(|v| v.as_u64()) {
+        if got < quality_to_br(want) as u64 {
+            return Err(SourceError::Unavailable);
+        }
     }
+
+    Ok(url.to_string())
 }
 
 pub use quality_to_br as br_for_quality;
@@ -1961,13 +2015,56 @@ pub mod parse;
 
 - [ ] **Step 4: 在 client.rs 追加方法**
 
+**先在 client.rs 顶部补 import**（**把 Task 6 那行 `use dsls_provider_api::SourceError;`
+整行替换掉**，不要新增第二行——同一 crate 两条 use 虽合法但没必要）：
+
 ```rust
-impl NeteaseClient {
-    pub async fn search(
-        &self,
-        keywords: &str,
-        limit: u32,
-    ) -> Result<Vec<dsls_provider_api::Track>, SourceError> {
+use dsls_provider_api::{
+    Capability, CapabilitySet, MusicSource, Quality, SourceError, SourceResult, Track,
+};
+```
+
+**给 `NeteaseClient` 加 `capabilities` 字段**（`MusicSource::capabilities()`
+返回 `&CapabilitySet`，所以它必须存在结构体里）：
+
+```rust
+pub struct NeteaseClient {
+    inner: ApiClient,
+    cookie: Option<String>,
+    capabilities: CapabilitySet,
+}
+```
+
+`new()` 里构造它。**只申报 M1 真正实现了的能力** —— `CapabilitySet` 是
+resolver 用来决定路由的依据（设计文档 §4.5），申报没实现的能力等于撒谎：
+
+```rust
+// 只列已实现的。歌词 / 封面 / 歌单 / 专辑 的 provider 方法随各自的
+// M2+ 任务落地时再加进来 —— 现在申报它们，resolver 会把请求路由过来，
+// 然后撞上 Unimplemented。
+capabilities: CapabilitySet::new()
+    .with(Capability::Search)
+    .with(Capability::StreamUrl),
+```
+
+**trait impl**（注意 `#[async_trait::async_trait]` —— Task 5 的 trait 定义
+就是这个宏，impl 侧必须匹配，否则签名对不上）：
+
+```rust
+#[async_trait::async_trait]
+impl MusicSource for NeteaseClient {
+    fn name(&self) -> &str {
+        crate::PLATFORM
+    }
+
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.capabilities
+    }
+
+    /// **三态契约**（设计文档 §4.5）：
+    /// `Ok(Some(vec![]))` = 查到了但没结果；`Err(Unsupported)` = 本音源不处理搜索。
+    /// 两者绝不可混淆 —— 前者不该触发换音源，后者应该。
+    async fn search(&self, keywords: &str, limit: u32) -> SourceResult<Vec<Track>> {
         let resp = self
             .inner
             .cloudsearch(
@@ -1978,26 +2075,28 @@ impl NeteaseClient {
             )
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
-        crate::parse::parse_search_tracks(&resp.body)
+        crate::parse::parse_search_tracks(&resp.body).map(Some)
     }
 
-    pub async fn stream_url(
-        &self,
-        track_id: &str,
-        quality: dsls_provider_api::Quality,
-    ) -> Result<String, SourceError> {
+    /// `Err(Unavailable)` 是**有意的**：版权 / 地区限制是「有能力但拿不到」，
+    /// 经 `should_retry_lower_quality()` 触发降档重试，而不是 Protocol。
+    async fn stream_url(&self, track_id: &str, quality: Quality) -> SourceResult<String> {
         // 已核实方法名存在：ncm-api-rs src/api/song_url_v1.rs
         //   pub async fn song_url_v1(&self, query: &Query) -> Result<ApiResponse>
         let resp = self
             .inner
-            .song_url_v1(&Query::new().param("id", track_id).param("level", &level_for(quality)))
+            .song_url_v1(
+                &Query::new()
+                    .param("id", track_id)
+                    .param("level", &level_for(quality)),
+            )
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
-        crate::parse::parse_stream_url(&resp.body, quality)
+        crate::parse::parse_stream_url(&resp.body, quality).map(Some)
     }
 }
 
-fn level_for(q: dsls_provider_api::Quality) -> String {
+fn level_for(q: Quality) -> String {
     match q {
         dsls_provider_api::Quality::Low => "standard",
         dsls_provider_api::Quality::Standard => "higher",
@@ -2010,13 +2109,41 @@ fn level_for(q: dsls_provider_api::Quality) -> String {
 
 > **已核实**：`song_url` / `song_url_v1` / `song_url_v1_302` / `song_url_ncmget` / `song_url_match` 五个方法在 `ncm-api-rs` 0.1.0 中都存在。用 `song_url_v1`（对应 Node 版 `/song/url/v1`，支持 `level` 参数）。
 
+**再加一个测试进 `client.rs` 的 `mod tests`** —— 它钉住的是**编译期契约**，
+不是运行时行为：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 编译期契约：`NeteaseClient` 必须能当 `dyn MusicSource` 用。
+    ///
+    /// 若有人删掉 `impl MusicSource`、或把 `name()` 改成别的字面量，
+    /// **这个测试编译不过 / 断言失败** —— 那正是它存在的意义。
+    /// 它守的是那条「`Track::platform` 与 `MusicSource::name()` 必须同源」
+    /// 的约束（见 Task 6 的 `PLATFORM` 常量）。
+    #[test]
+    fn netease_is_a_music_source_with_matching_platform_id() {
+        let client = NeteaseClient::new(None);
+        let src: &dyn MusicSource = &client;
+
+        assert_eq!(src.name(), crate::PLATFORM);
+
+        // 只申报已实现的 —— 多申报会让 resolver 路由到未实现的方法
+        assert!(src.capabilities().supports(Capability::Search));
+        assert!(src.capabilities().supports(Capability::StreamUrl));
+    }
+}
+```
+
 - [ ] **Step 5: 运行测试确认通过**
 
 ```bash
 cargo test -p dsls-provider-netease
 ```
 
-Expected: 13 passed。
+Expected: 16 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -2635,8 +2762,15 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
         _ => Quality::High,
     };
 
+    // 经**抽象**调用，不碰具体类型 —— M1 存在的理由就是验证这条链路。
+    // `Ok(None)` 表示「本音源不处理搜索」，与「没搜到」是两回事（§4.5）。
+    let src: &dyn dsls_provider_api::MusicSource = &client;
+
     println!("搜索: {keywords}");
-    let tracks = client.search(keywords, 5).await?;
+    let tracks = src
+        .search(keywords, 5)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("本音源不支持搜索（Unsupported）"))?;
     if tracks.is_empty() {
         println!("没有结果。");
         return Ok(());
@@ -2653,7 +2787,10 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
 
     let track = &tracks[0];
     println!("\n解析播放地址: {} — {}", track.title, track.artist);
-    let url = client.stream_url(&track.id, q).await?;
+    let url = src
+        .stream_url(&track.id, q)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("本音源不支持取流（Unsupported）"))?;
     println!("得到地址（{} 字符）", url.len());
 
     let mut engine = AudioEngine::new()?;
