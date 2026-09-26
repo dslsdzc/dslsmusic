@@ -1,0 +1,13 @@
+[package]
+name = "dsls-provider-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# `#[async_trait]` 而不是原生 `async fn in trait`：原生写法在 M1 之后的
+# `dyn MusicSource`（source-resolver 要持有 `Vec<Box<dyn MusicSource>>`）上
+# 不是 dyn-compatible，会直接把抽象锁死。这里先按 dyn 可用的形态定型。
+async-trait = "0.1"
