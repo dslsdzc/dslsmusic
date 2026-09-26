@@ -39,6 +39,13 @@ enum Cmd {
         /// 音质档位：low | standard | high | lossless | hires
         #[arg(long, default_value = "high")]
         quality: String,
+        /// 指定输出设备（ALSA 的 PCM 名字，如 `hw:CARD=1,DEV=0`）。
+        ///
+        /// ⚠️ **硬性**：打不开就报错，不会偷偷换一台设备播放。不给这个参数时走
+        /// 自动选路：先试设备独占（拿不到就**如实退回**共享路径，不会静音）。
+        /// 可选值见 `cargo run -p dsls-audio --example probe_devices`。
+        #[arg(long)]
+        device: Option<String>,
     },
 }
 
@@ -59,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
         // M0 的渲染循环是**同步**的，缺省臂必须与 `Render` 走同一条路径。
         None | Some(Cmd::Render) => render_triangle(),
         Some(Cmd::Login) => login().await,
-        Some(Cmd::Play { keywords, quality }) => play(&keywords, &quality).await,
+        Some(Cmd::Play {
+            keywords,
+            quality,
+            device,
+        }) => play(&keywords, &quality, device.as_deref()).await,
     }
 }
 
@@ -134,7 +145,7 @@ async fn login() -> anyhow::Result<()> {
 }
 
 /// `play`：搜索 → 取流 → 下载 → 解码 → 出声。
-async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
+async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Result<()> {
     let cookie = load_cookie();
     if cookie.is_none() {
         log::warn!("未找到会话，将以游客身份播放（可能受限）。先跑 `login` 更稳。");
@@ -214,28 +225,37 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
         44100
     });
 
-    let mut engine = AudioEngine::new(src_rate)?;
-    // 用户有权知道**我们**有没有动过样本。⚠️ 但 `true` 只代表「我们没重采样」，
-    // 不代表整条链路逐位精确 —— 系统混音器仍可能替我们重采样到硬件率。
-    // 所以下面两句话要一起说，只说前半句就是给人一个「已经 bit-perfect」的错觉。
-    if engine.is_passthrough() {
-        println!(
-            "输出流 {}Hz {}ch：**直通**（按源采样率建流，我们未重采样；\
-             逐位精确到我们这一层为止）",
-            engine.output_rate(),
-            engine.output_channels()
-        );
-        println!(
-            "  ⚠️ 这不等于整条链路逐位精确 —— 系统混音器（PipeWire/PulseAudio）\
-             仍可能替我们重采样到硬件的实际采样率。"
-        );
-    } else {
-        println!(
-            "输出流 {}Hz {}ch：设备不支持源采样率 {src_rate}Hz，**已重采样**\
-             （rubato FFT 同步重采样器，抗混叠；不是线性插值）",
-            engine.output_rate(),
-            engine.output_channels()
-        );
+    // `--device` 是**硬**语义（用户点名要这台设备，打不开就报错，不偷偷换一台）；
+    // 不给就走自动选路：先试独占，拿不到就如实退回共享 —— 见 AudioEngine 的文档。
+    let mut engine = match device {
+        Some(id) => AudioEngine::new_on(id, src_rate)?,
+        None => AudioEngine::new(src_rate)?,
+    };
+    // **两条边界必须一起说**，它们的口径不同：
+    //   ① is_passthrough：「**我们**没重采样」；
+    //   ② output_path：「**系统混音器**在不在我们与设备之间」。
+    // Task 10 的教训就是只知道 ① 会得出「已经 bit-perfect」的错觉 ——
+    // 那时 `is_passthrough() == true`，而 44.1kHz 仍是 PipeWire 在重采样。
+    println!("输出路径：{}", engine.output_path());
+    println!("  ⚠️ {}", engine.output_path().caveat());
+    println!(
+        "  设备侧：{}Hz {}ch 格式 {:?}；我们这一层{}重采样{}",
+        engine.output_rate(),
+        engine.output_channels(),
+        engine.output_format(),
+        if engine.is_passthrough() {
+            "未"
+        } else {
+            "已"
+        },
+        if engine.is_passthrough() {
+            ""
+        } else {
+            "（rubato FFT 同步重采样器，抗混叠；不是线性插值）"
+        }
+    );
+    if let Some(note) = dsls_audio::output_path::platform_note() {
+        println!("  {note}");
     }
 
     println!("开始播放…（Ctrl-C 停止）");
@@ -297,23 +317,28 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
 
     println!("\n播放结束。");
     println!(
-        "采样率：源 {src_rate}Hz → 输出 {}Hz（{}）",
+        "采样率：源 {src_rate}Hz → 输出 {}Hz（{}）；输出路径：{}",
         engine.output_rate(),
         if engine.is_passthrough() {
             "直通，未重采样"
         } else {
             "已重采样"
-        }
+        },
+        engine.output_path()
     );
     println!(
         "xrun：播放期间 = {xrun_during_playback}（这条必须为 0）；\
          总计 = {xrun_total}（其中收尾抽干 {xrun_tail} 次 —— 歌放完、环读空，\
          回调必然记一次，不是故障。口径见 crates/audio/src/lib.rs 与设计文档 §16.2）"
     );
-    // ⚠️ 本行以上的数字**只覆盖「我们自己的 ring 被抽干」**。
-    // ALSA/设备侧的 xrun 不在这里，它只会在 cpal 的错误回调里以
-    // 「音频流错误: A buffer underrun or overrun occurred.」的形式出现 ——
-    // 设备卡顿而我方缓冲有货时，上面的 0 照样是 0（设计文档 §16.2 的口径）。
+    // ⚠️ 上面的数字**只覆盖「我们自己的 ring 被抽干」**：设备卡顿而我方缓冲有货时，
+    // 它照样是 0（设计文档 §16.2 的口径）。设备侧那一半单独报 —— 它以前只进日志，
+    // 听感上是「断了一下」，而指标上完全隐形。
+    println!(
+        "设备侧报错（ALSA 的 underrun/overrun）：{}（这条也必须为 0 —— \
+         非零说明这条实时路径被饿到过，而上面的 xrun 计数看不见它）",
+        engine.device_error_count()
+    );
     Ok(())
 }
 

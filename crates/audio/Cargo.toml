@@ -37,3 +37,8 @@ ringbuf = "0.4"
 rubato = "5.0"
 anyhow.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+# 示例（examples/*.rs）要能看见引擎的 log —— 独占尝试、可选的 hw: 设备列表
+# 都是从 log 里出来的，不装 logger 就等于把「如实报告」吞掉。
+env_logger.workspace = true

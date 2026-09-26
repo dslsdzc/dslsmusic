@@ -27,18 +27,33 @@
 //!    高质量 FFT 同步重采样器 —— 不是线性插值那种）。
 //!
 //! 走的是哪条路由 [`AudioEngine::is_passthrough`] 如实报出来，CLI 会打印它。
+//!
+//! # 两道边界，别混为一谈
+//!
+//! - [`AudioEngine::is_passthrough`]：「**我们**没重采样」。
+//! - [`AudioEngine::output_path`]：「**系统混音器**在不在我们与设备之间」。
+//!
+//! 第二道是 Task 11 加的。它的来历是实测：那 184 秒里 `is_passthrough() == true`，
+//! 而 44.1kHz 仍然是 **PipeWire 在替我们重采样**到 48kHz 的硬件上 ——
+//! 「我们没动」并不蕴含「没人动」。两条都得报出来，只说前一条就是给人一个
+//! 「已经 bit-perfect」的错觉。边界说明见 [`OutputPath`] 的文档。
 
 pub mod decode;
 pub mod output;
+pub mod output_path;
 pub mod pcm;
 pub mod resample;
 
 pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer};
+pub use output_path::OutputPath;
 pub use pcm::{PcmGraph, PcmStage};
 pub use resample::StreamResampler;
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use output_path::{Candidate, EnvPreference};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// ring 缓冲的时长（秒）。**按秒而不是按样本数**定容量：输出率可能是 44.1k 也可能
 /// 是 48k，写死样本数会让「几秒缓冲」随设备而变（44.1k 的 4 秒样本数在 48k 上
@@ -54,6 +69,10 @@ pub struct AudioEngine {
     output_rate: u32,
     /// 输出流实际的声道数（`output_channels()`）。
     output_channels: u16,
+    /// 输出流实际的采样格式（`output_format()`）。
+    output_format: cpal::SampleFormat,
+    /// 我们**实际**拿到的那条路径：系统混音器在不在中间（`output_path()`）。
+    path: OutputPath,
     /// `None` = **直通**：设备支持源采样率，我们一个样本都没动。
     /// `Some` = 设备不支持，样本在进 ring 之前被换算到设备率。
     resampler: Option<StreamResampler>,
@@ -63,6 +82,9 @@ pub struct AudioEngine {
     conv: Vec<i16>,
     /// ring 容量（样本数），按**输出率**算出来的。
     ring_capacity: usize,
+    /// 设备侧报错次数（`device_error_count()`）。与 `producer.underruns()` 共享同一个
+    /// 计数器 —— 但**口径完全不同**，见那个方法的文档。
+    device_errors: Arc<AtomicU64>,
 }
 
 impl AudioEngine {
@@ -74,27 +96,96 @@ impl AudioEngine {
     ///
     /// `desired_rate == 0` 直接报错：0 不是「没意见」，是调用方的实现错误。
     /// 别把它当成「用设备默认率」—— 那样会静默退回本文件顶部描述的那个缺陷。
+    ///
+    /// # 自动选路：先试设备独占，拿不到再走系统默认（共享）
+    ///
+    /// - 独占候选从哪来：环境变量 `DSLS_AUDIO_DEVICE`（首选）或
+    ///   [`output_path::probe_default_target`]（拿证据，不猜）。见那个函数的文档。
+    /// - ⚠️ **独占失败是常态而不是异常**（`hw:` 被 PipeWire 或别的进程占着就打不开）。
+    ///   失败只记一条 `warn` 然后走共享路径 —— **绝不因此不出声**（设计文档 §17：
+    ///   能力缺失时降级，不要拒绝运行）。实际拿到哪条路由由
+    ///   [`AudioEngine::output_path`] 如实报出，CLI 会打印它。
+    /// - 「用户自己点了名」的设备走 [`AudioEngine::new_on`]，那条是**硬**语义。
     pub fn new(desired_rate: u32) -> anyhow::Result<Self> {
+        Self::check_rate(desired_rate)?;
+        let host = cpal::default_host();
+
+        // ① **独占优先。** 这一档的意义是「系统混音器不在我们与设备之间」——
+        //    它是 `is_passthrough()` 之外的另一半（见本模块文档）。
+        if let Some(pcm_id) = preferred_exclusive(&host) {
+            match Self::new_on(&pcm_id, desired_rate) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => log::warn!(
+                    "独占设备 {pcm_id} 打不开（{e}）—— **这是常态**（PipeWire 或别的进程\
+                     正占着它）。退回共享路径；这不会是静音，但系统混音器会回到中间。"
+                ),
+            }
+        }
+
+        // ② 共享路径：系统默认设备。行为与 Task 9/10 逐字相同。
+        let device = host
+            .default_output_device()
+            .context("没有可用的音频输出设备")?;
+        Self::build_on_device(&device, desired_rate, false)
+    }
+
+    /// **指定设备**建流（按 PCM 名字：`hw:CARD=1,DEV=0` / `plughw:…` / `default` /
+    /// `pipewire` / …）。
+    ///
+    /// ⚠️ 与 [`AudioEngine::new`] 的区别是**语义**，不是实现：
+    ///
+    /// - 这里是「**我要这台设备**」⇒ 打不开就**报错**（找不到名字时会把本机有哪些
+    ///   列在错误信息里）。静默换一台设备播放等于骗人 —— 用户点的是 A 卡，
+    ///   声音从 B 卡出来，而所有指标都正常。
+    /// - `new` 是「**能拿到什么就用什么**」⇒ 按能力降级（§17）。
+    ///
+    /// `hw:` 前缀的设备会被报成 [`OutputPath::Exclusive`]，其余报 `Shared`
+    /// （判据见 [`output_path::is_hardware_pcm_id`]）。
+    pub fn new_on(pcm_id: &str, desired_rate: u32) -> anyhow::Result<Self> {
+        Self::check_rate(desired_rate)?;
+        let host = cpal::default_host();
+        let device = find_device(&host, pcm_id)?;
+        Self::build_on_device(
+            &device,
+            desired_rate,
+            output_path::is_hardware_pcm_id(pcm_id),
+        )
+    }
+
+    fn check_rate(desired_rate: u32) -> anyhow::Result<()> {
         anyhow::ensure!(
             desired_rate > 0,
             "desired_rate 不能为 0（它不是「用默认率」的意思，见 AudioEngine::new 文档）"
         );
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .context("没有可用的音频输出设备")?;
+        Ok(())
+    }
 
-        // ① **音质最优的一档**：按源采样率建流 ⇒ 零处理、逐位精确。
-        if let Some(supported) = find_config_at_rate(&device, desired_rate) {
-            match Self::build(&device, supported, desired_rate) {
+    /// 在**一个已选定的设备**上按音质优先级建流：
+    ///
+    /// ① **源采样率**（直通：我们一个样本都不动 —— 音质最优的一档，任何重采样
+    ///    都是失真，哪怕是高质量算法）；
+    /// ② 设备不支持才退回**设备默认率 + 重采样**。
+    ///
+    /// `exclusive` 只影响**报出来的** [`OutputPath`]，不影响建流行为 ——
+    /// 而且它在 `build` 里还要再和「设备名确实是 `hw:`」与一次，见那里的注释。
+    fn build_on_device(
+        device: &cpal::Device,
+        desired_rate: u32,
+        exclusive: bool,
+    ) -> anyhow::Result<Self> {
+        let pcm_id = output_path::pcm_id_of(device);
+
+        // ① **音质最优的一档**：按源采样率建流 ⇒ 零处理。
+        if let Some(supported) = find_config_at_rate(device, desired_rate) {
+            match Self::build(device, supported, desired_rate, exclusive) {
                 Ok(engine) => return Ok(engine),
                 Err(e) => log::warn!(
-                    "按源采样率 {desired_rate}Hz 建流失败（{e}）；\
+                    "按源采样率 {desired_rate}Hz 在 {pcm_id} 上建流失败（{e}）；\
                      退回设备默认率并重采样。这不会是静音，但会有一次重采样。"
                 ),
             }
         } else {
-            log::info!("设备未报告 {desired_rate}Hz 下我们支持的输出配置");
+            log::info!("设备 {pcm_id} 未报告 {desired_rate}Hz 下我们支持的输出配置");
         }
 
         // ② 兜底：设备默认率 + 重采样。
@@ -106,8 +197,8 @@ impl AudioEngine {
         //    组合都报一遍，默认那一档只是它自己的偏好，不代表它只能给单声道。
         //    在**同一个采样率**上再找一个 ≥2 声道的配置；找到就用它。
         //    （采样率不变 ⇒ 重采样比率不变，所以这一步不会引入任何额外转换。）
-        let chosen = find_config_at_rate(&device, default.sample_rate()).unwrap_or(default);
-        Self::build(&device, chosen, desired_rate)
+        let chosen = find_config_at_rate(device, default.sample_rate()).unwrap_or(default);
+        Self::build(device, chosen, desired_rate, exclusive)
     }
 
     /// 把一条**已选定的**输出配置变成能出声的引擎。
@@ -118,11 +209,29 @@ impl AudioEngine {
         device: &cpal::Device,
         supported: cpal::SupportedStreamConfig,
         desired_rate: u32,
+        exclusive: bool,
     ) -> anyhow::Result<Self> {
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.config();
         let output_rate = config.sample_rate;
         let channels = config.channels;
+        let pcm_id = output_path::pcm_id_of(device);
+
+        // ⚠️ **报路径时宁可少报，也不多报。** 调用方说「这是独占候选」还不够 ——
+        //    设备名必须真的落在 `hw:` 上，否则一律按 `Shared` 报。
+        //    多报一次「独占」就是给用户一个假的 bit-perfect 承诺；
+        //    少报一次（其实是独占、报成共享）只是保守，代价小得多。
+        let path = if exclusive && output_path::is_hardware_pcm_id(&pcm_id) {
+            OutputPath::Exclusive {
+                device: pcm_id.clone(),
+                rate: output_rate,
+            }
+        } else {
+            OutputPath::Shared {
+                device: pcm_id.clone(),
+                rate: output_rate,
+            }
+        };
 
         let resampler = if output_rate == desired_rate {
             None
@@ -138,14 +247,14 @@ impl AudioEngine {
         //    所以 `config.sample_rate().0` 编译不过，要写 `config.sample_rate`。
         match &resampler {
             None => log::info!(
-                "音频输出: {} @ {}Hz {}ch fmt={:?} | 直通：按源采样率建流，未重采样",
+                "音频输出: {} [{path}] @ {}Hz {}ch fmt={:?} | 直通：按源采样率建流，未重采样",
                 device.description()?.name(),
                 output_rate,
                 channels,
                 sample_format
             ),
             Some(rs) => log::info!(
-                "音频输出: {} @ {}Hz {}ch fmt={:?} | 重采样 {}Hz → {}Hz（启动延迟 {} 帧）",
+                "音频输出: {} [{path}] @ {}Hz {}ch fmt={:?} | 重采样 {}Hz → {}Hz（启动延迟 {} 帧）",
                 device.description()?.name(),
                 output_rate,
                 channels,
@@ -165,7 +274,18 @@ impl AudioEngine {
         //    而设备默认格式是运行时才知道的（本机实测 F32/48000，但换台设备可能是
         //    别的）。硬写 f32 等于假设「所有设备的默认格式都是 F32」——
         //    在不是的设备上直接建流失败，**而这个任务的出口标准就是「出声」**。
-        let stream = build_stream_for(device, config, sample_format, consumer)?;
+        // 设备侧报错（ALSA 的 xrun 就走这条路）**只有在 cpal 的错误回调里看得见** ——
+        // 它以前只进日志，于是「设备卡了、声音断了一下」在指标上是隐形的
+        // （`xrun_count` 的口径明说了自己看不见它）。这里数起来，
+        // 由 `device_error_count()` 如实报出。
+        let device_errors = Arc::new(AtomicU64::new(0));
+        let stream = build_stream_for(
+            device,
+            config,
+            sample_format,
+            consumer,
+            Arc::clone(&device_errors),
+        )?;
         stream.play()?;
 
         Ok(Self {
@@ -173,9 +293,12 @@ impl AudioEngine {
             producer,
             output_rate,
             output_channels: channels,
+            output_format: sample_format,
+            path,
             resampler,
             conv: Vec::new(),
             ring_capacity,
+            device_errors,
         })
     }
 
@@ -224,7 +347,8 @@ impl AudioEngine {
     /// ⚠️ **`true` 只代表「我们没重采样」，不代表「整条链路逐位精确」。**
     /// 样本出我们这一层之后还要经过系统混音器（PipeWire / PulseAudio / ALSA 的
     /// `plug` 插件），**它仍可能替我们重采样到硬件实际跑的采样率**。
-    /// 真正的逐位精确需要设备独占访问 —— 那是 Task 11 的事。
+    /// 后半句由 [`AudioEngine::output_path`] 回答（Task 11 加的）；而且就算拿到了
+    /// `Exclusive`，也还要格式/采样率与源一致、设备自己不做处理 —— 见 [`OutputPath`]。
     ///
     /// 不说清这一点，会给人一种「已经 bit-perfect」的错觉，而那是假的。
     pub fn is_passthrough(&self) -> bool {
@@ -246,6 +370,26 @@ impl AudioEngine {
         self.output_channels
     }
 
+    /// 输出流实际的采样格式（**设备侧**的，不是我们喂进去的 i16）。
+    ///
+    /// 为什么值得单独报出来：`Exclusive` 只保证「系统混音器不在中间」，
+    /// 而逐位精确还要求**格式与源一致**。设备跑 f32/i32/I24 时，
+    /// i16 → 那一档虽然是无损转换，但它仍然是一次转换 —— 这条只有报出来，
+    /// 用户才可能知道。
+    pub fn output_format(&self) -> cpal::SampleFormat {
+        self.output_format
+    }
+
+    /// 我们**实际**拿到的那条输出路径：系统混音器在不在我们与设备之间。
+    ///
+    /// ⚠️ 这是与 [`AudioEngine::is_passthrough`] **并列的另一半**，两条都要看：
+    /// 前者说「我们没重采样」，本方法说「系统有没有可能替我们重采样」。
+    /// 边界说明（**`Exclusive` 不等于逐位精确**）见 [`OutputPath::caveat`] ——
+    /// UI 打印这条路径时**必须**带上它。
+    pub fn output_path(&self) -> &OutputPath {
+        &self.path
+    }
+
     /// ring 容量（样本数）。调用方按它做背压 —— **不要自己写死 `44100 * 2 * 4`**：
     /// 输出率随设备而变，写死的数字在 48kHz 设备上不是 4 秒。
     pub fn ring_capacity(&self) -> usize {
@@ -259,10 +403,102 @@ impl AudioEngine {
     /// **硬指标：必须为 0**（设计文档 §16.2）。
     ///
     /// ⚠️ 口径比名字窄：它**只数我们自己那个 ring 被抽干**，看不见 ALSA/PipeWire
-    /// 设备侧的 xrun。设备卡顿而我方缓冲有货时，它照样是 0。
+    /// 设备侧的 xrun。设备卡顿而我方缓冲有货时，它照样是 0 ——
+    /// 那一半由 [`AudioEngine::device_error_count`] 回答，**两个都要看**。
     pub fn xrun_count(&self) -> u64 {
         self.producer.underruns()
     }
+
+    /// **设备侧**报错次数（ALSA 的 underrun/overrun 就从这里来）。
+    ///
+    /// 补的是 [`AudioEngine::xrun_count`] 那条明确写着的盲区：设备卡顿而我方缓冲
+    /// 有货时，那个 0 什么都说明不了，而听感上是**断了一下**。实测：本机 CPU 满载时
+    /// 跑回环验证，一次 1 秒的播放里它数到 **17**（而 `xrun_count` 是 0）。
+    ///
+    /// ⚠️ 口径：它是「cpal 的错误回调被调了几次」，不是「丢了多少样本」；
+    /// 而且回调里现在只有 ALSA 的 xrun 会走到（设备拔出等也走同一条，本机没遇到过）。
+    /// **必须为 0**，非零就说明这条实时路径被饿到过。
+    pub fn device_error_count(&self) -> u64 {
+        self.device_errors.load(Ordering::Relaxed)
+    }
+}
+
+/// 首选拿来做**独占**的物理设备（`hw:`），没有就 `None`。
+///
+/// 两个来源，优先级是「用户说的」>「我们探测的」：
+///
+/// 1. 环境变量 `DSLS_AUDIO_DEVICE`（见 [`output_path::preferred_exclusive_from_env`]）——
+///    设了非法值时**告警并忽略**，不要静默把它当共享设备用（那会背地里改掉路由）；
+/// 2. [`output_path::probe_default_target`] —— 靠 `/proc/asound` 的**证据**
+///    判断 `default` 背后是哪张卡，判不出来就如实说，**不猜**。
+///
+/// 拿不到独占时把「本机可选哪些 hw: 设备」写进日志：用户下一次就能直接用上。
+/// 这条日志是这个功能**唯一**的可发现性来源（env 变量不是自解释的）。
+fn preferred_exclusive(host: &cpal::Host) -> Option<String> {
+    match output_path::preferred_exclusive_from_env() {
+        EnvPreference::Hardware(pcm_id) => return Some(pcm_id),
+        EnvPreference::Invalid(msg) => log::warn!("{msg}"),
+        EnvPreference::NotSet => {}
+    }
+
+    let reason = match output_path::probe_default_target(host) {
+        Candidate::Found { pcm_id } => return Some(pcm_id),
+        Candidate::Unavailable { reason } => reason,
+    };
+
+    let options = output_path::hardware_output_devices(host);
+    if options.is_empty() {
+        log::info!("没有拿到设备独占（{reason}）；本机也没有可选的 `hw:` 输出设备。");
+    } else {
+        let list = options
+            .iter()
+            .map(|(id, name)| format!("{id}（{name}）"))
+            .collect::<Vec<_>>()
+            .join("，");
+        log::info!(
+            "没有拿到设备独占（{reason}）。本机可选的物理输出设备：{list}。\
+             想指定其中一个：设 {}={}（或 CLI 的 --device，那条是硬性的：打不开就报错）。\
+             ⚠️ `hw:` 是独占的，别的进程占着时打不开 —— 那时会如实退回共享路径。",
+            output_path::EXCLUSIVE_DEVICE_ENV,
+            options[0].0
+        );
+    }
+    None
+}
+
+/// 按 PCM 名字在**枚举**里找一个输出设备。
+///
+/// 找不到时把本机有哪些设备列进错误信息 —— 这条信息就是用户下一步要用的东西，
+/// 比「设备不存在」有用得多。
+fn find_device(host: &cpal::Host, pcm_id: &str) -> anyhow::Result<cpal::Device> {
+    // ⚠️ **不能只靠 `devices()` 枚举。** `default` 这个虚拟设备在某些 ALSA 配置下
+    //    **不在**枚举列表里（本机实测：把 `pcm.!default` 定义成 `type hw; card 1`
+    //    之后，"default" 这一条从 hint 列表里消失了），而 `default_output_device()`
+    //    永远给得出它。所以先问它。
+    if let Some(default) = host.default_output_device() {
+        if output_path::pcm_id_of(&default) == pcm_id {
+            return Ok(default);
+        }
+    }
+
+    let mut available = Vec::new();
+    if let Ok(devices) = host.output_devices() {
+        for d in devices {
+            let id = output_path::pcm_id_of(&d);
+            if id == pcm_id {
+                return Ok(d);
+            }
+            available.push(id);
+        }
+    }
+    anyhow::bail!(
+        "找不到输出设备 {pcm_id:?}。本机枚举到的输出设备有：{}",
+        if available.is_empty() {
+            "<一个都没有>".to_owned()
+        } else {
+            available.join(", ")
+        }
+    )
 }
 
 /// 在设备报告的、**我们确实建得出流**的配置里，找一个能跑 `rate` 的。
@@ -356,15 +592,16 @@ fn build_stream_for(
     config: cpal::StreamConfig,
     format: cpal::SampleFormat,
     consumer: AudioRingConsumer,
+    device_errors: Arc<AtomicU64>,
 ) -> anyhow::Result<cpal::Stream> {
     use cpal::SampleFormat as F;
     match format {
-        F::F32 => build_output::<f32>(device, config, consumer),
-        F::I16 => build_output::<i16>(device, config, consumer),
-        F::I32 => build_output::<i32>(device, config, consumer),
+        F::F32 => build_output::<f32>(device, config, consumer, device_errors),
+        F::I16 => build_output::<i16>(device, config, consumer, device_errors),
+        F::I32 => build_output::<i32>(device, config, consumer, device_errors),
         // I24 本机设备确实报告支持，**漏了它会掉进 other 分支**
-        F::I24 => build_output::<cpal::I24>(device, config, consumer),
-        F::U8 => build_output::<u8>(device, config, consumer),
+        F::I24 => build_output::<cpal::I24>(device, config, consumer, device_errors),
+        F::U8 => build_output::<u8>(device, config, consumer, device_errors),
         other => {
             anyhow::bail!("不支持的输出采样格式 {other:?}。请把这个值报上来，不要静默降级到无声。")
         }
@@ -375,6 +612,7 @@ fn build_output<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     mut consumer: AudioRingConsumer,
+    device_errors: Arc<AtomicU64>,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::Sample + cpal::FromSample<i16> + Send + 'static,
@@ -394,7 +632,12 @@ where
         move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
             fill_from_ring::<T>(out, channels, &mut consumer, &mut scratch);
         },
-        |err| log::error!("音频流错误: {err}"),
+        // 错误回调：计数 + 日志。**只做一次原子加**（无分配、无锁、无 IO），
+        // 这条回调可能与音频线程同源。
+        move |err| {
+            device_errors.fetch_add(1, Ordering::Relaxed);
+            log::error!("音频流错误: {err}");
+        },
         None, // timeout：None = 无限等待后端初始化
     )?;
     Ok(stream)
