@@ -100,7 +100,13 @@ pub fn init_gpu<'a>(window: &'a PlatformWindow) -> anyhow::Result<GpuContext<'a>
         .iter()
         .find(|f| f.is_srgb())
         .unwrap_or(&caps.formats[0]);
-    let (width, height) = window.size();
+    // ⚠️ 必须用 size_in_pixels()（SDL_GetWindowSizeInPixels，物理像素），
+    // **不是 size()**（SDL_GetWindowSize，逻辑点）。SurfaceConfiguration
+    // 的 width/height 是物理像素，而 resize 路径用的是物理的
+    // PixelSizeChanged —— 用逻辑尺寸会让首次 configure 与之后每一次都
+    // 不一致（scale != 1.0 时），swapchain 被合成器放大变模糊，
+    // 并产生 VK_SUBOPTIMAL_KHR（见 main.rs 对 Suboptimal 的处理）。
+    let (width, height) = window.size_in_pixels();
 
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

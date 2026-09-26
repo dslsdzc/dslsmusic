@@ -84,6 +84,14 @@ fn main() -> anyhow::Result<()> {
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 continue;
             }
+            // ⚠️ Suboptimal 携带一个**完全可用**的纹理，在 Linux/Vulkan 上
+            // 直接来自 VK_SUBOPTIMAL_KHR。把它当致命错误会让「任何使
+            // swapchain extent 变陈旧的窗口/缩放变化」直接杀掉进程。
+            // 正确做法：重新配置，然后**照常渲染这一帧**。
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                f
+            }
             other => anyhow::bail!("取 surface texture 失败: {other:?}"),
         };
 

@@ -11,6 +11,12 @@ sdl3.workspace = true
 wgpu.workspace = true
 # Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device
 pollster.workspace = true
-raw-window-handle.workspace = true
-thiserror.workspace = true
 log.workspace = true
+# ── 已删除的两个依赖，勿再加回 ──
+# thiserror：M0–M1 的 platform 错误全是启动期致命错误，调用方只能报错退出，
+#   类型化错误枚举不会被产出（推迟，非否决）。
+# raw-window-handle：代码一律走 `wgpu::rwh`（wgpu 的无条件重导出），
+#   直接依赖它**既买不到版本对齐**（cargo 按各自 semver 解析），
+#   **反而制造陷阱**：后来者若写 `use raw_window_handle::HasWindowHandle`，
+#   实现的会是「直接依赖解析到的那个版本」的 trait，不再保证与 wgpu 的
+#   同版本 —— 那正是要避免的「两份 trait」错误。

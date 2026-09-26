@@ -43,6 +43,13 @@ impl PlatformWindow {
         (w, h)
     }
 
+    /// 物理像素尺寸（`SDL_GetWindowSizeInPixels`）。
+    /// **配置 wgpu surface 必须用这个**，不能用 `size()`——后者是逻辑点。
+    pub fn size_in_pixels(&self) -> (u32, u32) {
+        let (w, h) = self.window.size_in_pixels();
+        (w, h)
+    }
+
     /// 供 `gpu.rs` 创建 surface 使用。**不要在别处调用。**
     pub(crate) fn raw_window(&self) -> &sdl3::video::Window {
         &self.window
@@ -53,6 +60,11 @@ impl PlatformWindow {
     /// 接收者是 `&self`：`GpuContext` 借用窗口期间不可能取得 `&mut`。
     pub fn poll_events(&self) -> PlatformEvent {
         let mut result = PlatformEvent::None;
+        // ⚠️ 真需要这个标志位：同一个 pump 批次里可能**两个事件都来**，
+        //    而 or-pattern 只能决定单次匹配内的绑定顺序，**不构成两个
+        //    事件之间的优先级**。没有它的话，若 PixelSizeChanged 之后
+        //    又来了 Resized，物理值会被逻辑值覆盖。
+        let mut got_pixel_size = false;
         let self_id = self.window.id();
         for event in self.event_pump.borrow_mut().poll_iter() {
             match event {
@@ -65,10 +77,21 @@ impl PlatformWindow {
                 }
                 Event::Window {
                     window_id,
-                    win_event: WindowEvent::PixelSizeChanged(w, h) | WindowEvent::Resized(w, h),
+                    win_event: WindowEvent::PixelSizeChanged(w, h),
                     ..
                 } if window_id == self_id => {
                     result = PlatformEvent::Resized(w as u32, h as u32);
+                    got_pixel_size = true;
+                }
+                Event::Window {
+                    window_id,
+                    win_event: WindowEvent::Resized(w, h),
+                    ..
+                } if window_id == self_id => {
+                    // 物理像素优先：已拿到 PixelSizeChanged 就不被逻辑值覆盖
+                    if !got_pixel_size {
+                        result = PlatformEvent::Resized(w as u32, h as u32);
+                    }
                 }
                 _ => {}
             }
