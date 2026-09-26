@@ -1668,7 +1668,10 @@ git commit -m "feat(provider-api): Quality 扩到 5 档保真度梯度，新增 
 - Produces:
   - `pub const PLATFORM: &str = "netease"` —— 平台标识的唯一来源
   - `pub enum QrState { WaitingScan, WaitingConfirm, Confirmed { cookie: String }, Expired }`
-  - `impl QrState { pub fn from_code(code: i64, raw_cookie: &str) -> Self }`
+  - `impl QrState { pub fn from_code(code: i64, raw_cookies: &[String]) -> Self }`
+    ⚠️ 是 `&[String]` 不是 `&str` —— `login_qr_check` 给的是 `ApiResponse.cookie`
+    那个 `Vec<String>`。在调用点先 `join` 会把「清洗 Set-Cookie 属性」的责任
+    从 `session_cookie` 漏到调用方。
   - `NeteaseClient::new(cookie: Option<String>) -> Self`、`with_cookie(String) -> Self`
   - `NeteaseClient::qr_key(&self) -> Result<String, SourceError>`
   - `NeteaseClient::qr_image(&self, key: &str) -> Result<Vec<u8>, SourceError>`（PNG 字节）
@@ -1792,12 +1795,24 @@ dsls-provider-api = { path = "../provider-api" }
 ncm-api-rs = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 async-trait = "0.1"
-anyhow.workspace = true
 log.workspace = true
 serde_json = "1"
-qrcode = { version = "*", features = ["image"] }
-image = "*"
+# 版本由 cargo add 解析后钉死（Task 6 实测：qrcode 0.14.1 声明 image = "0.25"，
+# 与下面的 0.25.9 同一大版本 → 全树只有一个 image，Luma<u8> 不会冲突）
+qrcode = { version = "0.14.1", features = ["image"] }
+# ⚠️ **必须关掉默认 feature。** `image` 的 default-formats 含 `avif`，
+# 走默认会链进 `ravif`（纯 Rust AV1 编码器）。实测依赖树 **506 个 crate**，
+# 而我们只用 `ImageFormat::Png` 这一个编码器。
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 ```
+
+> **⚠️ 这里刻意没有 `anyhow`。** 本 crate 对外一律 typed `SourceError`
+> （见上面 Interfaces 块末尾的说明）——把 `anyhow` 放进音源层，
+> 与「`anyhow` 只允许出现在 `app` 的边界」这条硬约束**方向相反**。
+> M1 里 `dsls-provider-netease` 一次都用不到它。
+>
+> `serde_json` 目前 0 引用，但 Task 7 的 `parse.rs` 要用（`Value` + `json!`），**保留**。
+> `tokio` / `async-trait` / `log` 同理，都是 Task 7/8 的伏笔。
 
 > **⚠️ 上面两个 `*` 是刻意的**：`qrcode` 的 `image` feature 与 `image` 主版本
 > 必须配套，写死版本号极易撞车。**用 `cargo add` 让 cargo 自己解**：
@@ -2055,6 +2070,16 @@ pub const PLATFORM: &str = "netease";
 pub use client::NeteaseClient;
 pub use qr_login::{QrState, extract_music_u, session_cookie};
 ```
+
+> **⚠️ `Confirmed { cookie: "" }` 的契约（复审者与实现者都提过）**：
+> 若上游返回 `803` 但 `Set-Cookie` 里没有 `MUSIC_U`，
+> `session_cookie` 返回 `None`，`from_code` 会落到 `unwrap_or_default()`，
+> 得到一个**空串 cookie 的 `Confirmed`**。
+>
+> **调用方必须显式判空**——空串喂给 `create_client` 的后果与裸 token 一样
+> （`cookie_to_json` 丢弃它），症状还是「登录成功但仍是游客」，只是更隐蔽。
+> **Task 9 的 `login()` 里已经有这条判空**（`if cookie.is_empty() { bail }`）；
+> 本任务补一条测试把契约钉住，让它不至于只活在调用方。
 
 - [ ] **Step 4: 运行测试确认通过**
 
