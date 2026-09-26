@@ -1278,7 +1278,11 @@ thiserror.workspace = true
 
 ```rust
 /// 音质档位。各平台原始标识在 provider 内部映射（设计文档 §4.5）。
+///
+/// `#[non_exhaustive]`：resolver 马上要 `match` 它，而写操作/新音源可能
+/// 引入新档位。**加变体是破坏性变更，现在标比以后改便宜。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Quality {
     Low,
     Standard,
@@ -1286,9 +1290,34 @@ pub enum Quality {
     Super,
 }
 
+impl Quality {
+    /// 降一档。已是最低档时返回 `None`。
+    ///
+    /// **没有它，resolver 的降级链写不出来**——`Quality` 只派生 `Ord`，
+    /// 无法枚举档位。而 `SourceError::should_retry_lower_quality()` 返回
+    /// true 时，调用方必须知道「更低是哪一档」才能重试。
+    pub fn lower(self) -> Option<Quality> {
+        match self {
+            Quality::Super => Some(Quality::High),
+            Quality::High => Some(Quality::Standard),
+            Quality::Standard => Some(Quality::Low),
+            Quality::Low => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: String,
+    /// **这首歌来自哪个音源**（provider 的 `name()`）。
+    ///
+    /// 必须有：不同音源的 id 命名空间是私有的（网易云是数字串、本地是
+    /// 路径/哈希、云盘是另一套）。没有它，resolver 拿到一个 `Track`
+    /// **无法路由回正确的 provider 去调 `stream_url`**，只能外挂一张
+    /// (provider, track) 边表；跨音源合并去重也没有键。
+    ///
+    /// 设计文档 §4.5 的「统一 item」本来就含 `platform`——这里是补齐。
+    pub platform: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -1300,12 +1329,17 @@ pub struct Track {
 `crates/provider-api/src/error.rs`：
 
 ```rust
+// Track 只在测试里用到（`SourceResult<T>` 是泛型别名，不构成使用）。
+// 早先为了压住这个未使用警告，写过一个「什么也不检查」的 const _ 块——已删。
+// 正确做法就是标 cfg(test)。
+#[cfg(test)]
 use crate::model::Track;
 
 // PartialEq/Eq 是给调用方与测试用的：source-resolver 要能对比错误，
 // 测试也要能直接断言「这两个结果不同」，否则只能在已知字面量上调 unwrap()，
 // 而那会触发 clippy::unnecessary_literal_unwrap。
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceError {
     /// provider 根本没这个能力
     #[error("该音源不支持此操作")]
@@ -1349,17 +1383,16 @@ impl SourceError {
 /// 与 `Err(Unsupported)`「provider 没这个能力」是两回事。
 pub type SourceResult<T> = Result<Option<T>, SourceError>;
 
-const _: () = {
-    // 编译期确认 Track 被用在类型别名里
-    #[allow(dead_code)]
-    fn _t(_: SourceResult<Track>) {}
-};
+// （此处原有一个 `const _: () = { fn _t(_: SourceResult<Track>) {} };` 块，
+//   声称「编译期确认 Track 被用在类型别名里」——**它什么也不检查**：
+//   `SourceResult<T>` 是泛型别名，约束不了任何东西。已删除。）
 ```
 
 `crates/provider-api/src/capability.rs`：
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Capability {
     Search,
     TrackDetail,
