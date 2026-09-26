@@ -24,7 +24,12 @@ dsls-provider-api = { path = "../provider-api" }
 # 单版本 crate 的长期风险是真的 —— 缓解手段是把它整个包在我们自己的
 # NeteaseClient 后面（本任务就是这么做的），换实现时改动能收敛在这里。
 ncm-api-rs = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# ⚠️ **刻意没有 `tokio`** —— 它在 `src/` 里**零引用**
+#（本 crate 只做扫码登录，是同步的；异步在 `app` 的边界）。
+# 计划里那句「Task 7/8 的伏笔」**已经过期**：那两个任务都已经落地，
+# 而它们也没用上它。**这是本项目第三次「声明了但零使用」**
+#（前两次：Task 6 的 `anyhow`、Task 8 的 `reqwest`+`tokio`）。
+# ⇒ **§18.10 依赖裁剪**：写完依赖表要回头看谁真的用了。
 async-trait = "0.1"
 log.workspace = true
 serde_json = "1"

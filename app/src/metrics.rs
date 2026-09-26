@@ -144,7 +144,10 @@ pub fn percentile(sorted: &[f32], p: f32) -> f32 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
-/// 供后续 GPU timestamp 查询使用；GLES 后端不支持时回退到 CPU 计时（设计文档 §16.5）。
-pub fn frame_budget_ms(target_fps: u32) -> f32 {
-    1000.0 / target_fps as f32
-}
+// ⚠️ 这里原本有一个 `pub fn frame_budget_ms(target_fps: u32) -> f32 { 1000.0 / target_fps }`
+// —— **已删除**（最终复审，2026-09-27）。三条理由：
+//   1. **全仓零调用方**（只有一个定义，没有任何使用）
+//   2. 它的文档声称「供后续 GPU timestamp 查询使用；GLES 后端不支持时回退到 CPU 计时」
+//      —— **那两件事一件都没实现**，是假的
+//   3. `1000.0 / target_fps` 是**一行的除法**，需要时现写即可
+// **一个零调用方 + 文档说谎的函数，比没有它更糟**：读者会以为它带着那两个能力。
