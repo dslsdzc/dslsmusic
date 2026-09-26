@@ -1249,23 +1249,25 @@ mod tests {
         //   「查到了但没结果」= Ok(Some(空集合))   ← resolver **不该**换音源
         //   「本 provider 不处理」= Ok(None) 或 Err(Unsupported) ← **应该**换音源
         //
-        // 下面这条断言钉的是「resolver 能看出这两类不同」。
-        // 注意 Ok(None) 与 Err(Unsupported) **语义等价**（Option 带来的两种拼写），
-        // 不是需要区分的两种情况 —— 早先的注释把它们当成两种，那是错的。
-        let empty: SourceResult<Vec<Track>> = Ok(Some(Vec::new()));
-        let not_handled: SourceResult<Vec<Track>> = Ok(None);
-        let unsupported: SourceResult<Vec<Track>> = Err(SourceError::Unsupported);
-
-        assert_ne!(empty, not_handled, "「没结果」与「不处理」必须可区分");
-        assert_ne!(empty, unsupported, "「没结果」与「不处理」必须可区分");
-        // 这两种拼写语义相同，值当然不同 —— 断言它们不同是在钉「两种拼写都存在」，
-        // 不是在说它们是要区分的两种情况
-        assert_ne!(not_handled, unsupported);
-        assert!(matches!(unsupported, Err(SourceError::Unsupported)));
-        // ⚠️ 这里**不要**再写 `assert_eq!(empty, Ok(None))` ——
-        // `empty` 现在就是 `Ok(Some(vec![]))`，那个断言必失败。
-        // 它是收口前那版测试的残留（实现者逐字照抄实跑取证：
-        // left: Ok(Some([])) / right: Ok(None)）。
+        // ⚠️ **本测试只有编译期内容，一条运行时断言都没有 —— 这不是漏写。**
+        //
+        // 这里曾经有 5 条 `assert_*!` / `matches!`，它们比的**全是本函数两三行前
+        // 自己绑定的字面量**：`Ok(Some([])) != Ok(None)` 由 `Option` 的 `PartialEq`
+        // 保证、`Ok(_) != Err(_)` 由 `Result` 的 `PartialEq` 保证 —— **都是 std 的 derive**。
+        // ⇒ **没有任何实现改动能让它们变红**（反证：这个测试做不了变异测试，
+        // 因为没有可改的实现）。**留一半装饰性断言是最坏的选择** ——
+        // 看起来在测，其实什么也没测。已全部删除。
+        //
+        // 本测试真正的内容是**下面三个绑定的类型标注**：别名若被改成
+        // 另一种形状，这三行**直接编译失败**。值不参与任何检查，所以刻意用 `_` 命名。
+        //
+        // ⚠️ 早先这里写着「这条断言钉的是 resolver 能看出这两类不同」——**那句是假的**。
+        // 让 resolver 分得出来的是 `SourceResult` 的**形状**，而形状由这三个绑定钉住。
+        // 「该不该换音源」这类判断要在运行时测，就该测**真函数**
+        // （`should_try_next_provider` 那种），而不是把字面量互相比一遍。
+        let _empty: SourceResult<Vec<Track>> = Ok(Some(Vec::new()));
+        let _not_handled: SourceResult<Vec<Track>> = Ok(None);
+        let _unsupported: SourceResult<Vec<Track>> = Err(SourceError::Unsupported);
     }
 
     #[test]

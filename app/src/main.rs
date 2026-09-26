@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
     // 触发时有价值**，而它们的触发路径今天不可达 —— 默认配置下看不见，
     // 等于那条诊断不存在，出问题时用户手里没有任何线索。
     // `warn` 是「默认就该被看见」的下限。要更啰嗦仍可 `RUST_LOG=info`。
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // 声明顺序有意义：`gpu` 借用 `window`，后声明者先析构 → gpu 先于 window 释放。
     // 因此 `window` 不需要（也不能）是 mut：轮询走内部可变性。
