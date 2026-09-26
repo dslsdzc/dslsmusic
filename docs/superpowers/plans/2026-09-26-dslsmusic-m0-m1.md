@@ -1221,10 +1221,14 @@ mod tests {
 
     #[test]
     fn unsupported_is_distinguishable_from_empty() {
-        let a: SourceResult<Track> = Ok(None);
-        let b: SourceResult<Track> = Err(SourceError::Unsupported);
-        assert!(a.is_ok() && a.unwrap().is_none());
-        assert!(matches!(b, Err(SourceError::Unsupported)));
+        let empty: SourceResult<Track> = Ok(None);
+        let unsupported: SourceResult<Track> = Err(SourceError::Unsupported);
+
+        // 两者必须不同 —— 这是 source-resolver 决定「要不要换一个音源试」
+        // 与「这首歌确实没有」的依据（设计文档 §4.5）
+        assert_ne!(empty, unsupported);
+        assert_eq!(empty, Ok(None));
+        assert!(matches!(unsupported, Err(SourceError::Unsupported)));
     }
 
     #[test]
@@ -1298,7 +1302,10 @@ pub struct Track {
 ```rust
 use crate::model::Track;
 
-#[derive(Debug, thiserror::Error)]
+// PartialEq/Eq 是给调用方与测试用的：source-resolver 要能对比错误，
+// 测试也要能直接断言「这两个结果不同」，否则只能在已知字面量上调 unwrap()，
+// 而那会触发 clippy::unnecessary_literal_unwrap。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SourceError {
     /// provider 根本没这个能力
     #[error("该音源不支持此操作")]
@@ -1423,17 +1430,11 @@ pub trait MusicSource: Send + Sync {
 
     fn capabilities(&self) -> &CapabilitySet;
 
-    async fn search(
-        &self,
-        keywords: &str,
-        limit: u32,
-    ) -> SourceResult<Vec<Track>>;
+    // 签名写成 rustfmt 稳定的单行 —— 多行写法会被 cargo fmt 折叠，
+    // 而全 workspace 其余文件都是 fmt-clean，留着它会是唯一例外。
+    async fn search(&self, keywords: &str, limit: u32) -> SourceResult<Vec<Track>>;
 
-    async fn stream_url(
-        &self,
-        track_id: &str,
-        quality: Quality,
-    ) -> SourceResult<String>;
+    async fn stream_url(&self, track_id: &str, quality: Quality) -> SourceResult<String>;
 }
 ```
 
