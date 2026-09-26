@@ -423,6 +423,14 @@ async fn play(
         },
         engine.output_path()
     );
+    // ⚠️ **路径后面必须跟着边界。** `OutputPath` 的 `Display` 只打类型与设备
+    //    （见 `crates/audio/src/output_path.rs` 里那个 impl），而收尾这几行才是
+    //    用户拿来判断「我到底拿到了什么」的地方 —— 单独读「直通 + Exclusive」
+    //    正是本任务要防的那个虚假逐位精确印象。
+    //    启动时打过一次不代表这里能省（读结论的人常常只看最后几行）；
+    //    这里**调用** `engine.output_path().caveat()` 而不是抄一份文本，
+    //    免得造出第二处会漂移的事实。
+    println!("  ⚠️ {}", engine.output_path().caveat());
     println!(
         "xrun：播放期间 = {xrun_during_playback}（这条必须为 0）；\
          总计 = {xrun_total}（其中收尾抽干 {xrun_tail} 次 —— 歌放完、环读空，\
@@ -441,9 +449,14 @@ async fn play(
     // ⚠️ 上面的数字**只覆盖「我们自己的 ring 被抽干」**：设备卡顿而我方缓冲有货时，
     // 它照样是 0（设计文档 §16.2 的口径）。设备侧那一半单独报 —— 它以前只进日志，
     // 听感上是「断了一下」，而指标上完全隐形。
+    // ⚠️ **标签要跟计数器一样宽。** 这个数不是「ALSA 的 xrun 次数」，是「cpal 的错误
+    //    回调被调了几次」——ALSA 的 underrun/overrun 走这条，设备拔出等也走同一条
+    //    （见 `AudioEngine::device_error_count` 的文档）。标签写窄了，用户会把别的
+    //    设备侧错误读成 xrun，然后往错的方向查。
     println!(
-        "设备侧报错（ALSA 的 underrun/overrun）：{}（这条也必须为 0 —— \
-         非零说明这条实时路径被饿到过，而上面的 xrun 计数看不见它）",
+        "设备侧报错（cpal 错误回调被调的次数 —— ALSA 的 underrun/overrun 走这条，\
+         设备拔出等也走同一条）：{}（这条也必须为 0 —— 非零说明设备侧出过错；\
+         最常见的原因是实时路径被饿到，而上面的 xrun 计数看不见它）",
         engine.device_error_count()
     );
     Ok(())
