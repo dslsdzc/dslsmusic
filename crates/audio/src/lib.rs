@@ -205,6 +205,12 @@ impl AudioEngine {
     /// 恰好是 `ceil(输入帧数 × 比率)`。
     ///
     /// 直通时它什么都不做。
+    ///
+    /// **前置条件：此刻环里要放得下这点尾巴。** 排空产出的量是有界的
+    /// （`output_delay()` 帧 + 不足一整块的输入，本模块默认配置下约 12 ms），
+    /// 而 `push_samples` 在环满时是**丢弃**语义 —— 环真满的话尾巴会被丢掉，
+    /// **而且是静默的**。CLI 的背压把环维持在 3/4（约 1 秒余量），远大于这个量；
+    /// 直接调用本方法的代码要自己保证同一条。
     pub fn finish_stream(&mut self) {
         if let Some(rs) = &mut self.resampler {
             self.conv.clear();
