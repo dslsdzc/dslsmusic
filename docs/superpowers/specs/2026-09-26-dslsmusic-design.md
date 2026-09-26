@@ -532,10 +532,28 @@ pub type SourceResult<T> = Result<Option<T>, SourceError>;
 
 | 返回 | 含义 |
 |---|---|
-| `Ok(Some(v))` | 拿到了 |
-| `Ok(None)` | **请求合法，但确实没有** |
-| `Err(Unsupported)` | **provider 没这个能力** |
+| `Ok(Some(v))` | 拿到了。**`v` 可以是空集合**——「查到了，但确实没有结果」 |
+| `Ok(None)` | **本 provider 不处理这个请求**（= 没这个能力） |
+| `Err(Unsupported)` | **同上**，另一种拼写 |
 | `Err(Unavailable)` | **有能力，但当前拿不到** |
+
+> **⚠️ 这里改正一处早先的定义冲突**（Task 7 复审发现，2026-09-26）。
+> 本表原先把 `Ok(None)` 定义成「请求合法，但确实没有」——**那个定义与
+> `Ok(Some(vec![]))` 撞车**，两者会变成同一个意思，于是 resolver 无从区分
+> 「查到了但没结果」（**不该**换音源）与「没这个能力」（**应该**换音源）。
+>
+> 现在：**「确实没有」用 `Ok(Some(空集合))` 表达，`Ok(None)` 只表示「不处理」**。
+> 这样 resolver 的三条路各自可用：
+>
+> | resolver 该做什么 | 判据 |
+> |---|---|
+> | 用它 | `Ok(Some(非空))` |
+> | **不要**换音源，这就是答案 | `Ok(Some(空))` |
+> | 换一个音源试 | `Ok(None)` 或 `Err(Unsupported)` |
+> | 降档重试 | `Err(Unavailable)` / `Err(RateLimited)` |
+>
+> `Ok(None)` 与 `Err(Unsupported)` 语义等价、只是两种拼写，这是 `Option` 带来的
+> 冗余，**不是需要区分的两种情况**——早先的测试注释把它当成两种，那是错的。
 | `Err(Protocol)` | **上游变了** ← 这一条对网易云尤其重要（§13.1） |
 
 **这对未来多音源特别重要**：只有区分出 `Unsupported`，resolver 才知道「换一个音源试」有没有意义；只有区分出 `Unavailable`，才知道该不该降音质重试。

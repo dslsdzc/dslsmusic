@@ -1243,12 +1243,22 @@ mod tests {
 
     #[test]
     fn unsupported_is_distinguishable_from_empty() {
-        let empty: SourceResult<Track> = Ok(None);
-        let unsupported: SourceResult<Track> = Err(SourceError::Unsupported);
+        // ⚠️ 收口后的语义（设计文档 §4.5，Task 7 复审发现的定义冲突）：
+        //   「查到了但没结果」= Ok(Some(空集合))   ← resolver **不该**换音源
+        //   「本 provider 不处理」= Ok(None) 或 Err(Unsupported) ← **应该**换音源
+        //
+        // 下面这条断言钉的是「resolver 能看出这两类不同」。
+        // 注意 Ok(None) 与 Err(Unsupported) **语义等价**（Option 带来的两种拼写），
+        // 不是需要区分的两种情况 —— 早先的注释把它们当成两种，那是错的。
+        let empty: SourceResult<Vec<Track>> = Ok(Some(Vec::new()));
+        let not_handled: SourceResult<Vec<Track>> = Ok(None);
+        let unsupported: SourceResult<Vec<Track>> = Err(SourceError::Unsupported);
 
-        // 两者必须不同 —— 这是 source-resolver 决定「要不要换一个音源试」
-        // 与「这首歌确实没有」的依据（设计文档 §4.5）
-        assert_ne!(empty, unsupported);
+        assert_ne!(empty, not_handled, "「没结果」与「不处理」必须可区分");
+        assert_ne!(empty, unsupported, "「没结果」与「不处理」必须可区分");
+        // 这两种拼写语义相同，值当然不同 —— 断言它们不同是在钉「两种拼写都存在」，
+        // 不是在说它们是要区分的两种情况
+        assert_ne!(not_handled, unsupported);
         assert_eq!(empty, Ok(None));
         assert!(matches!(unsupported, Err(SourceError::Unsupported)));
     }
