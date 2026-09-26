@@ -78,7 +78,13 @@ impl FrameMetrics {
 
     /// 按**已产出样本**计数，不是按循环迭代次数——被放弃的帧不算一帧。
     pub fn should_report(&self) -> bool {
-        self.frame_count > 0 && self.frame_count % REPORT_EVERY == 0
+        // ⚠️ `is_multiple_of` 而不是 `% == 0` —— 后者在 MSRV ≥ 1.87 下触发
+        //    clippy 的 `manual_is_multiple_of`，而本项目的硬约束是
+        //    `clippy --workspace --all-targets -- -D warnings` 必须干净。
+        //    ⚠️ **这个 lint 是 MSRV 门控的**（1.85 静默、1.87 报错）——
+        //    所以改根 `rust-version` 时**必须跑全工作区 clippy**，不能只跑受影响 crate 的测试。
+        //    （这条就是 2026-09-26 MSRV 1.85→1.87 那次踩出来的。）
+        self.frame_count > 0 && self.frame_count.is_multiple_of(REPORT_EVERY)
     }
 
     pub fn summary(&self) -> String {
