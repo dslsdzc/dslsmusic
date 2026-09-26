@@ -315,6 +315,96 @@ fn probe_via_proc(_host: &cpal::Host) -> Candidate {
     }
 }
 
+/// 把 ALSA 文档里的设备名规范成 **cpal 枚举里的形式**（卡名 → 卡号）。
+///
+/// # 为什么需要它（实测的坑）
+///
+/// ALSA 自己的命名文档和所有教程都写 `hw:CARD=Loopback,DEV=0` —— `CARD` 既可以是
+/// **卡号**也可以是**卡名**，`aplay -D hw:CARD=Loopback,DEV=0` 照样能开。
+/// 但 **cpal 枚举出来的一律是卡号**（`hw:CARD=<数字>,DEV=<数字>`，源码注释原话
+/// `Add hw:/plughw: for all physical devices with numeric index`），
+/// 而 `AudioEngine::new_on` 是**按枚举到的名字**找设备 ⇒
+/// 用户按文档写卡名会得到「找不到输出设备」，**而设备明明在**。
+/// （实测：Task 11 的控制者在验收说明里就写的是 `hw:CARD=Loopback,DEV=0`。）
+///
+/// ⇒ 这里用 `/proc/asound/cards` 把卡名换成卡号。换不出来就返回 `None`，
+/// 让调用方按原样报错 —— **绝不猜**。
+///
+/// 支持的形式：`hw:CARD=<卡名>[,DEV=<n>]` 与 `plughw:...`（DEV 缺省按 0）。
+/// 已经是数字卡号的、或别的形式一律返回 `None`（不需要也不该改）。
+pub fn canonicalize_card_name(pcm_id: &str) -> Option<String> {
+    let (prefix, rest) = pcm_id.split_once(':')?;
+    if prefix != "hw" && prefix != "plughw" {
+        return None;
+    }
+    let (card_part, dev_part) = match rest.split_once(',') {
+        Some((c, d)) => (c, Some(d)),
+        None => (rest, None),
+    };
+    // `hw:1,0`（位置写法）与 `hw:CARD=1`（数字）都不用改。
+    let card_name = card_part.trim().strip_prefix("CARD=")?.trim();
+    if card_name.is_empty() || card_name.parse::<u32>().is_ok() {
+        return None;
+    }
+    let dev = match dev_part {
+        Some(d) => d.trim().strip_prefix("DEV=")?.trim().to_owned(),
+        None => "0".to_owned(),
+    };
+    let index = card_index_by_name(card_name)?;
+    Some(format!("{prefix}:CARD={index},DEV={dev}"))
+}
+
+/// 卡名（ALSA 的 card id，如 `Loopback`）→ 卡号。
+#[cfg(target_os = "linux")]
+fn card_index_by_name(name: &str) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/asound/cards").ok()?;
+    parse_cards(&text)
+        .into_iter()
+        .find(|(_, id)| id == name)
+        .map(|(index, _)| index)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn card_index_by_name(_name: &str) -> Option<u32> {
+    // 这条规范化是 Linux/ALSA 专有的（`/proc/asound`）；别的平台没有这个概念。
+    None
+}
+
+/// 解析 `/proc/asound/cards`：`(卡号, 卡名)`。
+///
+/// 真实内容长这样（本机实测，fixture 见测试）：
+///
+/// ```text
+///  0 [CAMERA         ]: USB-Audio - USB2.0 PC CAMERA
+///                       Generic USB2.0 PC CAMERA at usb-0000:00:10.0-1, high speed
+///  3 [Loopback       ]: Loopback - Loopback
+///                       Loopback 1
+/// ```
+///
+/// 只认形如 `<号> [<名>]:` 的行（卡名两侧有对齐空格，要 trim）；
+/// 第二行是描述，必须**忽略**（那里也有 `-` 和空格，认错就会把描述当卡名）。
+#[cfg(target_os = "linux")]
+fn parse_cards(text: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((idx, rest)) = line.trim().split_once('[') else {
+            continue;
+        };
+        let Ok(index) = idx.trim().parse::<u32>() else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once(']') else {
+            continue;
+        };
+        // 卡名后面必须紧跟 `:`（描述行里没有这一对），否则这一行不是卡头。
+        if !tail.trim_start().starts_with(':') {
+            continue;
+        }
+        out.push((index, name.trim().to_owned()));
+    }
+    out
+}
+
 /// 本机可选的物理输出设备（`hw:`），给 UI 提示用。`(pcm_id, 描述)`。
 ///
 /// 之所以要暴露它：拿不到独占时，「你本机有这些可选」比「不可用」有用得多 ——
@@ -341,6 +431,16 @@ pub fn hardware_output_devices(host: &cpal::Host) -> Vec<(String, String)> {
 /// 在 cpal 枚举的输出设备里找 `pcm_id` 那一个。
 fn hardware_output_device(host: &cpal::Host, pcm_id: &str) -> Option<cpal::Device> {
     host.output_devices().ok()?.find(|d| pcm_id_of(d) == pcm_id)
+}
+
+/// 本机枚举到的**所有**输出设备的 `pcm_id`（给错误信息与诊断用）。
+///
+/// 「找不到设备」时最有用的一句话就是「本机有这些」—— 让用户能照着改，
+/// 而不是去猜是拼错了还是设备真不在。
+pub fn output_device_ids(host: &cpal::Host) -> Vec<String> {
+    host.output_devices()
+        .map(|devices| devices.map(|d| pcm_id_of(&d)).collect())
+        .unwrap_or_default()
 }
 
 /// cpal 的 `Device` 在 ALSA 后端里**不暴露 PCM 名字**，唯一拿得到的地方是
@@ -537,6 +637,76 @@ hw_ptr      : 13230
 appl_ptr    : 13568
 ";
         assert_eq!(status_owner_pid(real), Some(4242));
+    }
+
+    /// `/proc/asound/cards` 的解析：**只认卡头行，描述行必须忽略**。
+    /// fixture 是 2026-09-26 本机的原文（`snd-aloop` 已加载时）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cards_from_real_fixture() {
+        let real = "\
+ 0 [CAMERA         ]: USB-Audio - USB2.0 PC CAMERA
+                      Generic USB2.0 PC CAMERA at usb-0000:00:10.0-1, high speed
+ 1 [Generic        ]: HDA-Intel - HD-Audio Generic
+                      HD-Audio Generic at 0xfe200000 irq 16
+ 2 [NVidia         ]: HDA-Intel - HDA NVidia
+                      HDA NVidia at 0xfe080000 irq 41
+ 3 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+";
+        assert_eq!(
+            parse_cards(real),
+            vec![
+                (0, "CAMERA".to_owned()),
+                (1, "Generic".to_owned()),
+                (2, "NVidia".to_owned()),
+                (3, "Loopback".to_owned()),
+            ],
+            "卡名要 trim 掉对齐空格；第二行描述不能被当成卡（它也有 [ 吗？没有，但也要防）"
+        );
+        // 没有卡的机器、以及只有描述行的输入
+        assert!(parse_cards("").is_empty());
+        assert!(parse_cards("--- no soundcards ---\n").is_empty());
+    }
+
+    /// 卡名的规范化：**只在确实需要换、且换得出来时才换**。
+    #[test]
+    fn canonicalize_only_when_it_helps() {
+        // 已经是卡号 / 位置写法 / 别的前缀 ⇒ 不该动（None 表示原样使用）
+        for unchanged in [
+            "hw:CARD=3,DEV=0",
+            "hw:3,0",
+            "plughw:CARD=1,DEV=0",
+            "default",
+            "pipewire",
+            "hw:CARD=0",
+        ] {
+            assert_eq!(
+                canonicalize_card_name(unchanged),
+                None,
+                "{unchanged:?} 不该被改写"
+            );
+        }
+        // 卡名形式：**本机查得到就换，查不到就 None**（绝不猜）
+        assert_eq!(
+            canonicalize_card_name("hw:CARD=NoSuchCardZZZ,DEV=0"),
+            None,
+            "卡名查不到时必须原样返回，让调用方报错"
+        );
+        // 本机真实存在的那张（snd-aloop 已加载时才在；不在时这条也应当返回 None，
+        // 所以这里不断言它一定换得出来 —— 只在存在时检查结果形状）。
+        if let Some(canonical) = canonicalize_card_name("hw:CARD=Loopback,DEV=0") {
+            assert!(
+                canonical.starts_with("hw:CARD=") && canonical.ends_with(",DEV=0"),
+                "换出来的必须仍是 hw:CARD=<号>,DEV=0 的形状，实得 {canonical:?}"
+            );
+            assert!(
+                canonical
+                    .trim_start_matches("hw:CARD=")
+                    .starts_with(|c: char| c.is_ascii_digit()),
+                "CARD= 后面必须是**卡号**（cpal 枚举的形式），实得 {canonical:?}"
+            );
+        }
     }
 
     /// `Display` 必须把两条路径的**区别**写在最前面 —— 这是 CLI 打印的那一行。

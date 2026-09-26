@@ -481,24 +481,45 @@ fn find_device(host: &cpal::Host, pcm_id: &str) -> anyhow::Result<cpal::Device> 
         }
     }
 
-    let mut available = Vec::new();
-    if let Ok(devices) = host.output_devices() {
-        for d in devices {
-            let id = output_path::pcm_id_of(&d);
-            if id == pcm_id {
-                return Ok(d);
-            }
-            available.push(id);
+    // ① 按枚举到的名字**原样**找。
+    //    ⚠️ 这一步曾经被我删掉过（改这段时只顾着加下面的卡名解析，把原样查找整段
+    //    替换掉了），后果是 `hw:CARD=3,DEV=0` 这种**枚举里明明有**的名字也报
+    //    「找不到设备」—— 单元测试抓不到（`find_device` 要真设备），
+    //    是回环示例一跑就红才暴露的。**先原样、再改写**，这个顺序不能反。
+    if let Some(d) = lookup_pcm_id(host, pcm_id) {
+        return Ok(d);
+    }
+
+    // ② **卡名换成卡号再找一次。** ALSA 文档与所有教程写的都是
+    //    `hw:CARD=Loopback,DEV=0`（CARD 可以是卡名），而 cpal 枚举的**只有卡号**形式
+    //    （`hw:CARD=3,DEV=0`）⇒ 不换的话，用户按文档写就会得到「找不到设备」，
+    //    而设备明明在。实测：Task 11 的控制者在验收说明里写的就是卡名那种。
+    if let Some(canonical) = output_path::canonicalize_card_name(pcm_id) {
+        if let Some(d) = lookup_pcm_id(host, &canonical) {
+            log::info!("设备名 {pcm_id} 按 ALSA 的卡名写法解析为 {canonical}");
+            return Ok(d);
         }
     }
+
+    let available = output_path::output_device_ids(host);
     anyhow::bail!(
-        "找不到输出设备 {pcm_id:?}。本机枚举到的输出设备有：{}",
+        "找不到输出设备 {pcm_id:?}。本机枚举到的输出设备有：{}。\
+         （提示：cpal 枚举物理设备用的是**卡号**，如 hw:CARD=3,DEV=0；\
+         按 ALSA 文档写卡名，如 hw:CARD=Loopback,DEV=0，也会被解析，但卡名必须在 \
+         /proc/asound/cards 里找得到。）",
         if available.is_empty() {
             "<一个都没有>".to_owned()
         } else {
             available.join(", ")
         }
     )
+}
+
+/// 在枚举里按 `pcm_id` 原样找一个输出设备（不做任何名字改写）。
+fn lookup_pcm_id(host: &cpal::Host, pcm_id: &str) -> Option<cpal::Device> {
+    host.output_devices()
+        .ok()?
+        .find(|d| output_path::pcm_id_of(d) == pcm_id)
 }
 
 /// 在设备报告的、**我们确实建得出流**的配置里，找一个能跑 `rate` 的。
