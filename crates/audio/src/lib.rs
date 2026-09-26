@@ -102,7 +102,12 @@ impl AudioEngine {
         //    `supported_output_configs()` 枚举失败的后端）。`build` 里按
         //    「输出率 == 源率 ⇒ 直通」判，所以那种情况仍然不会白白重采样。
         let default = device.default_output_config()?;
-        Self::build(&device, default, desired_rate)
+        // ⚠️ 设备的**默认**配置也可能是单声道 —— 本机设备会把 1..64 声道的全部
+        //    组合都报一遍，默认那一档只是它自己的偏好，不代表它只能给单声道。
+        //    在**同一个采样率**上再找一个 ≥2 声道的配置；找到就用它。
+        //    （采样率不变 ⇒ 重采样比率不变，所以这一步不会引入任何额外转换。）
+        let chosen = find_config_at_rate(&device, default.sample_rate()).unwrap_or(default);
+        Self::build(&device, chosen, desired_rate)
     }
 
     /// 把一条**已选定的**输出配置变成能出声的引擎。
