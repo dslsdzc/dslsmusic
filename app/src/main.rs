@@ -444,7 +444,7 @@ async fn play(
     //    `dropped_frames() == 0` 才是这条的唯一证据（设计文档 §16.2）——
     //    ⚠️ 但「为 0」不等于「一个样本都没少」：流的末尾还可能有**半个帧**
     //    （总样本数为奇数时最后那个样本），它不算丢弃、不在任何计数器里，
-    //    也播不出来（`finish_stream` 会为它记一条 warn，见 `AudioEngine::dropped_frames`）。
+    //    也播不出来（`AudioEngine::finish_stream` 会为它记一条 warn —— 不是 `dropped_frames`）。
     //    下面那行打印出来的话因此**只覆盖丢弃这一个方向**，不要读成「零即无损」。
     // ⚠️ **单位是帧，不是「次数」**（帧化时一起改的，理由见 `AudioEngine::dropped_frames`）。
     //    非零时它可以直接换算成「丢了多少秒音频」——「丢了一次」和「丢了一千帧」
