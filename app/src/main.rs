@@ -307,7 +307,7 @@ async fn play(
     let cursor = std::io::Cursor::new(bytes);
 
     // 闭包借用 engine 与 pcm（`push_samples` 要 `&mut`），闭包结束借用即释放，
-    // 所以后面的 `ring_available()` / `xrun_count()` 可以直接用。
+    // 所以后面的 `ring_available_frames()` / `xrun_count()` 可以直接用。
     const CHUNK: usize = 4096;
     // v1 是空图（零开销）；v2 的 EQ / 响度 / 变速都挂在这里。
     // ⚠️ **它跑在【源采样率】上** —— 重采样是图**之后**的速率边界，
@@ -327,12 +327,14 @@ async fn play(
                     d.write(chunk);
                 }
             }
-            // 背压：`push_samples` 在环满时**丢数据**（只记一次 overflow，
+            // 背压：`push_samples` 在环满时**丢数据**（计入 `dropped_frames()`，
             // 见 crates/audio/src/output.rs 的既定语义），而 `AudioEngine` 没有把
-            // overflow 暴露出来 ⇒ 这里不压住就是**静默丢样本**。
+            // 丢弃暴露出来 ⇒ 这里不压住就是**静默丢样本**。
             // 阈值取环容量的 3/4 —— 环容量按**输出率**算出来的，所以这里不能写死
-            // `44100 * 2 * 3`：48kHz 设备上那个数字不是 3 秒。
-            while engine.ring_available() > engine.ring_capacity() / 4 * 3 {
+            // `44100 * 3`：48kHz 设备上那个数字不是 3 秒。
+            // ⚠️ **分子分母必须同单位**：两个方法现在都是**帧**（改名带 `_frames`
+            //    就是为了让这件事写不错 —— 帧化之前它们是样本）。
+            while engine.ring_available_frames() > engine.ring_capacity_frames() / 4 * 3 {
                 std::thread::sleep(Duration::from_millis(20));
             }
         })?;
@@ -403,14 +405,14 @@ async fn play(
     let xrun_during_playback = engine.xrun_count();
 
     // 等缓冲播完（否则 main 一返回，AudioEngine 析构 = 立刻断声）。
-    while engine.ring_available() > 0 {
+    while engine.ring_available_frames() > 0 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let xrun_total = engine.xrun_count();
     let xrun_tail = xrun_total.saturating_sub(xrun_during_playback);
-    // 反方向的那一半：环被**填满**、生产者丢样本的次数。**单调累加**，所以取收尾后的
+    // 反方向的那一半：环被**填满**、生产者丢帧。**单调累加**，所以取收尾后的
     // 总数即可 —— 任何一次非零都是缺陷，不像 xrun 要避开「歌放完、环自然读空」那一次。
-    let overflow = engine.overflow_count();
+    let dropped = engine.dropped_frames();
 
     println!("\n播放结束。");
     println!(
@@ -437,14 +439,21 @@ async fn play(
          回调必然记一次，不是故障。口径见 crates/audio/src/lib.rs 与设计文档 §16.2）"
     );
     // ⚠️ 上面那个数字**只覆盖「环被抽干」这一个方向**。反方向的另一半是
-    //    「环被填满、生产者丢样本」—— 它此前**没有任何指标覆盖**：
+    //    「环被填满、生产者丢帧」—— 它此前**没有任何指标覆盖**：
     //    WAV 文件完整、xrun 为 0、波形统计正常，都**不代表你听到的等于我们产出的**。
-    //    `overflow_count() == 0` 才是这条的唯一证据（设计文档 §16.2）。
+    //    `dropped_frames() == 0` 才是这条的唯一证据（设计文档 §16.2）。
+    // ⚠️ **单位是帧，不是「次数」**（帧化时一起改的，理由见 `AudioEngine::dropped_frames`）。
+    //    非零时它可以直接换算成「丢了多少秒音频」——「丢了一次」和「丢了一千帧」
+    //    是两个量级的事故，标签必须说得出这个区别。
     println!(
-        "ring 溢出（生产者丢样本）：{overflow}（这条也必须为 0 —— 非零说明\
-         你听到的**不等于我们产出的**。它和上面的 xrun 是**相反方向**的一对：\
-         那个数环被抽干（消费者饿、我们喂不上），这个数环被填满（生产者丢、\
-         我们不喂了）。两个方向都要看）"
+        "ring 丢弃（生产者丢帧）：{dropped}（这条也必须为 0 —— 非零说明\
+         你听到的**不等于我们产出的**。单位是**帧**：{dropped} ÷ {}Hz ≈ {:.3} 秒的音频\
+         没播出来。它和上面的 xrun 是**相反方向**的一对：那个数环被抽干\
+         （消费者饿、我们喂不上），这个数环被填满（生产者丢、我们不喂了）。\
+         两个方向都要看。⚠️ 两者**单位不同**（那个按事件计），数字之间没有\
+         可比性 —— 各自判是否为 0）",
+        engine.output_rate(),
+        dropped as f64 / engine.output_rate() as f64
     );
     // ⚠️ 上面的数字**只覆盖「我们自己的 ring 被抽干」**：设备卡顿而我方缓冲有货时，
     // 它照样是 0（设计文档 §16.2 的口径）。设备侧那一半单独报 —— 它以前只进日志，

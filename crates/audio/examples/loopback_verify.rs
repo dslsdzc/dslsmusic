@@ -778,8 +778,10 @@ fn start_capture(
         //    缓冲 —— 那是产品行为，不为测试改。
         buffer_size: cpal::BufferSize::Fixed(rate / 8),
     };
-    // 环容量按采集率算（同 `AudioEngine` 的理由：按秒定，不按样本数定）。
-    let ring = AudioRing::new(rate as usize * channels as usize * CAPTURE_SECONDS);
+    // 环容量按采集率算（同 `AudioEngine` 的理由：按秒定，不按帧数定）。
+    // ⚠️ **容量单位是帧**，所以是 `率 × 秒`（不是 `率 × 声道数 × 秒`）——
+    //    后者在帧化之后是 12 秒缓冲，而字节数是这里的两倍。
+    let ring = AudioRing::new(rate as usize * CAPTURE_SECONDS);
     let (producer, consumer) = ring.split();
     let errors = Arc::new(AtomicU64::new(0));
     let stream = build_capture(device, config, format, producer, Arc::clone(&errors))?;
@@ -856,30 +858,48 @@ where
 }
 
 /// 抽环线程（普通线程，允许分配）。回调只推，这里只取。
+///
+/// ⚠️ **环的存储单元是整帧**（[`dsls_audio::StereoFrame`]），所以这里按帧取，
+/// 再摊回交错样本 —— 下游的比对、判据全都按交错样本写（与 `AudioEngine` 的
+/// dump 同一个形状），不跟着改。
 fn spawn_drain(
     mut consumer: AudioRingConsumer,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<Vec<i16>> {
+    use dsls_audio::StereoFrame;
     std::thread::spawn(move || {
         let mut out: Vec<i16> = Vec::new();
-        let mut buf = vec![0i16; 8192];
-        while !stop.load(Ordering::Relaxed) {
-            let n = consumer.available().min(buf.len());
+        let mut buf = vec![StereoFrame::SILENT; 8192]; // 帧，不是样本
+        let take = |consumer: &mut AudioRingConsumer, buf: &mut Vec<StereoFrame>| {
+            // ⚠️ `available_frames()` 数的是**帧**，而 `buf` 也是按帧分配的
+            //    —— 两边同单位，`min` 才是对的（前一版这里是样本对样本）。
+            let n = consumer.available_frames().min(buf.len());
             if n == 0 {
+                return 0;
+            }
+            consumer.pop_raw_frames(&mut buf[..n])
+        };
+        while !stop.load(Ordering::Relaxed) {
+            let got = take(&mut consumer, &mut buf);
+            if got == 0 {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
-            let got = consumer.pop_raw(&mut buf[..n]);
-            out.extend_from_slice(&buf[..got]);
+            for f in &buf[..got] {
+                out.push(f.l);
+                out.push(f.r);
+            }
         }
         // 收尾：停流之前已经交付的样本还在环里。
         loop {
-            let n = consumer.available().min(buf.len());
-            if n == 0 {
+            let got = take(&mut consumer, &mut buf);
+            if got == 0 {
                 break;
             }
-            let got = consumer.pop_raw(&mut buf[..n]);
-            out.extend_from_slice(&buf[..got]);
+            for f in &buf[..got] {
+                out.push(f.l);
+                out.push(f.r);
+            }
         }
         out
     })
@@ -1142,7 +1162,7 @@ fn report_no_onset(captured: &[i16], expected: &[i16]) {
 /// 等 ring 排空（带超时 —— 卡住时要有结论，不能挂死）。
 fn wait_drained(engine: &AudioEngine) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while engine.ring_available() > 0 {
+    while engine.ring_available_frames() > 0 {
         anyhow::ensure!(Instant::now() < deadline, "等了 20 秒环还没排空");
         std::thread::sleep(Duration::from_millis(10));
     }

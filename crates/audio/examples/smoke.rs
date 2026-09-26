@@ -1,6 +1,6 @@
 //! 手动冒烟程序：**在真实设备上**验证三件事。
 //!
-//! 1. 建流成功、回调真的在取数（`ring_available` 下降）
+//! 1. 建流成功、回调真的在取数（`ring_available_frames` 下降）
 //! 2. 环被抽干后 `xrun` 从 0 开始上涨（指标是活的）
 //! 3. **时长对得上**：喂进去 N 秒源率样本，环里就该出 N 秒
 //!
@@ -84,30 +84,30 @@ fn main() -> anyhow::Result<()> {
     let mut engine = AudioEngine::new(rate)?;
     println!(
         "STREAM BUILT + PLAY OK | source={rate}Hz output={}Hz {}ch passthrough={} | \
-         ring_capacity={}",
+         ring_capacity_frames={}",
         engine.output_rate(),
         engine.output_channels(),
         engine.is_passthrough(),
-        engine.ring_capacity()
+        engine.ring_capacity_frames()
     );
 
     // ── 1) 回调真的在取数 + xrun 可观测 ──
     //
     // ⚠️ 这一段**故意不加背压**（下面第 2 段才加）：它的目的是把环喂爆、
     //    好让「饿死之后 xrun 会涨」这条可观测。源率远高于输出率时这里会溢出丢样本
-    //    （`push_samples` 的既定语义），所以 `ring_available` / `xrun` 在这两行里
+    //    （`push_samples` 的既定语义），所以 `ring_available_frames` / `xrun` 在这两行里
     //    不可当性能指标读 —— 时长的判据在第 2 段。
     let one_sec = tone(rate, 1);
     engine.push_samples(&one_sec);
     println!(
-        "PUSHED {} samples, ring_available={}",
+        "PUSHED {} samples, ring_available_frames={}",
         one_sec.len(),
-        engine.ring_available()
+        engine.ring_available_frames()
     );
     std::thread::sleep(Duration::from_millis(400));
-    let after_play = engine.ring_available();
+    let after_play = engine.ring_available_frames();
     println!(
-        "AFTER 400ms: ring_available={after_play} xrun={}",
+        "AFTER 400ms: ring_available_frames={after_play} xrun={}",
         engine.xrun_count()
     );
 
@@ -125,15 +125,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!(
-        "AFTER STARVING 3000ms: ring_available={} xrun={}",
-        engine.ring_available(),
+        "AFTER STARVING 3000ms: ring_available_frames={} xrun={}",
+        engine.ring_available_frames(),
         engine.xrun_count()
     );
 
     // ── 2) 时长判据：喂 N 秒 ⇒ 环里出 N 秒 ──
     //
-    // ⚠️ **必须带背压喂**：`push_samples` 在环满时是**丢数据**（只记一次 overflow），
-    //    一次全塞进去会丢掉大半，量出来的时长就没有意义了。CLI 里也是同一条规则。
+    // ⚠️ **必须带背压喂**：`push_samples` 在环满时是**丢数据**（计入
+    //    `dropped_frames()`），一次全塞进去会丢掉大半，量出来的时长就没有意义了。
+    //    CLI 里也是同一条规则。
     let audio = tone(rate, TONE_SECONDS);
     let started = Instant::now();
     let mut fed = 0usize;
@@ -141,13 +142,13 @@ fn main() -> anyhow::Result<()> {
         let take = (4096usize).min(audio.len() / 2 - fed);
         engine.push_samples(&audio[fed * 2..(fed + take) * 2]);
         fed += take;
-        while engine.ring_available() > engine.ring_capacity() / 4 * 3 {
+        while engine.ring_available_frames() > engine.ring_capacity_frames() / 4 * 3 {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
     // ⚠️ **排空重采样器的尾巴。** 不调它，结尾会少一截（重采样那条路上尤其明显）。
     engine.finish_stream();
-    while engine.ring_available() > 0 {
+    while engine.ring_available_frames() > 0 {
         std::thread::sleep(Duration::from_millis(5));
     }
     let measured = started.elapsed().as_secs_f64();

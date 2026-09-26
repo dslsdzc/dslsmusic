@@ -44,7 +44,7 @@ pub mod output_path;
 pub mod pcm;
 pub mod resample;
 
-pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer};
+pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer, StereoFrame};
 pub use output_path::OutputPath;
 pub use pcm::{PcmGraph, PcmStage};
 pub use resample::StreamResampler;
@@ -55,9 +55,13 @@ use output_path::{Candidate, EnvPreference};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// ring 缓冲的时长（秒）。**按秒而不是按样本数**定容量：输出率可能是 44.1k 也可能
-/// 是 48k，写死样本数会让「几秒缓冲」随设备而变（44.1k 的 4 秒样本数在 48k 上
+/// ring 缓冲的时长（秒）。**按秒而不是按帧数**定容量：输出率可能是 44.1k 也可能
+/// 是 48k，写死帧数会让「几秒缓冲」随设备而变（44.1k 的 4 秒帧数在 48k 上
 /// 只有 3.675 秒）。
+///
+/// ⚠️ 容量单位是**帧**（`AudioRing::new` 收帧数），所以这里是 `率 × 秒`
+/// —— 前一版 ring 存的是散装样本，那一版这里是 `率 × 声道数 × 秒`。
+/// 两边的**字节数相同**（一帧 = 2 个样本）。
 const RING_SECONDS: usize = 4;
 
 pub struct AudioEngine {
@@ -80,8 +84,8 @@ pub struct AudioEngine {
     /// （这里在**解码线程**上，分配是允许的 —— §16.2 只约束回调线程；
     /// 但没有必要每包都分配一次。）
     conv: Vec<i16>,
-    /// ring 容量（样本数），按**输出率**算出来的。
-    ring_capacity: usize,
+    /// ring 容量（**帧数**），按**输出率**算出来的。
+    ring_capacity_frames: usize,
     /// 设备侧报错次数（`device_error_count()`）。
     ///
     /// ⚠️ **与 `producer.underruns()` 不是一个计数器**（两者各自一个
@@ -280,9 +284,11 @@ impl AudioEngine {
         }
 
         // 缓冲时长按**输出率**折算 —— 见 `RING_SECONDS` 的说明。
+        // ⚠️ 容量按**帧**算：`AudioRing::new` 收的是帧数（一帧 4 字节 = 两个 i16），
+        //    所以这里**不再乘声道数** —— 乘了就是 8 秒缓冲，而字节数是改前的两倍。
         // **split 之后消费端移进回调，全程无锁。**
-        let ring_capacity = output_rate as usize * resample::CHANNELS * RING_SECONDS;
-        let (producer, consumer) = AudioRing::new(ring_capacity).split();
+        let ring_capacity_frames = output_rate as usize * RING_SECONDS;
+        let (producer, consumer) = AudioRing::new(ring_capacity_frames).split();
 
         // ⚠️ **不要硬写 `f32`。** `build_output_stream<T>` 是泛型，`T` 由调用方选；
         //    而设备默认格式是运行时才知道的（本机实测 F32/48000，但换台设备可能是
@@ -311,7 +317,7 @@ impl AudioEngine {
             path,
             resampler,
             conv: Vec::new(),
-            ring_capacity,
+            ring_capacity_frames,
             device_errors,
         })
     }
@@ -342,7 +348,7 @@ impl AudioEngine {
     /// 正是本任务的验收标准。它同时把开头为对齐而丢掉的帧补回来，所以总输出帧数
     /// 恰好是 `ceil(输入帧数 × 比率)`。
     ///
-    /// 直通时它什么都不做。
+    /// 直通时它不排空任何东西（没有重采样器可排）。
     ///
     /// **前置条件：此刻环里要放得下这点尾巴。** 排空产出的量是有界的
     /// （`output_delay()` 帧 + 不足一整块的输入，本模块默认配置下约 12 ms），
@@ -350,18 +356,35 @@ impl AudioEngine {
     /// **而且是静默的**。CLI 的背压把环维持在 3/4（约 1 秒余量），远大于这个量；
     /// 直接调用本方法的代码要自己保证同一条。
     ///
-    /// ⚠️ **还要算上 `carry`**：`push_samples` 手上可能扣着 1 个样本
-    /// （见 `AudioRingProducer` 的字段文档），它不在环里、`available()` 也数不到。
-    /// 环**整个满着**（一个槽位都没有）时它**再也不会进环** —— 本方法之后不会再
-    /// 有推送了：尾巴为空（`data` 为空 ⇒ 那一次 `dropped == 0`）时**连溢出事件都不计**，
-    /// 那 1 个样本就这么没了；尾巴非空时计到的是**尾巴被丢**的那一次事件，
-    /// 「`carry` 里那个出不去」这件事照样没有任何读数反映。
+    /// # 收尾顺便报一件事：手上还扣着半个帧
+    ///
+    /// [`AudioRingProducer`] 可能扣着**一个凑不成帧的样本**（见
+    /// [`AudioRingProducer::push_samples`] 的失效档）。**收尾这一刻是它最后的
+    /// 机会** —— 本方法之后不会再有推送了，所以此刻若还扣着，那一个样本
+    /// **永远播不出来**：它不在环里（`available_frames()` 数不到）、
+    /// 也不计入 [`AudioEngine::dropped_frames`]（它没被丢弃，是这条流自己不成帧）。
+    ///
+    /// 前一版这里只写了这条性质、**没有任何读数**。现在补上：为真就记一条
+    /// `warn`。这是**解码线程**，写日志不犯 §16.2。
+    ///
+    /// ⚠️ 正常路径**不该**走到这里：`decode` 按 packet 产出 2 声道交错样本
+    /// （每个 packet 都是偶数个），重采样器的 `conv` 也有整帧断言。所以这条
+    /// 告警一旦出现，它同时是那句「正常路径恒为偶数」的**绊线** ——
+    /// 说明有别的调用方按奇数边界喂了它，而**流的末尾丢了半个帧**。
     pub fn finish_stream(&mut self) {
         if let Some(rs) = &mut self.resampler {
             self.conv.clear();
             rs.flush(&mut self.conv);
             debug_assert_whole_frames(&self.conv, "flush");
             self.producer.push_samples(&self.conv);
+        }
+        if self.producer.has_pending_sample() {
+            log::warn!(
+                "流的末尾有**半个帧**（总样本数是奇数）：最后那一个样本凑不成一帧，\
+                 不会进 ring、也不会被计入丢弃帧数 —— **它播不出来**。\
+                 正常路径不会发生（解码与重采样都按整帧产出），\
+                 若出现说明喂进 ring 的那条流长度是奇数。"
+            );
         }
     }
 
@@ -413,14 +436,20 @@ impl AudioEngine {
         &self.path
     }
 
-    /// ring 容量（样本数）。调用方按它做背压 —— **不要自己写死 `44100 * 2 * 4`**：
+    /// ring 容量（**帧数**）。调用方按它做背压 —— **不要自己写死 `44100 * 4`**：
     /// 输出率随设备而变，写死的数字在 48kHz 设备上不是 4 秒。
-    pub fn ring_capacity(&self) -> usize {
-        self.ring_capacity
+    ///
+    /// ⚠️ **单位是帧**（改帧化之前是样本数，同一个时长的数值是它的两倍）。
+    /// 名字里带 `frames` 是故意的 —— 背压那处比的是
+    /// `ring_available_frames() > ring_capacity_frames() / 4 * 3`，
+    /// 分子分母**必须同单位**，同名换单位会让这个比值静默地变一倍。
+    pub fn ring_capacity_frames(&self) -> usize {
+        self.ring_capacity_frames
     }
 
-    pub fn ring_available(&self) -> usize {
-        self.producer.available()
+    /// 环内当前可读**帧数**（单位见 [`AudioEngine::ring_capacity_frames`]）。
+    pub fn ring_available_frames(&self) -> usize {
+        self.producer.available_frames()
     }
 
     /// **硬指标：必须为 0**（设计文档 §16.2）。
@@ -432,25 +461,25 @@ impl AudioEngine {
         self.producer.underruns()
     }
 
-    /// ring **溢出**次数 —— 环满、样本被丢。**按「事件」计**（不按缺失样本数计），
-    /// 与 [`AudioEngine::xrun_count`] 同口径。
+    /// ring **丢弃的帧数** —— 环满、新数据被丢。**按帧计**，不是「事件次数」。
     ///
     /// ⚠️ 与 [`AudioEngine::xrun_count`] 是**相反方向**的一对，**两个都要看**：
     /// 那个数的是环被**抽干**（消费者饿），本方法数的是环被**填满**（生产者丢）。
+    /// 两者**不同单位**（那个按事件、这个按帧），数字之间没有可比性 ——
+    /// 各自判是否为 0。
     ///
     /// **本方法存在的唯一理由**：丢样本是**静默**的 —— WAV 文件完整、
     /// `xrun_count` 为 0、波形统计正常，都**不代表你听到的等于我们产出的**。
-    /// `overflow_count() == 0` 才是这一条的唯一证据（设计文档 §16.2）。
+    /// `dropped_frames() == 0` 才是这一条的唯一证据（设计文档 §16.2）。
     ///
-    /// 口径：**每次推送真正丢掉的样本数恒为偶数**（见 [`AudioRing`] 的帧对齐
-    /// 不变量 —— 丢奇数个会永久翻转左右声道）。这不是「通常如此」，是
-    /// `push_samples` **按实际丢弃数配平**出来的：收得下就少收一个，一个都收不下
-    /// 就扣下最后一个、或把手上那个一起丢掉 —— 那条路径见
-    /// [`AudioRingProducer::push_samples`] 的文档。
-    /// **扣在 `carry` 里、下次才进环的那 1 个不算丢弃，也不计事件。**
-    /// 所以非零同样只说明「丢过」，不是「丢了多少」。
-    pub fn overflow_count(&self) -> u64 {
-        self.producer.overflows()
+    /// 口径：**丢的永远是整帧** —— ring 的存储单元是一帧立体声
+    /// （见 [`AudioRing`]），所以不存在「丢掉半个帧」。这个数因此是
+    /// **精确的**：`想推的帧数 − 真进环的帧数`，可以直接换算成丢了多少毫秒
+    /// （`帧数 × 1000 / 输出率`）。前一版这里按**事件**计（丢一次记一次），
+    /// 因为那时的样本计数被「为奇偶少收一个」的配平污染过 ±1；
+    /// 帧化把那个污染连同它的理由一起删掉了。
+    pub fn dropped_frames(&self) -> u64 {
+        self.producer.dropped_frames()
     }
 
     /// **设备侧**报错次数（ALSA 的 underrun/overrun 就从这里来）。
@@ -480,9 +509,10 @@ impl AudioEngine {
 /// 写成断言是为了让它**继续**成立 —— 半个帧意味着重采样器把一个样本吞了、
 /// 或多吐了半个，那是**样本丢失**。
 ///
-/// ⚠️ 别和「环里可以有半个帧」混为一谈，那是合法的另一件事：
-/// 调用方按任意边界切分立体声流时，那半个样本留在环里等它的另一半
-/// （见 [`AudioRing`] 的帧对齐不变量）。
+/// ⚠️ 别和「调用方按任意边界切分立体声流」混为一谈，那是合法的另一件事：
+/// `push_samples` 收的**样本数**允许是奇数，凑不成帧的那一个样本扣在生产端的
+/// `pending` 里等它的另一半（见 [`AudioRingProducer::push_samples`]）。
+/// 但**环里不会有半个帧** —— 环的存储单元就是整帧（见 [`AudioRing`]）。
 ///
 /// 回归测试：本模块的 `resampled_conv_is_always_whole_frames`。
 fn debug_assert_whole_frames(conv: &[i16], stage: &str) {
@@ -737,7 +767,10 @@ where
     // 回调内**绝不分配**：scratch 在这里一次性分配好，再 move 进闭包。
     // （旧写法在回调里 `scratch.resize()`——虽然容量预留着不会真重分配，
     //   但那是把「不分配」这条硬约束押在容量估算上，换个大缓冲就破了。）
-    let mut scratch: Vec<i16> = vec![0; 8192];
+    //
+    // ⚠️ 元素类型是 [`StereoFrame`]（**帧**），不是 i16。4096 帧 = 16384 字节，
+    //    与改帧化之前那 8192 个 i16 **同样大** —— 帧化不改内存，只改单位。
+    let mut scratch: Vec<StereoFrame> = vec![StereoFrame::SILENT; 4096];
     // 通道数要在 move 进闭包**之前**取出来（`config` 下面会被按值消费掉）
     let channels = config.channels as usize;
 
@@ -774,20 +807,25 @@ where
 /// 无分配、无 IO（设计文档 §16.2）。
 ///
 /// 前置条件（唯一的调用点 `build_output` 两条都满足；违反了会 panic）：
-/// `channels >= 1`，且 `scratch.len() >= 2`（至少要装得下一帧立体声）。
+/// `channels >= 1`，且 `scratch.len() >= 1`（至少要装得下一帧）。
 ///
-/// 环里承载的是**2 声道交错**的样本（`decode::decode_to_i16` 的契约）。推入的
-/// 样本数**允许是奇数**（切片边界随调用方），本函数按**整帧**消费，见下面的注释。
+/// 环里承载的是**2 声道交错**的样本，而它的存储单元是**整帧**
+/// （[`StereoFrame`]）。所以本函数按帧取、按帧配对 —— 取数边界**天生**是整帧，
+/// 不需要任何取偶（前一版这里有一句 `available() & !1`：那是为「环里可能装着
+/// 奇数个样本」打的补丁，而那个状态现在已经不可表达，见 [`AudioRing`]）。
+///
+/// 推入的**样本数**允许是奇数（切片边界随调用方）——那半个帧扣在生产端的
+/// `pending` 里，**不在环里**，本函数因此看不见它、也不会把它弄丢。
 fn fill_from_ring<T>(
     out: &mut [T],
     channels: usize,
     consumer: &mut AudioRingConsumer,
-    scratch: &mut [i16],
+    scratch: &mut [StereoFrame],
 ) where
     T: cpal::SizedSample + cpal::Sample + cpal::FromSample<i16>,
 {
     let total_frames = out.len() / channels;
-    let cap_frames = (scratch.len() / 2).max(1); // scratch 存的是立体声样本
+    let cap_frames = scratch.len().max(1); // scratch 存的就是**帧**
     let mut frame = 0usize;
     let mut starved = false;
 
@@ -797,24 +835,22 @@ fn fill_from_ring<T>(
     out.fill(T::EQUILIBRIUM);
 
     while frame < total_frames {
-        let want_frames = (total_frames - frame).min(cap_frames);
-        let want = want_frames * 2;
-        // ⚠️ **只取整帧。** 环里可能装着**奇数**个样本：push 端按任意边界切分
-        //    同一个立体声流是合法的（先推 [L0,R0,L1]，再推 [R1,L2,R2]）。
-        //    按 `available()` 把 pop 长度向下取到偶数，那**半个样本就留在环里**，
-        //    下一次回调自然接在它后面。
-        //    反过来（直接 pop 奇数个再 `got / 2`）会把它**丢掉** —— 而它后面的
-        //    样本还在环里 ⇒ 此后所有 L/R 配对整体错位，听感是**声道互换**，
-        //    而且**不可恢复**（比丢一个样本难查得多）。
-        let avail = consumer.available();
-        // `want` 本身是偶数，只有 `avail` 更小时才可能算出半个帧 ⇒ 清掉最低位。
-        let n = want.min(avail) & !1;
-        let got = consumer.pop_raw(&mut scratch[..n]);
-        let got_frames = got / 2;
+        let want = (total_frames - frame).min(cap_frames);
+        // ⚠️ **按帧取，不按样本取。** `available_frames()` 数的是环里的**帧**
+        //    （环的存储单元就是帧），所以 `want.min(avail)` 天然是整帧数。
+        //    前一版这里要把样本数**向下取到偶数**（`& !1`）才能保证不把半个
+        //    帧取出来丢掉 —— 那个下取偶本身就是当年那个声道互换 bug 的补丁。
+        let n = want.min(consumer.available_frames());
+        let got = consumer.pop_raw_frames(&mut scratch[..n]);
 
-        for f in 0..want_frames {
-            let (l, r) = if f < got_frames {
-                (scratch[f * 2], scratch[f * 2 + 1])
+        // ⚠️ 迭代 `scratch` 本身而不是写下标（clippy 的 `needless_range_loop`）：
+        //    用 `.take(want)` 而不是 `scratch[..want]` —— 后者在 `scratch` 为空、
+        //    `want == 1`（`cap_frames` 的 `.max(1)`）时会**多出一条 panic 路径**，
+        //    而那正是前置条件允许范围之外、旧写法又恰好不会炸的那一档。
+        //    `f >= got` 时读到的 `s` 是 scratch 里的旧值，但那个分支**不读它**。
+        for (f, s) in scratch.iter().take(want).enumerate() {
+            let (l, r) = if f < got {
+                (s.l, s.r)
             } else {
                 (0, 0) // i16 域的静音；转换到 T 后自然就是该格式的静音
             };
@@ -835,7 +871,7 @@ fn fill_from_ring<T>(
         if got < want {
             starved = true;
         }
-        frame += got_frames;
+        frame += got;
         if starved {
             break;
         }
@@ -872,7 +908,7 @@ mod tests {
         let ring = AudioRing::new(16);
         let (mut prod, mut cons) = ring.split();
         prod.push_samples(&[1000, -1000, 2000, -2000]); // 2 帧立体声
-        let mut scratch = vec![0i16; 8]; // 4 帧容量
+        let mut scratch = vec![StereoFrame::SILENT; 4]; // 4 帧容量
         let mut out = [123u8; 8]; // 4 帧 × 2ch，故意预填垃圾值
 
         fill_from_ring::<u8>(&mut out, 2, &mut cons, &mut scratch);
@@ -897,7 +933,8 @@ mod tests {
         let data: Vec<i16> = (0..40).map(|i| i as i16).collect(); // 20 帧立体声
         prod.push_samples(&data);
 
-        let mut scratch = vec![0i16; 4]; // 只能装 2 帧，远小于 20 帧的请求
+        // 只能装 1 帧，远小于 20 帧的请求
+        let mut scratch = vec![StereoFrame::SILENT; 1];
         let mut out = [0i16; 40];
         fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
 
@@ -912,7 +949,7 @@ mod tests {
         let (mut prod, mut cons) = ring.split();
         prod.push_samples(&[1, 2]); // 只有 1 帧
 
-        let mut scratch = vec![0i16; 8];
+        let mut scratch = vec![StereoFrame::SILENT; 4];
         let mut out = [7i16; 40]; // 要 20 帧，预填 7 用来暴露「没写到的槽位」
         fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
 
@@ -931,7 +968,7 @@ mod tests {
         let (mut prod, mut cons) = ring.split();
         prod.push_samples(&[11, 22, 33, 44]); // 2 帧立体声
 
-        let mut scratch = vec![0i16; 8];
+        let mut scratch = vec![StereoFrame::SILENT; 4];
         let mut out = [0i16; 2]; // 2 帧 × 1ch
         fill_from_ring::<i16>(&mut out, 1, &mut cons, &mut scratch);
 
@@ -949,7 +986,7 @@ mod tests {
         let ring = AudioRing::new(16);
         let (mut prod, mut cons) = ring.split();
         prod.push_samples(&[0, -32768, 32767, 100]); // 2 帧立体声
-        let mut scratch = vec![0i16; 8];
+        let mut scratch = vec![StereoFrame::SILENT; 4];
         let mut out = [I24::EQUILIBRIUM; 4];
         fill_from_ring::<I24>(&mut out, 2, &mut cons, &mut scratch);
 
@@ -977,26 +1014,35 @@ mod tests {
         );
     }
 
-    /// 环里只剩**半个**立体声帧时，那半个样本必须**留在环里**，不能取出来丢掉。
+    /// **推送边界切在半个帧上时，L/R 配对不能错位。**
     ///
-    /// 丢掉它不会当场出错（本次回调只是补静音 + 记一次欠载），但它后面的样本
-    /// 还在环里 ⇒ **此后所有 L/R 配对整体错位**，听感是声道互换，且不可恢复。
+    /// 这一条替代前一版的 `callback_leaves_a_half_frame_in_the_ring_instead_of_dropping_it`。
+    /// 旧测试的前提是「环里可以留着半个样本、由消费端负责不把它取走」——
+    /// **那个状态现在不可表达**：环的存储单元是整帧，半个帧根本进不去。
+    /// 半个帧改由**生产端的 `pending`** 持有，所以断言的位置从消费端挪到了
+    /// 生产端（旧测试断 `cons.available() == 1` 那半个样本；现在环里是 **0 帧**，
+    /// 那半个样本在 `prod` 手上）。
+    ///
+    /// **旧测试真正想钉的东西一点没丢**：推送边界切在帧中间时，后续帧仍然
+    /// 正确配对（`(3,4)` 而不是 `(4,3)`）—— 声道不互换。
     #[test]
-    fn callback_leaves_a_half_frame_in_the_ring_instead_of_dropping_it() {
+    fn callback_pairs_across_a_split_push_boundary() {
         let ring = AudioRing::new(16);
         let (mut prod, mut cons) = ring.split();
-        prod.push_samples(&[1, 2, 3]); // 1.5 帧：3 是下一帧的左声道
-        let mut scratch = vec![0i16; 8];
+        prod.push_samples(&[1, 2, 3]); // 1 整帧 + 3 是下一帧的左声道
+        assert!(
+            prod.has_pending_sample(),
+            "半个帧应扣在**生产端**（环里放不下半个帧）"
+        );
+        assert_eq!(prod.available_frames(), 1, "环里只有那 1 整帧");
+
+        let mut scratch = vec![StereoFrame::SILENT; 4];
         let mut out = [7i16; 4]; // 2 帧，预填 7 用来暴露「没写到的槽位」
 
         fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
         assert_eq!(out, [1, 2, 0, 0], "只有整帧可用，尾部补静音");
-        assert_eq!(cons.underruns(), 1, "半个帧也算饿死");
-        assert_eq!(
-            cons.available(),
-            1,
-            "那半个样本必须还在环里，不能被取走丢掉"
-        );
+        assert_eq!(cons.underruns(), 1, "环里的整帧不够填满 ⇒ 饿死");
+        assert_eq!(prod.available_frames(), 0, "那 1 帧已被取走");
 
         // 下一帧的右声道到了：它必须**接在那半个样本后面**。
         // 若上一步把 3 丢了，这里会读成 [4, 5, ...] —— 也就是 L/R 互换。
