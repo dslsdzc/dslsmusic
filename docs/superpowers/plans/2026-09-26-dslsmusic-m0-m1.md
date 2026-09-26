@@ -542,11 +542,12 @@ impl PlatformWindow {
                     window_id,
                     win_event: WindowEvent::Resized(w, h),
                     ..
-                } if window_id == self_id => {
-                    // 物理像素优先：已拿到 PixelSizeChanged 就不被逻辑值覆盖
-                    if !got_pixel_size {
-                        result = PlatformEvent::Resized(w as u32, h as u32);
-                    }
+                } if window_id == self_id && !got_pixel_size => {
+                    // 物理像素优先：已拿到 PixelSizeChanged 就不被逻辑值覆盖。
+                    // 条件写进 match guard（而不是块内 if）——否则触发 clippy
+                    // 的 collapsible_match，而完成标准要求
+                    // `cargo clippy --workspace -- -D warnings` 无告警。
+                    result = PlatformEvent::Resized(w as u32, h as u32);
                 }
                 _ => {}
             }
