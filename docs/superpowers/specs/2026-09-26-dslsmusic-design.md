@@ -378,6 +378,45 @@ pub type SourceResult<T> = Result<Option<T>, SourceError>;
 
 §4.4 的云盘政策本次已定（完全可写），所以 §4.6 的三个缺口现在可以动了。
 
+### `MusicSource` trait（补进规格——原先只在计划里）
+
+```rust
+#[async_trait]
+pub trait MusicSource: Send + Sync {
+    fn name(&self) -> &str;
+    fn capabilities(&self) -> &CapabilitySet;
+
+    /// `quality` 是**精确档位要求**，不是「取所能及的最高档」。
+    ///
+    /// provider 必须**核对响应里的实际档位**；低于 `quality` 时返回
+    /// `Err(SourceError::Unavailable)`，而不是降档返回。
+    /// 降档由 resolver 用 `Quality::lower()` 显式走降级链——**这样
+    /// `should_retry_lower_quality()` 才是可执行的**。
+    ///
+    /// 返回 `Ok(Some(url))` 表示**可完整播放的 URL**。
+    /// **试听片段 / 残缺响应必须映射成 `Err(Unavailable)`**，不能返回
+    /// ——否则播放器会播 30 秒然后停住，而调用方以为成功了。
+    async fn stream_url(&self, track_id: &str, quality: Quality) -> SourceResult<String>;
+}
+```
+
+> **为什么「精确档位」而不是「取所能及」**（Task 5 审查 Important 1）：
+> 「取所能及」会让 `should_retry_lower_quality()` **返回 true 却无人可调** ——
+> provider 已经自己降过档了，resolver 无事可做。而计划里已写好的 Task 7
+> 正是「取所能及」，于是**该谓词对网易云是死代码、对本地音源是活代码，
+> 降级链行为随 provider 而异**。
+>
+> 网易云的 `song/url/v1` 会返回实际 `level`，**核对是可行的**，且常见情况下
+> 只需一次请求；只有真的要降档时才会多一次。
+
+**配套要求（缺一不可）：**
+
+| 要求 | 位置 | 理由 |
+|---|---|---|
+| `Quality::lower() -> Option<Quality>` | `model.rs` | `Quality` 目前只派生 `Ord`，**无法枚举档位**；没有它，降级链写不出来 |
+| `Track` 加 `platform: String` | `model.rs` | 设计文档 §4.5 的「统一 item」本来就含它，而实现里漏了。**第二个音源到位后 id 是 provider 私有的**（网易云数字串 vs 本地路径/哈希），没有它 resolver 要外挂一张边表才能路由 |
+| `#[non_exhaustive]` | `Capability` / `Quality` / `SourceError` | resolver 马上要 `match` 它们；加变体会破坏外部穷尽匹配。**唯一一件「现在做明显比以后便宜」的改动** |
+
 ### 另一处规格缺口（审查发现）
 
 > 设计文档 §4.5 规定了 `SourceError` / `CapabilitySet` / `SourceResult`，
