@@ -94,11 +94,36 @@ pub fn parse_stream_url(body: &Value, want: Quality) -> Result<String, SourceErr
     // 下面这条日志把实际形状原样打出来，这条路径今天不可达，
     // **第一次真实触发时它是唯一线索**（复审明确要求不许静默）。
     if let Some(trial) = first.get("freeTrialInfo").filter(|v| !v.is_null()) {
+        // ⚠️ **下面这些字段只打印，绝不据此判断。** 判据永远只有上面那一个
+        // 「`freeTrialInfo` 是不是非 null」。把它写复杂（例如再要求
+        // `freeTrialPrivilege.userConsumable` 为真）只是把一个赌注换成另一个赌注：
+        // 真试听若 `userConsumable=false`，那个合取会**漏判**，退回原来的静默缺口。
+        // **那不是严格改进**（复审 2026-09-26 §2 明确否掉了这条路）。
+        //
+        // 要打印的恰好是**事后区分「真试听」与「误拒」所需的字段**，且都已实测存在
+        // （加它们不改行为）：
+        //   - `size` + `br`：**决定性**。`size / br` 就是时长 —— 实测可播条目
+        //     `br≈128000`、`size 2.1–9.7MB` ⇒ 几分钟；而 30 秒试听在同码率下
+        //     约 0.5MB，**一眼可分**。这一条决定了「我刚拒掉的是不是一个能播的
+        //     URL」能不能被回答。
+        //   - `url`：试听 URL 常带特征路径。
+        //   - `fee`：区分免费 / VIP。
+        //   - `freeTrialPrivilege`：与 `freeTrialInfo` 成组出现的权限对象。
+        //
+        // 为什么值得这么细：这条路径**今天不可达**，第一次真实触发时本日志是
+        // 唯一线索 —— 它必须**一次就够还原现场**，不能指望「下次再多打一个字段」。
         log::warn!(
             "song/url 返回试听片段（freeTrialInfo 非 null）→ 按 Unavailable 处理；\
-             实测形状: freeTrialInfo={trial}, code={code}, level={level}",
+             实测形状: freeTrialInfo={trial}, code={code}, level={level}, \
+             size={size}, br={br}, fee={fee}, \
+             freeTrialPrivilege={privilege}, url={url}",
             code = first.get("code").unwrap_or(&Value::Null),
             level = first.get("level").unwrap_or(&Value::Null),
+            size = first.get("size").unwrap_or(&Value::Null),
+            br = first.get("br").unwrap_or(&Value::Null),
+            fee = first.get("fee").unwrap_or(&Value::Null),
+            privilege = first.get("freeTrialPrivilege").unwrap_or(&Value::Null),
+            url = first.get("url").unwrap_or(&Value::Null),
         );
         return Err(SourceError::Unavailable);
     }
