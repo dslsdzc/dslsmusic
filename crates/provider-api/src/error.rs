@@ -1,6 +1,9 @@
 use crate::model::Track;
 
-#[derive(Debug, thiserror::Error)]
+// PartialEq/Eq 是给调用方与测试用的：source-resolver 要能对比错误，
+// 测试也要能直接断言「这两个结果不同」，否则只能在已知字面量上调 unwrap()，
+// 而那会触发 clippy::unnecessary_literal_unwrap。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SourceError {
     /// provider 根本没这个能力
     #[error("该音源不支持此操作")]
@@ -56,17 +59,14 @@ mod tests {
 
     #[test]
     fn unsupported_is_distinguishable_from_empty() {
-        // 经一层函数边界产出，而不是就地写字面量 `Ok(None)`：
-        // 后者会让 clippy 的 `unnecessary_literal_unwrap` 判定 `a.unwrap()`
-        // 多余（它知道 a 就是 Ok(None)）—— 那会让 `--all-targets` 挂掉，
-        // 而断言本身要验的正是「解包后确实是 None」。断言语句因此保持原样。
-        fn none_result() -> SourceResult<Track> {
-            Ok(None)
-        }
-        let a: SourceResult<Track> = none_result();
-        let b: SourceResult<Track> = Err(SourceError::Unsupported);
-        assert!(a.is_ok() && a.unwrap().is_none());
-        assert!(matches!(b, Err(SourceError::Unsupported)));
+        let empty: SourceResult<Track> = Ok(None);
+        let unsupported: SourceResult<Track> = Err(SourceError::Unsupported);
+
+        // 两者必须不同 —— 这是 source-resolver 决定「要不要换一个音源试」
+        // 与「这首歌确实没有」的依据（设计文档 §4.5）
+        assert_ne!(empty, unsupported);
+        assert_eq!(empty, Ok(None));
+        assert!(matches!(unsupported, Err(SourceError::Unsupported)));
     }
 
     #[test]
