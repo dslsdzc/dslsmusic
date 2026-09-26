@@ -1,0 +1,58 @@
+# 依赖许可审计 —— 验收标准「cargo deny check licenses 通过」的判据本体。
+#
+# ⚠️ **本文件的存在本身就是那条标准的一部分**：cargo-deny **没有配置时
+# allow 列表是空的**，连 MIT 都会被拒（实测 `error[rejected]: MIT -
+# license is not explicitly allowed`）。所以「跑一下 cargo-deny」这句话
+# 在缺本文件时是无意义的 —— 它必然失败，且失败的信息量为零。
+#
+# 下面的列表来自 2026-09-27 对全量依赖的实测审计：**385 个第三方包、
+# 32 种许可表达式、0 个缺 license 字段**。
+#
+# **刻意只列实际出现的**：多出一种许可就该让检查红一次、由人判断兼容性，
+# 而不是预先塞一堆「大概没问题」的条目把闸门放空。
+
+[licenses]
+version = 2
+allow = [
+    # ── 我们自己：5 个 workspace 成员（license.workspace = true）──
+    #
+    # ⚠️ **漏掉这一条，检查会对「全部依赖」报失败**：cargo-deny 检查的是
+    # **整个包图，包含 workspace 成员自己**。缺了它，5 个成员全被拒，
+    # 而错误信息会把判定位置标到某个 Cargo.toml 的**注释行**上
+    # （cargo-deny 会扫文件里的许可字样，注释里写了 `license = "…"` 也会被它读到），
+    # 看起来像第三方问题 —— 实测踩到，故记在这里。
+    "GPL-3.0-or-later",
+
+    # ── 宽松型：与 GPLv3 兼容，无附加条件 ──
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # wasi。该例外本就为 GPL 兼容而设，且它是 `OR MIT`
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",        # sdl3-sys / foldhash / slotmap 等
+    "0BSD",
+    "Unlicense",   # aho-corasick / memchr / jiff 等（`Unlicense OR MIT`）
+    "BSL-1.0",     # ryu（`OR Apache-2.0`）
+    "Unicode-3.0", # icu_* / zerovec 系列共 18 个包
+    "CDLA-Permissive-2.0", # webpki-roots —— 这是**数据**许可（CA 根证书列表），非代码
+    "WTFPL",       # ncm-api-rs
+
+    # ── 文件级 copyleft：**与 GPLv3 兼容**，但附一条操作约束 ──
+    #
+    # 依据（逐条款核实过，不是推断）：
+    #   · MPL-2.0 §1.12「Secondary License」明列
+    #     「GPL v2.0 … **或这些许可的任何更新版本**」⇒ **GPLv3 在列**；
+    #   · §1.5「Incompatible With Secondary Licenses」只有两种成立方式：
+    #     附 **Exhibit B 声明**，或源自 MPL 1.1 及更早；
+    #   · `grep -r` 全部 `symphonia-*0.5.5` 源码头 —— **零命中 Exhibit B**；
+    #   ⇒ §3.3 的通道**开启**，可随 GPLv3 一起分发。
+    #
+    # ⚠️ **操作约束（这一条比「能不能用」更重要）**：
+    # §3.3 允许的是**分发 Larger Work**，它**没有把 symphonia 的文件重新许可**。
+    # 所以：链接发布 ✅ / 原样不改 ✅ /
+    # **一旦我们改动了任一 MPL-2.0 文件，那个文件仍然受 MPL-2.0 约束、
+    #   必须公开其源码**（且 §3.4 规定不得删改许可声明）。
+    # 15 个 MPL-2.0 包里 14 个是 symphonia-*0.5.5，另一个是 option-ext。
+    "MPL-2.0",
+]
