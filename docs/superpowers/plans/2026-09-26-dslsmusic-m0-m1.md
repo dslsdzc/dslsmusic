@@ -45,7 +45,7 @@ dslsmusic/
 │   │       ├── lib.rs
 │   │       ├── error.rs            # SourceError ★
 │   │       ├── capability.rs       # CapabilitySet ★
-│   │       └── model.rs            # Track / Artist / Album / Quality
+│   │       └── model.rs            # Quality / Track（Artist、Album 属 v2 详情页，M1 不做）
 │   ├── provider-netease/
 │   │   └── src/
 │   │       ├── lib.rs
@@ -54,18 +54,31 @@ dslsmusic/
 │   │       └── parse.rs            # ApiResponse → model ★
 │   └── audio/
 │       └── src/
-│           ├── lib.rs
+│           ├── lib.rs              # AudioEngine
 │           ├── decode.rs           # symphonia
-│           └── output.rs           # cpal + ring buffer
+│           ├── output.rs           # 无锁 AudioRing（ringbuf）
+│           └── pcm.rs              # v2 DSP 挂载点（v1 为空图）
 └── app/
     ├── Cargo.toml
+    ├── tests/
+    │   └── metrics.rs              # percentile 的集成测试
     └── src/
         ├── main.rs                 # CLI 入口
+        ├── lib.rs                   # 暴露 metrics，供 tests/ 使用
         ├── metrics.rs              # 帧时间直方图 ★
         └── shader.wgsl
 ```
 
 ★ = 含可单测的纯逻辑
+
+> ⚠️ **这段索引是手工维护的，会漂移。** 它已经漂移过三次
+> （`pcm.rs`、`app/src/lib.rs`、`app/tests/` 都是后加的任务产出，
+> 加完没回头更新这里），以及一次反向漂移（曾声称 `model.rs` 有
+> `Artist` / `Album` 而实际没有）。
+>
+> **权威是各任务 body 里的 `Files:` 列表，不是这段。**
+> 改动下层文件清单时，回来同步这里；或者直接把这段删掉——
+> 它提供的信息（目录概览）不值得持续维护成本。
 
 ---
 
