@@ -1,6 +1,5 @@
-mod metrics;
-
 use dsls_platform::{PlatformEvent, PlatformWindow, init_gpu};
+use dslsmusic::metrics;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

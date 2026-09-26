@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "dslsmusic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dslsmusic"
+path = "src/main.rs"
+
 [dependencies]
 dsls-platform = { path = "../crates/platform" }
 # main.rs 直接用 wgpu 类型建管线；SDL 的一切都经 dsls-platform
