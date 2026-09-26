@@ -430,8 +430,72 @@ SPlayer 只显示 HQ，根因是**云盘逻辑不一样，需读 `privilege.play
 参考 MusicFree 的设计（其实现路线不适用——Rust 内嵌 JS 引擎代价太高——但契约值得翻译）：
 
 - 统一 item：`id / platform / artist / title / duration / album / artwork / source / lyric`
-- 音质统一四档：`low / standard / high / super`，各平台原始标识在 provider 内映射
+- 音质分**两根轴**，不可混为一谈（详见下面的「音质是两根轴」一节）
 - 搜索用并发，单个 provider 异常不影响整体
+
+#### ⚠️ 音质是**两根轴**，不是一条梯度
+
+> **本节修正一处早先的错误**：本文件此前写的是「音质统一四档
+> `low / standard / high / super`」。**那句话是错的**，而且错法比「漏了几档」
+> 严重——它把两类**不同性质**的东西塞进了同一条轴。
+> （同文件 §4.4 提到「官方显示 **Hi-Res**/SQ 的云盘歌」，与此处的四档说法
+> 本就自相矛盾，两处是同一个人写的，没对上。）
+
+网易云 `/song/url/v1` 的 `level` 参数共 **10 个合法取值**，分属两类：
+
+| 轴 | 取值 | 性质 |
+|---|---|---|
+| **保真度**（有序，可降级） | `standard` < `higher` < `exhigh` < `lossless` < `hires` | 同一混音的不同保真度 |
+| **AI / 空间音频**（**不可排序**） | `jyeffect` `jymaster` `sky` `dolby` `vivid` | **不同的混音或声道结构** |
+
+**凭什么说后者不是保真度档**（硬证据）：SPLayer `src/utils/meta.ts:55` 直接写着
+`AI_AUDIO_LEVELS = ["jymaster","sky","jyeffect","vivid"]`、注释「AI 增强音质」，
+并在保真度判断里**显式排除**。机理吻合：
+
+- `jymaster`（超清母带）是**神经网络升频**——不是原生更高的保真度
+- `sky`（沉浸环绕声）是 AI 分离声部后**模拟** 5.1
+- `dolby` / `vivid` 是**空间音频格式**——声道结构不同
+
+**声道结构不同 ⇒ 数学上不可排序、也不可互相降级。**
+
+> **对设计的直接影响**：`Quality::lower()` 的线性降级链**只在保真度轴上成立**。
+> 若把音效档塞进同一个 `Ord` 梯度，「精确档位 + 显式降级链」这个设计会产出一条条
+> 荒唐的路径（`sky → jymaster` 不是降级）。**所以它们是两个类型，不是同一个
+> 枚举里的两个变体。**
+
+**本项目的建模**（用户 2026-09-26 裁决：5 档 + 预留音效轴结构）：
+
+- `Quality` = 保真度轴，**5 档**，`Ord` + `lower()`
+- `AudioEffect` = 音效轴，**与 `Quality` 之间没有 `Ord` 关系**；v1 **不实现**，
+  只把「这里有一条轴」写进类型里，避免以后误把音效档当成保真度档塞进 `Quality`
+
+| 我们的档位 | 网易云 `level` | 备注 |
+|---|---|---|
+| `Quality::Low` | `standard` | 128k |
+| `Quality::Standard` | `higher` | 192k |
+| `Quality::High` | `exhigh` | 320k |
+| `Quality::Lossless` | `lossless` | 无损 |
+| `Quality::HiRes` | `hires` | 高解析度 |
+
+**⚠️ 两条落地时必须知道的实测事实：**
+
+1. **静默降级是常态。** 匿名（或非会员）请求 `lossless` / `hires` / `jymaster`，
+   服务端**全部返回 `level: "exhigh"`、`br: 320000`**——**不报错、不提示**。
+   所以「精确档位」契约会**频繁**返回 `Err(Unavailable)` 并触发降级链。
+   这是**对的行为**，但意味着 **UI 必须把「你要的无损当前不可用，正在以极高播放」
+   告诉用户**，不能默默放过去。
+
+2. **不要用 `br` 数值判档。** 实测 `br = 999000` **同时覆盖 `lossless` 和 `hires`**
+   ——用它比对分不出这两档。**判据是响应里的 `level` 字符串**（它回显实际授予的
+   档位）。相关：`privilege` 里判 `hires` 的真实依据是 `chargeInfoList` 含
+   `rate:1999000`；`maxBrLevel` 的 `"none"` 是**合法值**、不是 `null`，解析必须容忍。
+
+> **来源矛盾要记录在案**：合法 level 的「8 个还是 10 个」在各处说法不一
+> （api-enhanced 的代码注释与 TS 枚举漏了 `higher`/`dolby`；ncm-api-rs 的
+> `API.md` 与 SPlayer 的 `song.ts` 漏了 `vivid`）。`higher` 已实测存在
+> （返回 `br=192000`），所以 8 档说法是代码注释的疏漏。
+> **另：「鲸云音效」在任何源码/文档里都不存在**——只有「鲸云母带」「鲸云臻音」
+> 作为 `jymaster`/`jyeffect` 的**营销品牌名**。**品牌名不得混进技术枚举。**
 
 #### ⚠️ 错误模型：不能把一切压成「空结果」
 

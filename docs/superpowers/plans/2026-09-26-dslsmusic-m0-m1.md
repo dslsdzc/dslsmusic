@@ -1220,7 +1220,8 @@ git commit -m "feat(m0): 帧时间测量基建（avg/p50/p95/p99/max）"
   - `pub enum SourceError { Unsupported, NotFound, AuthRequired, Unavailable, RateLimited, Network(String), Protocol(String) }`
   - `pub type SourceResult<T> = Result<Option<T>, SourceError>`
   - `pub struct CapabilitySet`（bitflags 或 HashSet）
-  - `pub enum Quality { Low, Standard, High, Super }`
+  - `pub enum Quality { Low, Standard, High, Super }` —— ⚠️ **Task 5b 会把它扩到 5 档**
+    并改名（`Super` → `Lossless`，新增 `HiRes`）；Task 7 起请以 Task 5b 的为准
   - `pub struct Track { pub id: String, pub platform: String, pub title: String, pub artist: String, pub album: String, pub duration_ms: u64 }`
 
 - [ ] **Step 1: 写失败的测试**
@@ -1296,6 +1297,9 @@ thiserror.workspace = true
 /// 引入新档位。**加变体是破坏性变更，现在标比以后改便宜。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
+// ⚠️ **这是 Task 5 完成时的状态，不是最终形态。**
+//    Task 5b 会把它扩到 5 档并改名：`Super` → `Lossless`，新增 `HiRes`。
+//    **Task 7 起请以 Task 5b 的代码为准。**
 pub enum Quality {
     Low,
     Standard,
@@ -1503,6 +1507,150 @@ Expected: 5 passed（3 个 error + 2 个 capability）。
 ```bash
 git add crates/provider-api
 git commit -m "feat(provider-api): MusicSource trait + typed SourceError + CapabilitySet"
+```
+
+---
+
+## Task 5b: 音质模型扩到真实的保真度梯度（+ 预留音效轴）
+
+> **为什么有这个任务**：Task 5 建的是 4 档 `Low/Standard/High/Super`——那是我在
+> **没核实网易云真实档位**的情况下定的。2026-09-26 的核实推翻了它：真实是
+> **5 档保真度**，外加 **5 个不可排序的 AI/空间音频档**。
+> 完整论证见设计文档 §4.5「音质是两根轴」。
+>
+> **Task 7 依赖本任务的产出，所以它必须排在 Task 7 之前。**
+
+**Files:**
+- Modify: `crates/provider-api/src/model.rs`
+- Modify: `crates/provider-api/src/lib.rs`
+
+**Interfaces:**
+- Consumes: Task 5 的 `Quality`
+- Produces:
+  - `pub enum Quality { Low, Standard, High, Lossless, HiRes }`
+    （**`Super` 改名为 `Lossless`，新增 `HiRes`**）
+  - `Quality::lower()`：`HiRes → Lossless → High → Standard → Low → None`
+  - `pub enum AudioEffect { Jyeffect, Jymaster, Sky, Dolby, Vivid }`
+    —— **与 `Quality` 之间没有 `Ord` 关系**
+
+- [ ] **Step 1: 改测试（先让它失败）**
+
+`crates/provider-api/src/model.rs` 的 `mod tests` 里，把 `lower` 的两条测试改成
+新档位，并**新增一条钉住档位总数的**：
+
+```rust
+    #[test]
+    fn lower_walks_the_five_fidelity_tiers_to_none() {
+        assert_eq!(Quality::HiRes.lower(), Some(Quality::Lossless));
+        assert_eq!(Quality::Lossless.lower(), Some(Quality::High));
+        assert_eq!(Quality::High.lower(), Some(Quality::Standard));
+        assert_eq!(Quality::Standard.lower(), Some(Quality::Low));
+        assert_eq!(Quality::Low.lower(), None);
+    }
+
+    /// 钉住**档位总数**。加档位却忘了接进 `lower()` 的话，这条会失败。
+    #[test]
+    fn ladder_has_exactly_five_rungs() {
+        let mut n = 1;
+        let mut q = Quality::Low;
+        while let Some(next) = q.lower() {
+            n += 1;
+            q = next;
+        }
+        assert_eq!(n, 5, "保真度梯度应为 5 档；加档位时必须同时更新 lower()");
+    }
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cargo test -p dsls-provider-api
+```
+
+Expected: 编译失败（`Quality::HiRes` 不存在）。
+
+- [ ] **Step 3: 改实现**
+
+`crates/provider-api/src/model.rs`：
+
+```rust
+/// **保真度**档位。有序，可沿 [`Quality::lower`] 逐级降。
+///
+/// ⚠️ **这里只有保真度。** 网易云的 `jyeffect` / `jymaster` / `sky` /
+/// `dolby` / `vivid` **不属于本枚举**——它们是不同的混音／声道结构，
+/// 不可排序、也不可互相降级（设计文档 §4.5）。见 [`AudioEffect`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Quality {
+    /// 网易云 `standard`，128k
+    Low,
+    /// 网易云 `higher`，192k
+    Standard,
+    /// 网易云 `exhigh`，320k
+    High,
+    /// 网易云 `lossless`，无损
+    Lossless,
+    /// 网易云 `hires`，高解析度
+    HiRes,
+}
+
+impl Quality {
+    /// 降一档。已是最后一档则返回 `None`——降级链到此为止。
+    pub fn lower(self) -> Option<Quality> {
+        match self {
+            Quality::HiRes => Some(Quality::Lossless),
+            Quality::Lossless => Some(Quality::High),
+            Quality::High => Some(Quality::Standard),
+            Quality::Standard => Some(Quality::Low),
+            Quality::Low => None,
+        }
+    }
+}
+
+/// **AI / 空间音频**档位。**与 [`Quality`] 之间没有 `Ord` 关系。**
+///
+/// 它们不是「同一首歌的更高保真度」，而是**不同的混音或声道结构**：
+/// `jymaster` 是神经网络升频、`sky` 是 AI 分离声部后模拟 5.1、
+/// `dolby` / `vivid` 是空间音频格式。因此 **`sky → jymaster` 不是降级**，
+/// 把它们塞进 `Quality` 的 `Ord` 梯度会产出荒唐的降级路径。
+///
+/// **v1 不实现。** 这个类型存在的意义是把「这里有一条轴」写进类型里，
+/// 防止以后误把音效档当成保真度档塞进 `Quality`（用户 2026-09-26 裁决）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AudioEffect {
+    /// 高清臻音。⚠️ 官方中文名**待定**——来源互相矛盾，别照抄任何一处
+    Jyeffect,
+    /// 超清母带。**神经网络升频，不是原生更高的保真度**
+    Jymaster,
+    /// 沉浸环绕声。AI 分离声部后**模拟** 5.1
+    Sky,
+    /// 杜比全景声。⚠️ 需要 `os=pc`，**与 `Vivid` 互斥**
+    Dolby,
+    /// 臻品音质。⚠️ 需要 `os=android` + `appver=9.5.61`，**与 `Dolby` 互斥**
+    Vivid,
+}
+```
+
+`crates/provider-api/src/lib.rs` 的 re-export 补上 `AudioEffect`：
+
+```rust
+pub use model::{AudioEffect, Quality, Track};
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cargo test -p dsls-provider-api
+```
+
+Expected: 全过（原 11 条 + 1 条新 = 12 条；两条改名的算在原有 11 里）。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add crates/provider-api
+git commit -m "feat(provider-api): Quality 扩到 5 档保真度梯度，新增 AudioEffect 预留音效轴"
 ```
 
 ---
@@ -2001,7 +2149,12 @@ mod tests {
     #[test]
     fn parses_stream_url() {
         let body = json!({
-            "data": [{"url": "https://m8.music.126.net/x.mp3", "br": 320000, "code": 200}]
+            "data": [{
+                "url": "https://m8.music.126.net/x.mp3",
+                "level": "exhigh",
+                "br": 320000,
+                "code": 200
+            }]
         });
         let url = parse_stream_url(&body, Quality::High).unwrap();
         assert_eq!(url, "https://m8.music.126.net/x.mp3");
@@ -2024,24 +2177,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_url_below_requested_quality() {
-        // 要无损、只给 128k —— 必须拒绝，否则是静默降档
+    fn rejects_silent_downgrade() {
+        // ★ 这是本组最重要的一条。要无损、服务端给了极高 ——
+        // **实测这是常态而非异常**：匿名/非会员请求 lossless / hires /
+        // jymaster 一律返回 level:"exhigh"，且不报错、不提示。
+        // 必须拒绝，否则就是静默的谎言：「无损」标签配 320k 的声音。
         let body = json!({
-            "data": [{"url": "https://m8.music.126.net/low.mp3", "br": 128000, "code": 200}]
+            "data": [{
+                "url": "https://m8.music.126.net/x.mp3",
+                "level": "exhigh",
+                "br": 320000,
+                "code": 200
+            }]
         });
-        let err = parse_stream_url(&body, Quality::Super).unwrap_err();
+        let err = parse_stream_url(&body, Quality::Lossless).unwrap_err();
         assert!(matches!(err, dsls_provider_api::SourceError::Unavailable));
         // 这条断言是关键：它保证降档链真的可执行（Task 5 审查的重点）
         assert!(err.should_retry_lower_quality());
     }
 
     #[test]
-    fn accepts_when_br_absent() {
-        // br 缺失时不拒绝：拒绝一个能播的 URL 让用户直接听不到歌，
+    fn hires_is_not_confused_with_lossless() {
+        // br 分不出这两档（实测 999000 同时覆盖二者），
+        // 所以才改用 level 字符串 —— 这条测试钉的就是这个区别。
+        let lossless = json!({
+            "data": [{"url": "https://m8.music.126.net/l.flac", "level": "lossless",
+                      "br": 999000, "code": 200}]
+        });
+        assert!(
+            matches!(
+                parse_stream_url(&lossless, Quality::HiRes),
+                Err(dsls_provider_api::SourceError::Unavailable)
+            ),
+            "br 同为 999000，但 level 是 lossless —— 要 hires 时必须拒绝"
+        );
+    }
+
+    #[test]
+    fn accepts_when_level_absent() {
+        // level 缺失时不拒绝：拒绝一个能播的 URL 让用户直接听不到歌，
         // 代价远大于音质低于预期。这是有意的不对称取舍。
         let body = json!({"data": [{"url": "https://m8.music.126.net/x.mp3", "code": 200}]});
         assert_eq!(
-            parse_stream_url(&body, Quality::Super).unwrap(),
+            parse_stream_url(&body, Quality::HiRes).unwrap(),
             "https://m8.music.126.net/x.mp3"
         );
     }
@@ -2106,16 +2284,6 @@ pub fn parse_search_tracks(body: &Value) -> Result<Vec<Track>, SourceError> {
         .collect())
 }
 
-/// 音质档位 → 网易云 br 参数。
-fn quality_to_br(q: Quality) -> u32 {
-    match q {
-        Quality::Low => 128_000,
-        Quality::Standard => 192_000,
-        Quality::High => 320_000,
-        Quality::Super => 999_000, // 无损
-    }
-}
-
 /// 从 `song/url/v1` 响应里取出可播放 URL，**并核对实际档位**。
 ///
 /// `want` 是**精确档位要求**，不是「取所能及的最高档」——这是 Task 5 的
@@ -2139,19 +2307,24 @@ pub fn parse_stream_url(body: &Value, want: Quality) -> Result<String, SourceErr
     // 拿到了无损，实际听到的是 320k。返回 Unavailable 才能让 resolver
     // 走 `Quality::lower()` 的显式降级链，把「降档」这件事告诉用户。
     //
-    // 不对称取舍（有意为之）：`br` **缺失时不拒绝**。拒绝一个本可播放的
+    // **判据是 `level` 字符串，不是 `br`。** 实测 `br = 999000` **同时覆盖
+    // `lossless` 和 `hires`**，用它分不出这两档；而 `level` 回显服务端
+    // 实际授予的档位，可靠且精确。
+    //
+    // 这条检查会**频繁**命中：实测匿名（或非会员）请求 lossless/hires/jymaster
+    // 一律返回 `level: "exhigh"` —— **静默降级是常态**，不是异常。
+    //
+    // 不对称取舍（有意为之）：`level` **缺失时不拒绝**。拒绝一个本可播放的
     // URL 会让用户直接听不到歌；接受一个无法核实的 URL 最坏只是音质
     // 低于预期。前者的代价大得多。
-    if let Some(got) = first.get("br").and_then(|v| v.as_u64()) {
-        if got < quality_to_br(want) as u64 {
+    if let Some(got) = first.get("level").and_then(|v| v.as_str()) {
+        if got != level_for(want) {
             return Err(SourceError::Unavailable);
         }
     }
 
     Ok(url.to_string())
 }
-
-pub use quality_to_br as br_for_quality;
 ```
 
 `crates/provider-netease/src/lib.rs` 追加一行（**这一步就是本任务 `Files:` 里承诺的 lib.rs 修改**——
@@ -2236,7 +2409,7 @@ impl MusicSource for NeteaseClient {
             .song_url_v1(
                 &Query::new()
                     .param("id", track_id)
-                    .param("level", &level_for(quality)),
+                    .param("level", level_for(quality)),
             )
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
@@ -2244,14 +2417,16 @@ impl MusicSource for NeteaseClient {
     }
 }
 
-fn level_for(q: Quality) -> String {
+/// 档位 → 网易云 `level` 参数。**必须覆盖 `Quality` 的全部变体** ——
+/// 少一个变体这里就是编译错误，那是有意的（加档位不能忘了接线）。
+fn level_for(q: Quality) -> &'static str {
     match q {
-        dsls_provider_api::Quality::Low => "standard",
-        dsls_provider_api::Quality::Standard => "higher",
-        dsls_provider_api::Quality::High => "exhigh",
-        dsls_provider_api::Quality::Super => "lossless",
+        Quality::Low => "standard",
+        Quality::Standard => "higher",
+        Quality::High => "exhigh",
+        Quality::Lossless => "lossless",
+        Quality::HiRes => "hires",
     }
-    .to_string()
 }
 ```
 
@@ -2294,7 +2469,7 @@ mod tests {
 cargo test -p dsls-provider-netease
 ```
 
-Expected: 20 passed。
+Expected: 21 passed。
 
 - [ ] **Step 6: 提交**
 
@@ -3045,7 +3220,8 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     let q = match quality {
         "low" => Quality::Low,
         "standard" => Quality::Standard,
-        "super" => Quality::Super,
+        "lossless" => Quality::Lossless,
+        "hires" => Quality::HiRes,
         _ => Quality::High,
     };
 
