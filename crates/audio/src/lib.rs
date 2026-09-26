@@ -130,8 +130,8 @@ impl AudioEngine {
                      占着它）。退回共享路径；这不会是静音，但系统混音器会回到中间。"
                 ),
                 Err(e) => log::warn!(
-                    "独占设备 {pcm_id} 打不开（{e}）—— 这**不是**「设备被占着」那一类\
-                     （错误类别见上），退回共享路径。这不会是静音，但系统混音器会回到中间。"
+                    "独占设备 {pcm_id} 打不开（{e}）—— 这**不是**「设备被占着」那一类，\
+                     退回共享路径。这不会是静音，但系统混音器会回到中间。"
                 ),
             }
         }
@@ -542,6 +542,13 @@ fn preferred_exclusive(host: &cpal::Host) -> Option<String> {
 /// 为什么要分开：只有这一类才配得上「这是常态，PipeWire 或别的进程占着它」那句
 /// 归因。别的失败（名字拼错、设备不在枚举里、权限不足）套上那句话会把用户引向
 /// 完全错误的方向 —— 见 [`AudioEngine::new`] 里那段按类别分档的告警。
+///
+/// **这一类在 Linux 上真的会被触发**（不是只为别的后端留的分支）：ALSA 后端的
+/// `impl From<alsa::Error> for Error` 把 `EBUSY` / `EAGAIN` 映射成它
+/// （已核实·源码 `cpal-0.18.2/src/host/alsa/mod.rs:1718` 那一支；变体本身在
+/// `cpal-0.18.2/src/error.rs:13`）—— 本机实测：先用 `--hold` 占住一台 `hw:` 设备
+/// 再开一次，落进 busy 这一档的就是它，报的正是「The requested device is
+/// temporarily busy…」（记录见 `.superpowers/sdd/task-11-fix-report.md` §3 的 B 档）。
 ///
 /// `anyhow::Error` 的**整条链**都要看：`cpal::Error` 常被 `?` 转进来，
 /// 那时它就是链上的一个节点，不一定是第一个。

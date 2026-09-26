@@ -76,10 +76,16 @@ const EXCLUSIVE_CAVEAT: &str = "独占（系统混音器不在我们与设备之
 /// **自动选路**那一支（[`crate::preferred_exclusive`]）里打印 —— 用 `--device`
 /// 点名设备时走的是 `new_on`，那条日志根本不出现。所以这里写成**条件从句**：
 /// 承诺必须在所有会打印它的场合都成立，否则就是下一句「日志里会列出…」而日志里没有。
+///
+/// ⚠️ 还有**第二道**门：那份列表只在**有** `hw:` 设备时打印
+/// （`crate::preferred_exclusive` 里按 `hardware_output_devices` 是不是空表分了
+/// 两句，空表那句说的是「本机也没有可选的 `hw:` 输出设备」）⇒ 一台物理输出设备
+/// 都没有的机器上，日志里不会出现任何列表，承诺得跟着补上这个条件。
 const SHARED_CAVEAT: &str = "共享（经系统混音器）。**系统可能替我们重采样**，我们看不见也管不着 —— \
      这一档只能保证「我们交出去的是源采样率的样本」。要绕开系统混音器，\
      把 DSLS_AUDIO_DEVICE 设成一台物理设备（`hw:`）；走**自动选路**且没拿到独占时，\
-     上面的日志里会列出本机可选的 hw: 设备（用 --device 点名设备时不会打印那份列表）。";
+     上面的日志里会列出本机可选的 hw: 设备（**本机有物理输出设备时**；\
+     用 --device 点名设备时不会打印那份列表）。";
 
 impl OutputPath {
     /// 系统混音器在不在我们和设备之间。
@@ -239,7 +245,17 @@ fn classify_env_value(raw: Option<&str>) -> EnvPreference {
 ///
 /// 这条前置条件**不靠调用方自觉**：第 2 步拿到的是本进程持有的**全部**播放 PCM
 /// （[`held_playback_pcms`]），**多于一台就判 `Unavailable`**，不取第一个 ——
-/// 所以前置条件被破坏时，结果是「如实判不出来」，而不是「认到别的卡上」。
+/// **两台及以上**那种破坏方式下，结果是「如实判不出来」，而不是「认到别的卡上」。
+///
+/// ⚠️ **但只做到这一步，别读成「前置条件一被破坏就判得出来」。** 去重后**恰好一台**
+/// 时走的是 [`HeldTarget::One`] 那一支（[`resolve_held`] 里 `[(card, dev)]` 那个模式），
+/// 它**照样把那一台当成 `default` 的目标**（再拿去 cpal 的枚举里查一次，
+/// 查得到就报 `Found`）；而「本进程持有一台**别的** engine 的 PCM、探针自己那条
+/// 又落在服务型后端上（不记在本进程名下）」给出的正是恰好一台 —— 那正是这条
+/// 前置条件被破坏的一种方式（有单测钉住）。今天**同时**只有一个 `AudioEngine`
+/// （app 的播放循环每首歌建一个、上一首在循环体末尾就出了作用域；两个示例各只建一个），
+/// 而它建流是在这次探针**之后** ⇒ 探针跑的时候本进程名下不会有别人的 PCM，
+/// 所以到不了这里；将来真加第二个引擎的人要先把这一条补上。
 ///
 /// # 一条**没有消除**的窗口（如实记着）
 ///
@@ -306,15 +322,9 @@ fn probe_via_proc(host: &cpal::Host) -> Candidate {
     //    挪到最后只剩 `AudioEngine::new` 那边 `new_on` 自己的一次枚举 + open，
     //    这一段**消不掉**（除非把已经解析好的 `cpal::Device` 交给引擎，那是接口改动）——
     //    所以这里是「把窗口缩到不可再缩」而不是「消除竞态」，如实记着。
-    let candidate = match found.as_slice() {
-        [] => Candidate::Unavailable {
-            reason: format!(
-                "默认设备背后不是一张物理卡（本进程没有持有任何 /proc/asound 里的播放 PCM）—— \
-                 这通常是 PipeWire/PulseAudio 这类服务型后端：硬件由**服务进程**持有。\
-                 进程内无法把 default 映射到 hw:{HW_PREFIX} 名字（原因与实测见 output_path.rs 的文档）"
-            ),
-        },
-        [(card, dev)] => {
+    let candidate = match resolve_held(&found) {
+        HeldTarget::Unknown(reason) => Candidate::Unavailable { reason },
+        HeldTarget::One { card, dev } => {
             let pcm_id = format!("{HW_PREFIX}CARD={card},DEV={dev}");
             // 只在 cpal 自己枚举得出的设备里选 —— 我们不自己拼 ALSA 名字去打开：
             // 拼错了是一条静默的失败路径，而枚举列表是 cpal/ALSA 报出来的事实。
@@ -328,25 +338,60 @@ fn probe_via_proc(host: &cpal::Host) -> Candidate {
                 },
             }
         }
-        // ⚠️ **多于一台就判「判不出来」，不取第一个。** 同进程里若同时开着两个
-        //    `AudioEngine`（两台不同的卡），「第一个」是 `/proc/asound` 的**遍历顺序**
-        //    决定的；而多子流的卡（`snd-aloop` 有 8 个子流）上打开另一台卡**会成功**
-        //    ⇒ 声音出到错误的设备，而采样率、xrun、时长**全都正常**。
-        //    这正是本模块开头那段「宁可拿不到证据，也不猜」的同一条规矩。
-        //    （今天单引擎故不可达；写成显式的判定是为了让它**继续**不可达。）
-        many => Candidate::Unavailable {
-            reason: format!(
-                "本进程同时持有多台播放 PCM（{}）—— 「default 落在哪一台」不再唯一，\
-                 判定为不可用（本模块宁可判不出来，也不认错设备）",
-                many.iter()
-                    .map(|(c, d)| format!("{HW_PREFIX}CARD={c},DEV={d}"))
-                    .collect::<Vec<_>>()
-                    .join("、")
-            ),
-        },
     };
     drop(probe);
     candidate
+}
+
+/// 「本进程持有的播放 PCM（去重后）」⇒ 该拿哪一台当 `default` 的目标。
+///
+/// 从 [`probe_via_proc`] 里抽出来**只为了可测**：这段判定是**纯逻辑**，原来却嵌在
+/// 「真扫 `/proc` + 真枚举 cpal 设备」的流程里，于是「多于一台 ⇒ 判不出来」这条
+/// 只剩代码层面的推理，构造不出用例（`task-11-fix-report.md` §4 如实记着这一条）。
+/// 抽成纯函数之后，单测可以直接喂构造切片（见本文件的 `held_pcm_resolution`）。
+/// **判定规则一个字都没改**：`probe_via_proc` 只是把那个 `match` 换成了对它结果的 `match`。
+///
+/// ⚠️ **多于一台就判「判不出来」，不取第一个。** 同进程里若同时开着两个
+/// `AudioEngine`（两台不同的卡），「第一个」是 `/proc/asound` 的**遍历顺序**
+/// 决定的；而多子流的卡（`snd-aloop` 有 8 个子流）上打开另一台卡**会成功**
+/// ⇒ 声音出到错误的设备，而采样率、xrun、时长**全都正常**。
+/// 这正是本模块开头那段「宁可拿不到证据，也不猜」的同一条规矩。
+/// （今天单引擎故不可达；写成显式的判定是为了让它**继续**不可达。）
+///
+/// ⚠️ **恰好一台时不做任何「这真是 `default` 那一台吗」的追问** —— 持有一台
+/// **别的** engine 的 PCM 也满足「恰好一台」，那时会认到那一台上，而不是判不出来。
+/// 理由与后果见 [`probe_default_target`] 的「前置条件」那一段。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum HeldTarget {
+    /// 去重后**恰好一台** ⇒ 它是候选（还要拿去 cpal 的枚举里查一次才用得上）。
+    One { card: u32, dev: u32 },
+    /// 一台都没有 / 多于一台 ⇒ 判不出来。附带给用户看的原因。
+    Unknown(String),
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_held(held: &[(u32, u32)]) -> HeldTarget {
+    match held {
+        [] => HeldTarget::Unknown(
+            "默认设备背后不是一张物理卡（本进程没有持有任何 /proc/asound 里的播放 PCM）—— \
+             这通常是 PipeWire/PulseAudio 这类服务型后端：硬件由**服务进程**持有。\
+             进程内无法把 default 映射到 `hw:` 名字（原因与实测见 output_path.rs 的文档）"
+                .to_owned(),
+        ),
+        [(card, dev)] => HeldTarget::One {
+            card: *card,
+            dev: *dev,
+        },
+        many => HeldTarget::Unknown(format!(
+            "本进程同时持有多台播放 PCM（{}）—— 「default 落在哪一台」不再唯一，\
+             判定为不可用（本模块宁可判不出来，也不认错设备）",
+            many.iter()
+                .map(|(c, d)| format!("{HW_PREFIX}CARD={c},DEV={d}"))
+                .collect::<Vec<_>>()
+                .join("、")
+        )),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -384,12 +429,15 @@ fn probe_via_proc(_host: &cpal::Host) -> Candidate {
 ///
 /// # 两段各自的出处
 ///
-/// - **数字写法**这一段是 cpal `canonical_pcm_id` 的镜像（已核实·源码
+/// - **数字写法**这一段是 cpal `canonical_pcm_id` 的**分支镜像**（已核实·源码
 ///   `cpal-0.18.2/src/host/alsa/mod.rs:1696-1711`）。cpal 也经公开的
-///   `HostTrait::device_by_id`（同文件 `:164-168`）暴露了同一个归一化，
-///   但**那条路不查卡名**（`canonical_pcm_id` 对 `CARD=<非数字>` 原样返回），
-///   所以卡名那段无论如何都得自己写。两段都写成纯函数、各自可单测，
-///   比「先 `device_by_id` 再补一次卡名」少一层接力。
+///   `HostTrait::device_by_id`（同文件 `:164-169`）暴露了同一个归一化，
+///   但**那条路只做名字归一化、不把卡名解析成卡号** —— `canonical_pcm_id`
+///   在 `CARD=` 后面不是数字时最多补一个 `DEV=0`（同文件 `:1702-1705`：
+///   `hw:CARD=Loopback` → `hw:CARD=Loopback,DEV=0`，写全了则**原样返回**），
+///   名字里是卡名就还是卡名 ⇒ 匹配不上 cpal 枚举出的 `hw:CARD=<数字>,DEV=<数字>`
+///   ⇒ 卡名那段无论如何都得自己写（查 `/proc/asound/cards` 换成卡号）。
+///   两段都写成纯函数、各自可单测，比「先 `device_by_id` 再补一次卡名」少一层接力。
 /// - 镜像若与 cpal 的真实行为有出入，后果**有上界**：这个返回值只用来
 ///   *查* cpal 的枚举，查不到就退回「原样报错」，与今天同一个下场，不会更坏。
 /// - **卡名**那一段查 `/proc/asound/cards`（见 [`card_index_by_name`]）。
@@ -407,8 +455,17 @@ pub fn canonicalize_pcm_id(pcm_id: &str) -> Option<String> {
 
 /// `hw:3,0` / `hw:CARD=3` 这类**数字**写法 → cpal 枚举的形式。`None` = 没改动。
 ///
-/// 逐字镜像 `cpal-0.18.2/src/host/alsa/mod.rs:1696-1711` 的分支
-/// （`CARD=` 后面是数字、或位置写法），只把「返回原串」改成 `None`。
+/// **按分支**镜像 `cpal-0.18.2/src/host/alsa/mod.rs:1696-1711` 的两种形状
+/// （`CARD=` 只缺 `DEV`、位置写法），但**两处刻意更严**：
+///
+/// 1. **判据不同**：cpal 认的是 `card_str.contains('=')`，这里认 `strip_prefix("CARD=")`
+///    ⇒ `hw:FOO=3` 这种 cpal 会补成 `hw:FOO=3,DEV=0`，这里返回 `None`；
+/// 2. **卡段必须是数字**：cpal 的 `CARD=` 分支不看 `=` 后面是什么，位置写法那支
+///    也只要求 `DEV` 能解析 ⇒ `hw:CARD=Loopback`、`hw:,0`、`hw:abc,0` 这三种
+///    cpal 都会补出一个**查不到设备**的名字，这里一律 `None`（卡名那种留给下一段）。
+///
+/// 剩下的差别只有「返回原串」vs「返回 `None`」：cpal 不需要改时回原串，这里回
+/// `None`（调用方按「原样使用」处理）—— 对调用方是同一件事。
 fn canonicalize_numeric_pcm_id(pcm_id: &str) -> Option<String> {
     let (prefix, rest) = pcm_id.split_once(':')?;
     let (card_str, device_str) = match rest.split_once(',') {
@@ -789,6 +846,59 @@ appl_ptr    : 13568
         // 没有卡的机器、以及只有描述行的输入
         assert!(parse_cards("").is_empty());
         assert!(parse_cards("--- no soundcards ---\n").is_empty());
+    }
+
+    /// `resolve_held` 的三支：**构造切片就能钉住**，不需要真 `/proc`、真设备。
+    ///
+    /// 这条存在的理由：原来这段判定嵌在 `probe_via_proc` 里（要真扫 `/proc`、
+    /// 真枚举 cpal 设备），于是「多于一台 ⇒ 判不出来」只能靠代码推理 ——
+    /// `task-11-fix-report.md` §4 把它列进了「我不能排除的」。抽出来之后它可测了。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_pcm_resolution() {
+        assert!(
+            matches!(resolve_held(&[]), HeldTarget::Unknown(_)),
+            "一台都没持有 ⇒ 判不出来（服务型后端那条：硬件不在本进程名下）"
+        );
+
+        assert!(
+            matches!(resolve_held(&[(3, 0)]), HeldTarget::One { card: 3, dev: 0 }),
+            "恰好一台 ⇒ 就是它（下一站是 cpal 的枚举）"
+        );
+        // ⚠️ 这一条钉的是**一条已知的、比文档更弱的边界，不是 bug**：持有一台
+        //    **别的** engine 的 PCM 也满足「恰好一台」⇒ 照样被当成 default 的目标。
+        //    今天同时只有一个 AudioEngine 且它在探针之后才建流，故不可达；
+        //    把「不可达」写成断言，是为了让它**继续**不可达（见 probe_default_target
+        //    的「前置条件」那一段）。
+        assert!(
+            matches!(resolve_held(&[(2, 7)]), HeldTarget::One { card: 2, dev: 7 }),
+            "单台就是别的 engine 的 PCM 时也会被认下 —— 如实钉住，不粉饰"
+        );
+
+        match resolve_held(&[(1, 0), (3, 0)]) {
+            HeldTarget::Unknown(msg) => {
+                assert!(
+                    msg.contains("hw:CARD=1,DEV=0") && msg.contains("hw:CARD=3,DEV=0"),
+                    "多台时必须把**每一台**都列进原因里（用户要能照着改），实得 {msg:?}"
+                );
+                assert!(
+                    msg.contains("多台") || msg.contains("不再唯一"),
+                    "原因要说明是「哪一台不再唯一」，不能只说「不可用」，实得 {msg:?}"
+                );
+            }
+            other => panic!("多于一台 ⇒ 必须判不出来、不取第一个，实得 {other:?}"),
+        }
+        // 三台也一样：判定只看「几台」，与 `/proc` 的遍历顺序无关 ——
+        // 而原因里必须三台**全在**（不是「第一个 + 省略号」）。
+        match resolve_held(&[(0, 0), (2, 7), (3, 0)]) {
+            HeldTarget::Unknown(msg) => assert!(
+                ["hw:CARD=0,DEV=0", "hw:CARD=2,DEV=7", "hw:CARD=3,DEV=0"]
+                    .iter()
+                    .all(|p| msg.contains(p)),
+                "三台时也要一台不落地列出来，实得 {msg:?}"
+            ),
+            other => panic!("三台 ⇒ 判不出来，实得 {other:?}"),
+        }
     }
 
     /// 规范化：**只在确实需要换、且换得出来时才换**。
