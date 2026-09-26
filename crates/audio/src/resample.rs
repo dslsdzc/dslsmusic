@@ -198,8 +198,12 @@ impl StreamResampler {
         // 目标：rubato 自己对「处理完整段」的口径也是这个式子
         // （`process_all_into_buffer` 里 `expected_output_len = ceil(ratio * input_len)`），
         // 用同一个式子才能保证我们和它算出的时长一致。
-        // 除以 `CHANNELS` 是整的：不足一帧的那半个样本（若真出现）在这里被舍掉 ——
-        // 它是 1/88200 秒，且没有右声道可配，留着也没有意义。
+        //
+        // ⚠️ 除不尽时（调用方喂进来的样本数是**奇数**，即最后那半个帧没有右声道）
+        // 这里是**向下取整**：下面补静音时那半个样本会配到一个静音的右声道，
+        // 于是重采样器会多算出一丁点输出，而 `pump` 的 `cap` 把它截掉。
+        // 截掉是对的 —— 半个帧不构成一帧时长，把它算进"应有"里反而会让
+        // 输出比输入长。
         let frames = self.total_samples / CHANNELS;
         let expected = (self.inner.resample_ratio() * frames as f64).ceil() as usize;
         let block = self.inner.input_frames_next() * CHANNELS;
