@@ -2411,11 +2411,17 @@ rust-version.workspace = true
 cpal = "0.18"
 # ⚠️ 刻意钉在 0.5 —— 0.6 已发布（0.6.1）但 API 与本计划中的代码未经核对。
 # 升级是 dsls-audio 内部的封闭改动，v1 不冒这个险。
-symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "isomp4", "ogg", "vorbis", "wav"] }
+# ⚠️ `pcm` 必须显式列出：`wav` 只是**容器**，PCM 解码器是**独立的 feature**。
+# 已核实：现在能解码 WAV 纯属默认 feature 没被关掉——一旦有人加
+# `default-features = false`，WAV 会**静默失效**（能打开文件、解不出样本）。
+symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "isomp4", "ogg", "vorbis", "wav", "pcm"] }
 # 已核实：reqwest 最新稳定版是 0.13.5
 reqwest = { version = "0.13", features = ["stream", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 # 无锁 SPSC 环形缓冲。**音频回调线程里绝不允许加锁**（设计文档 §16.2 / 本计划 Global Constraints）
+# 已核实："0.4" 解析到 0.4.8。**不要写死 =0.4.9——那个版本已被 yank。**
+# 最新是 0.5.2；本计划按 0.4 的 API 写（traits::{Producer,Consumer,Observer,Split}
+# 在 0.4 里已核实存在）。升 0.5 是 dsls-audio 内部的封闭改动，v1 不冒这个险。
 ringbuf = "0.4"
 anyhow.workspace = true
 log.workspace = true
@@ -2722,19 +2728,36 @@ impl AudioEngine {
         let device = host
             .default_output_device()
             .context("没有可用的音频输出设备")?;
-        let config = device.default_output_config()?;
-        log::info!("音频输出: {} @ {}Hz", device.name()?, config.sample_rate().0);
+        let supported = device.default_output_config()?;
+        let sample_format = supported.sample_format();
+        let config: cpal::StreamConfig = supported.into();
+        // ⚠️ cpal 0.18 已删除 `DeviceTrait::name()`（已核实·编译：
+        //    error[E0599]: no method named `name` found for struct `Device`），
+        //    换成 `description()?` 再取 `.name()`。
+        // ⚠️ `SampleRate` 在 0.18 是**裸 `u32` 别名**，不是 newtype
+        //    （已核实·源码 cpal-0.18.2/src/lib.rs:220-233），
+        //    所以 `config.sample_rate().0` 编译不过，要写 `config.sample_rate`。
+        log::info!(
+            "音频输出: {} @ {}Hz {}ch fmt={:?}",
+            device.description()?.name(),
+            config.sample_rate,
+            config.channels,
+            sample_format
+        );
 
         // ~4 秒缓冲（立体声 44.1kHz）。**split 之后消费端移进回调，全程无锁。**
         let (mut producer, mut consumer) = AudioRing::new(44100 * 2 * 4).split();
 
-        let channels = config.channels() as usize;
+        let channels = config.channels as usize;
         // ⚠️ 回调内**绝不分配**：这里一次性预分配足够容量，
         //    回调里的 resize 就不会触发重新分配（回调缓冲远小于 8192 帧）。
         let mut scratch: Vec<i16> = Vec::with_capacity(8192 * 2);
 
+        // ⚠️ 0.18 的 `config` 是**按值传**的（旧版是引用），且多了第 4 个参数
+        //    `timeout: Option<Duration>`。已核实·源码 cpal-0.18.2/src/traits.rs:318-329。
+        //    错误类型也变了：没有 `BuildStreamError` 了，统一是 `cpal::Error`。
         let stream = device.build_output_stream(
-            &config.into(),
+            config,
             move |out: &mut [f32], _| {
                 let frames = out.len() / channels;
                 scratch.resize(frames * 2, 0); // 引擎内部固定立体声
@@ -2971,16 +2994,6 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     }
     println!("\n播放结束。xrun 计数 = {}（必须为 0）", engine.xrun_count());
     Ok(())
-}
-```
-
-`crates/audio/src/lib.rs` 追加一个方法：
-
-```rust
-impl AudioEngine {
-    pub fn ring_available(&self) -> usize {
-        self.ring.lock().map(|r| r.available()).unwrap_or(0)
-    }
 }
 ```
 
