@@ -92,7 +92,10 @@ dslsmusic/
 ```toml
 [workspace]
 resolver = "3"
-members = ["crates/platform", "app"]
+# ⚠️ 用 glob 而不是逐个列 —— Task 5/6/8 会各自新建 crate，
+# 逐个列的话每加一个都要记得回来改这里，漏一次 cargo 就报
+# "package not found"。glob 让新 crate 自动成为成员。
+members = ["crates/*", "app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -1202,6 +1205,8 @@ Expected: 编译失败（crate 尚不存在）。
 name = "dsls-provider-api"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
@@ -1478,6 +1483,8 @@ Expected: 编译失败（crate 尚不存在）。
 name = "dsls-provider-netease"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 dsls-provider-api = { path = "../provider-api" }
@@ -1982,6 +1989,8 @@ Expected: 编译失败（crate 尚不存在）。
 name = "dsls-audio"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # 已核实：cpal 最新稳定版是 0.18.2
