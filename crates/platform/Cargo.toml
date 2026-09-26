@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 sdl3.workspace = true
 wgpu.workspace = true
 # Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device

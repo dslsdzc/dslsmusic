@@ -263,6 +263,7 @@ dependencies = [
 name = "dsls-platform"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "log",
  "pollster",
  "raw-window-handle",

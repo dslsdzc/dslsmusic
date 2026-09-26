@@ -8,3 +8,9 @@
 //! 目标，**M0–M1 不会创建它**，不是当前的不变量。
 
 pub mod capability;
+pub mod gpu;
+pub mod window;
+
+pub use capability::{AdapterInfo, RenderTier, detect_tier, is_software_adapter};
+pub use gpu::{GpuContext, init_gpu};
+pub use window::{PlatformEvent, PlatformWindow};
