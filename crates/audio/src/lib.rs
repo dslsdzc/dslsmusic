@@ -60,8 +60,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 只有 3.675 秒）。
 ///
 /// ⚠️ 容量单位是**帧**（`AudioRing::new` 收帧数），所以这里是 `率 × 秒`
-/// —— 前一版 ring 存的是散装样本，那一版这里是 `率 × 声道数 × 秒`。
-/// 两边的**字节数相同**（一帧 = 2 个样本）。
+/// —— 前一版 ring 存的是散装样本，那一版这里是 `率 × 2 × 秒`。
+/// **那个 2 是 `resample::CHANNELS`（内容声道数这个常量），不是设备报的声道数**
+/// （本机设备报 1..64 声道的全部组合），所以两边的**字节数恒相同**
+/// （一帧 = 2 个样本，而那个 2 与设备无关）—— 别把这句读成「只在立体声设备上成立」。
 const RING_SECONDS: usize = 4;
 
 pub struct AudioEngine {
@@ -285,7 +287,9 @@ impl AudioEngine {
 
         // 缓冲时长按**输出率**折算 —— 见 `RING_SECONDS` 的说明。
         // ⚠️ 容量按**帧**算：`AudioRing::new` 收的是帧数（一帧 4 字节 = 两个 i16），
-        //    所以这里**不再乘声道数** —— 乘了就是 8 秒缓冲，而字节数是改前的两倍。
+        //    所以这里**不再乘 2**（前一版乘的是 `resample::CHANNELS`，**内容**声道数
+        //    那个常量，不是设备报的声道数 —— 见 `RING_SECONDS`）——
+        //    乘了就是 8 秒缓冲，而字节数是改前的两倍。
         // **split 之后消费端移进回调，全程无锁。**
         let ring_capacity_frames = output_rate as usize * RING_SECONDS;
         let (producer, consumer) = AudioRing::new(ring_capacity_frames).split();
@@ -371,6 +375,18 @@ impl AudioEngine {
     /// （每个 packet 都是偶数个），重采样器的 `conv` 也有整帧断言。所以这条
     /// 告警一旦出现，它同时是那句「正常路径恒为偶数」的**绊线** ——
     /// 说明有别的调用方按奇数边界喂了它，而**流的末尾丢了半个帧**。
+    ///
+    /// # ⚠️ 本方法**不清空** `pending`，也**不认流边界**
+    ///
+    /// 它只报警，**一个字节的状态都不动**。所以同一个 [`AudioRingProducer`]
+    /// 接着推**下一条流**时，那个样本**不是消失而是错配**：它被配成
+    /// `(这条流的最后一个样本, 下一条流的第一个样本)` ⇒ **下一条流整条 L/R 互换**，
+    /// 而 `dropped_frames()` 与 `xrun_count()` 都读不出来（见 `pending` 字段的
+    /// 「一个生产端只喂一条流」）。
+    ///
+    /// ⇒ 「复用一个引擎连着播多条流」（v2 的预加载 / 无缝衔接）**必须在这里
+    /// 自己保证边界干净**：要么每条流一个生产端，要么先补一个重置。
+    /// **本方法给不了这个保证**，它只是那条 `warn` 的发声口。
     pub fn finish_stream(&mut self) {
         if let Some(rs) = &mut self.resampler {
             self.conv.clear();
@@ -381,9 +397,12 @@ impl AudioEngine {
         if self.producer.has_pending_sample() {
             log::warn!(
                 "流的末尾有**半个帧**（总样本数是奇数）：最后那一个样本凑不成一帧，\
-                 不会进 ring、也不会被计入丢弃帧数 —— **它播不出来**。\
+                 不会进 ring、也不会被计入丢弃帧数 —— **在这条流里它播不出来**。\
                  正常路径不会发生（解码与重采样都按整帧产出），\
-                 若出现说明喂进 ring 的那条流长度是奇数。"
+                 若出现说明喂进 ring 的那条流长度是奇数。\
+                 ⚠️ 若这条流之后还有**同一个生产端**推来的数据，它不会被丢掉而是被\
+                 配进那条流的帧里 ⇒ **那条流整条 L/R 互换**，且没有任何计数器会变\
+                 —— 这条日志是它唯一的痕迹。"
             );
         }
     }
@@ -471,6 +490,10 @@ impl AudioEngine {
     /// **本方法存在的唯一理由**：丢样本是**静默**的 —— WAV 文件完整、
     /// `xrun_count` 为 0、波形统计正常，都**不代表你听到的等于我们产出的**。
     /// `dropped_frames() == 0` 才是这一条的唯一证据（设计文档 §16.2）。
+    ///
+    /// ⚠️ **但「为 0」不等于「一个样本都没少」**：流的末尾还可能有**半个帧**
+    /// （总样本数是奇数时最后那一个样本）—— 它没被丢弃、不算在这条口径里，
+    /// 却也播不出来，见 [`AudioEngine::finish_stream`] 的收尾那一节。
     ///
     /// 口径：**丢的永远是整帧** —— ring 的存储单元是一帧立体声
     /// （见 [`AudioRing`]），所以不存在「丢掉半个帧」。这个数因此是
@@ -806,8 +829,11 @@ where
 /// （0.4 ns/样本 vs 20.0 ns/样本，各 800 万样本）。本函数全程无锁、
 /// 无分配、无 IO（设计文档 §16.2）。
 ///
-/// 前置条件（唯一的调用点 `build_output` 两条都满足；违反了会 panic）：
+/// 前置条件（唯一的调用点 `build_output` 两条都满足）：
 /// `channels >= 1`，且 `scratch.len() >= 1`（至少要装得下一帧）。
+/// 违反第一条会 panic（`out.len() / channels` 除零）；违反第二条**不会** ——
+/// `n` 上挂着 `.min(scratch.len())`（见那里的注释），那一档走的是
+/// 「饿死 + 补静音 + 记一次 underrun」。**别把这条写成「违反了会 panic」**。
 ///
 /// 环里承载的是**2 声道交错**的样本，而它的存储单元是**整帧**
 /// （[`StereoFrame`]）。所以本函数按帧取、按帧配对 —— 取数边界**天生**是整帧，
@@ -840,14 +866,23 @@ fn fill_from_ring<T>(
         //    （环的存储单元就是帧），所以 `want.min(avail)` 天然是整帧数。
         //    前一版这里要把样本数**向下取到偶数**（`& !1`）才能保证不把半个
         //    帧取出来丢掉 —— 那个下取偶本身就是当年那个声道互换 bug 的补丁。
-        let n = want.min(consumer.available_frames());
+        // ⚠️ **`.min(scratch.len())` 是把本函数的前置条件落到代码上。**
+        //    前置条件说 `scratch.len() >= 1`（见函数文档）。不满足时 `want` 仍可能
+        //    是 1（`cap_frames` 的 `.max(1)`），而 `n` 只由 `want` 与 `avail` 决定
+        //    ⇒ 没有这一条，`scratch[..n]` 会在**音频回调线程上 panic**（n=1 > len=0）。
+        //    加上它：n = 0 ⇒ `got < want` ⇒ 走「饿死」那一档（补静音 + 记一次
+        //    underrun），**同一个失效从 panic 降级成静音**。
+        //    前置条件成立时它是**空操作**：`cap_frames = scratch.len().max(1)`
+        //    ⇒ `want <= scratch.len()`。唯一的调用点 `build_output` 传 4096 帧。
+        let n = want.min(consumer.available_frames()).min(scratch.len());
         let got = consumer.pop_raw_frames(&mut scratch[..n]);
 
         // ⚠️ 迭代 `scratch` 本身而不是写下标（clippy 的 `needless_range_loop`）：
-        //    用 `.take(want)` 而不是 `scratch[..want]` —— 后者在 `scratch` 为空、
-        //    `want == 1`（`cap_frames` 的 `.max(1)`）时会**多出一条 panic 路径**，
-        //    而那正是前置条件允许范围之外、旧写法又恰好不会炸的那一档。
-        //    `f >= got` 时读到的 `s` 是 scratch 里的旧值，但那个分支**不读它**。
+        //    用 `.take(want)` 而不是 `scratch[..want]` —— 上面那条 `.min(scratch.len())`
+        //    只夹住了 `n`，`want` 仍可能比 `scratch` 长（`scratch` 为空时
+        //    `cap_frames` 的 `.max(1)` 会让 `want == 1`），那一档 `scratch[..want]`
+        //    会直接 panic。`f >= got` 时读到的 `s` 是 scratch 里的旧值，
+        //    但那个分支**不读它**。
         for (f, s) in scratch.iter().take(want).enumerate() {
             let (l, r) = if f < got {
                 (s.l, s.r)

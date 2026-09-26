@@ -780,7 +780,14 @@ fn start_capture(
     };
     // 环容量按采集率算（同 `AudioEngine` 的理由：按秒定，不按帧数定）。
     // ⚠️ **容量单位是帧**，所以是 `率 × 秒`（不是 `率 × 声道数 × 秒`）——
-    //    后者在帧化之后是 12 秒缓冲，而字节数是这里的两倍。
+    //    这里的 `channels` 是**设备**声道数（调用方 `start_capture(.., engine.output_channels(), ..)`
+    //    传进来的），**不是** `AudioEngine` 那个 `resample::CHANNELS` 常量 2。
+    //    ⇒ 「两版字节数相同」这句话在**这里**只对 2 声道设备成立：
+    //      现在恒为 `率 × 6` 帧 = `24 × 率` 字节；前一版是 `率 × N × 6` **样本**
+    //      = `12 × N × 率` 字节 ⇒ 现在是前一版的 `2 / N`（N=2 时相同、
+    //      N=1 时是 2 倍、N>2 时更小）。
+    //    （把 `率 × 声道数 × 秒` 原样写进新的帧单位更糟：那是 `6 × N` 秒的内容、
+    //      字节数是现在的 N 倍 —— N=2 时才恰好是「12 秒 / 两倍」。）
     let ring = AudioRing::new(rate as usize * CAPTURE_SECONDS);
     let (producer, consumer) = ring.split();
     let errors = Arc::new(AtomicU64::new(0));

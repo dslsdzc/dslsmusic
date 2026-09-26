@@ -29,8 +29,15 @@
 //! 标了这条边界。）
 //!
 //! ⚠️ 这两条是**测试**不是证明：覆盖面到此为止（容量、序列长度、并发场景不在这
-//! 条测试里）。但它们**不是恒真的** —— 本次改动做过变异测试，把
-//! `push_samples` 按四种方式破坏后这两条都变红了，记录见
+//! 条测试里）。但它们**不是恒真的** —— 本次改动做过变异测试。
+//! 破坏 `push_samples` 的三种方式都让本文件的用例变红：**性质 2**
+//! （`overflow_drops_whole_frames_only`）被 M1/M2/M3 三种全抓住，**性质 1**
+//! （`arbitrary_split_points_never_mispair_frames`）被其中 M1/M2 抓住；
+//! 第四种变异（M4）动的是**回调**的 L/R，不在 `push_samples` 上，由 `lib.rs`
+//! 里的 `callback_*` 用例负责，**本文件不声称覆盖它**。
+//!
+//! ⚠️ 那份记录是**记录，不是可复现的产物**：变异在 `/tmp` 的隔离副本上做，
+//! 副本没有留下来。逐条结果（哪个变异让哪些用例变红）见
 //! `.superpowers/sdd/task-ring-frames-report.md` 的「变异测试证据」一节。
 
 use dsls_audio::{AudioRing, AudioRingConsumer, StereoFrame};

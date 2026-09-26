@@ -112,6 +112,27 @@ pub struct AudioRingProducer {
     ///
     /// 它最多积压 1 个（新的一次推送就会把它消费掉，或连同新数据一起被丢），
     /// 不会随调用增长。
+    ///
+    /// # ⚠️ 前置条件：**一个生产端只喂一条流**
+    ///
+    /// 本字段**不认识流边界**：那个样本在下一次推送时会被配成帧，而「下一次推送」
+    /// **可以已经是另一条流的数据**。于是，若流 N 的总样本数是**奇数**：
+    ///
+    /// 1. 流 N 结束时 `pending` 扣着它的**最后一个样本** —— 那是**左**声道；
+    /// 2. 接着推**流 N+1** 时，它的第一个样本（本该是流 N+1 的**左**声道 L0）
+    ///    被写进这一帧的 `r`：`StereoFrame { l: 流N的末样本, r: L0 }`；
+    /// 3. 此后每帧都错开半个帧：`(R0, L1)`、`(R1, L2)`… ⇒ **流 N+1 整条 L/R 互换**。
+    ///
+    /// 这个失效档**比丢失更糟：它是静默的损坏，不是丢失。** `dropped_frames()` 保持 0、
+    /// `underruns()` 保持 0、`available_frames()` 正常、帧的顺序也正常 ——
+    /// 而且 **`has_pending_sample()` 读不出它**：配帧之后那个标志只反映**当前**
+    /// 这条流的长度奇偶（为真也可能是流 N+1 自己的奇数尾巴），与这次错位无关。
+    /// 唯一的痕迹是 [`crate::AudioEngine::finish_stream`] 在流边界记的那一条 `warn`。
+    ///
+    /// ⇒ **跨流复用同一个生产端的调用方必须自己保证边界上 `pending` 为空**
+    /// （即上一条流的总样本数是偶数）。今天 `app` 是「一个 `play` 建一个
+    /// `AudioEngine`」，走不到这里；而 v2 的预加载 / 无缝衔接正是「一个引擎连着
+    /// 放两首」—— 那时候先补一个重置（或每条流一个生产端），再谈别的。
     pending: Option<i16>,
 }
 
@@ -125,7 +146,7 @@ impl AudioRingProducer {
     /// 丢弃数就是 `想推的帧数 − 真进环的帧数`，**没有配平、没有 `% 2`**。
     ///
     /// ringbuf 的语义是**新数据被丢弃**（保留先到的，见
-    /// `counts_overflow_and_keeps_oldest`），所以丢掉的是本次推送的**末尾**：
+    /// `counts_dropped_frames_and_keeps_oldest`），所以丢掉的是本次推送的**末尾**：
     /// 有一帧被丢时，它的 `l` 与 `r` **一起**被丢 —— 不存在「留下半个」。
     ///
     /// # `data` 的长度允许是**奇数**
@@ -135,11 +156,17 @@ impl AudioRingProducer {
     /// —— 注意它**不在环里**，所以 `available_frames()` 数不到它，
     /// 它**也不算丢弃**（没被扔掉，只是晚一步）。
     ///
-    /// ⚠️ **它的失效档**：一个流的**总**样本数是奇数时，最后那一个样本永远
-    /// 等不到它的右声道。它既不会进环、也不会被计进 `dropped_frames`
+    /// ⚠️ **它的失效档**：一个流的**总**样本数是奇数时，最后那一个样本
+    /// **在这条流里**等不到它的右声道。它既不会进环、也不会被计进 `dropped_frames`
     /// ——它没被「丢弃」，是这条流自己不成帧。**它能被看见**：
-    /// [`Self::has_pending_sample`] 在那一刻为真，`AudioEngine::finish_stream`
-    /// 就是靠它把这条**本来静默的**损失变成一条日志。
+    /// [`Self::has_pending_sample`] 在那一刻为真，
+    /// [`crate::AudioEngine::finish_stream`] 就是靠它把这条**本来静默的**损失
+    /// 变成一条日志。
+    ///
+    /// ⚠️ 但「等不到」有一个前提：**这条流之后不再由同一个生产端推数据**。
+    /// 若接着推的是**下一条流**，那一个样本不是消失，而是被配进下一条流的帧里
+    /// —— 后果是**下一条流整条 L/R 互换**，而且**没有任何读数**会变。
+    /// 完整的失效档与前置条件见 `pending` 字段的「一个生产端只喂一条流」。
     pub fn push_samples(&mut self, data: &[i16]) {
         // 概念上要推的是 `[pending] ++ data`，按 (L,R) 两两成帧。
         // `first` 是 `pending` 与新数据第一个样本配成的那一帧；`rest` 是剩下的
@@ -178,8 +205,23 @@ impl AudioRingProducer {
                 .map(|p| StereoFrame { l: p[0], r: p[1] }),
         );
         let pushed = self.inner.push_iter(frames);
-        debug_assert!(pushed <= total, "定长推送：不可能比想推的还多");
-
+        // ⚠️ 这里**故意没有**「推满了没有」的断言。三条理由，按重要性排：
+        //
+        // ① 前一版那句 `debug_assert!(pushed <= total)` 是**同义反复** ——
+        //    `total` 就是上面那个迭代器的长度（`first` 的 0/1 + `rest.len() / 2`），
+        //    `push_iter` 又永远不会返回比迭代器更长的东西 ⇒ **它一个输入都抓不到**。
+        // ② 它替换掉的那条（`debug_assert_eq!(pushed, take, "定长推送：能收多少就收多少")`）
+        //    在旧结构里**有承重**：那时 `dropped` 是拿**算出来的** `take` 相减
+        //    （`total - take - …`），推送数与它不一致会让计数**静默**算错。
+        //    现在 `dropped` 直接用**实际的** `pushed`（下一行）—— 推送数就是计数的
+        //    输入，「算出来的」与「实际的」不再是两个东西，承重搬进了代码本身。
+        // ③ 想补一条等价检查的话，**不能**写成 `pushed == total || is_full()`：
+        //    消费端在这两行之间把环抽走几帧是合法的，`is_full()` 读到的是**另一个
+        //    时刻**的环 —— ringbuf 自己的文档就说这个结果「可能随时失效」
+        //    （已核实·源码 `ringbuf-0.4.8/src/traits/observer.rs:69-75`）⇒ 那条断言会
+        //    **误报**（decode 线程上 panic）。竞态下安全的形式要在 `push_iter`
+        //    **之前**读一次 `vacant_len()`（`pushed >= total.min(room)`），那要加一行
+        //    读；本轮只改注释，所以先不加。
         let dropped = (total - pushed) as u64;
         if dropped > 0 {
             self.dropped_frames.fetch_add(dropped, Ordering::Relaxed);
@@ -212,7 +254,7 @@ impl AudioRingProducer {
 
     /// **累计丢掉的帧数**（不是「溢出事件次数」）。
     ///
-    /// 一次推送里丢了 3 帧就加 3。口径与 [`AudioEngine::dropped_frames`]
+    /// 一次推送里丢了 3 帧就加 3。口径与 [`crate::AudioEngine::dropped_frames`]
     /// 一致（那个方法转发到这里）。
     ///
     /// ⚠️ **前一版这个方法叫 `overflows()`，口径是「事件次数」。** 改成帧数
@@ -221,7 +263,7 @@ impl AudioRingProducer {
     /// 个问题——「丢了一次」和「丢了一千帧」是两个量级的事故。
     /// 旧口径存在的理由（样本计数被奇偶配平污染过 ±1）随帧化一起消失了。
     ///
-    /// ⚠️ 因此它与 [`AudioEngine::xrun_count`] **不同单位**：那个按事件计，
+    /// ⚠️ 因此它与 [`crate::AudioEngine::xrun_count`] **不同单位**：那个按事件计，
     /// 这个按帧计。两者本来也不是一个量（一个数环被抽干、一个数环被填满），
     /// 数字从来没有可比性。**唯一要做的事是判是否为 0。**
     pub fn dropped_frames(&self) -> u64 {
@@ -236,7 +278,11 @@ impl AudioRingProducer {
     ///
     /// ⚠️ **只可能在流的末尾为真**：只要还有下一次推送，它就会被配成帧
     /// （或连同新数据一起被丢）。为真即「这条流**总**样本数是奇数，最后那一个
-    /// 样本永远播不出来」——`AudioEngine::finish_stream` 靠它报警。
+    /// 样本播不出来」——[`crate::AudioEngine::finish_stream`] 靠它报警。
+    ///
+    /// ⚠️ **它读不出跨流那一次错位**（见 `pending` 字段的前置条件）：配帧之后
+    /// 这个标志只反映**当前**这条流的长度奇偶 —— 为真也可能是这条流自己的奇数
+    /// 尾巴，为假则说明这一次推送收尾收得干净。**两种取值都与上一次错位无关。**
     pub fn has_pending_sample(&self) -> bool {
         self.pending.is_some()
     }
@@ -336,8 +382,14 @@ mod tests {
         assert_eq!(out, [StereoFrame::SILENT; 4]);
     }
 
+    /// 环满时**新数据被丢弃**、先到的留下；计的是**帧数**。
+    ///
+    /// ⚠️ 本测试前一版叫 `counts_overflow_and_keeps_oldest` —— 名字里的
+    /// 「overflow」是旧口径（按事件计），帧化时口径与名字一起改了。
+    /// 改名时留这一行是为了让按旧名字搜索的人找到这里（本仓把测试名当规格读，
+    /// 旧名字出现在历史 brief / 报告 / 计划里，那些是记录，不改）。
     #[test]
-    fn counts_overflow_and_keeps_oldest() {
+    fn counts_dropped_frames_and_keeps_oldest() {
         // ringbuf 的语义：环满之后**新数据被丢弃**（不是挤掉最旧的）
         let ring = AudioRing::new(4); // 4 帧 = 8 个样本
         let (mut prod, mut cons) = ring.split();
