@@ -1029,9 +1029,12 @@ pub mod metrics;
 
 `app/src/main.rs` 顶部改为 `use dslsmusic::metrics;`，并删掉 `mod metrics;`。
 
-> ⚠️ **实现前必读**：`app/src/main.rs` 里有**三条 `continue` 路径**
-> （`Timeout|Occluded` 一条、`Outdated|Lost` 一条、以及 `Suboptimal` 一条），
-> 它们都在 `begin_frame()` 之后、`end_frame()` 之前跳出循环。
+> ⚠️ **实现前必读**：`app/src/main.rs` 里有**两条 `continue` 路径**
+> （`Timeout|Occluded`、`Outdated|Lost`），它们都在 `begin_frame()` 之后、
+> `end_frame()` 之前跳出循环。
+>
+> （注：早先此处写「三条」并列入 `Suboptimal`——**那是错的**。`Suboptimal`
+> 修复后返回纹理并**落到 `end_frame`**，那些帧是被采样的。）
 > **真实的 `FrameMetrics` 会看到未配对的 `begin_frame`。**
 > 你的实现必须容忍这一点——例如把 `begin_frame` 只当作「记下起点」，
 > 而让 `end_frame` 成为唯一的样本产出点；**或**把配对责任移到调用方。
@@ -1044,7 +1047,7 @@ pub mod metrics;
 `app/src/metrics.rs`：
 
 ```rust
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// 环形缓冲容量：约 10 秒 @60fps。
 const CAPACITY: usize = 600;
@@ -1140,12 +1143,11 @@ pub fn percentile(sorted: &[f32], p: f32) -> f32 {
 }
 
 /// 供后续 GPU timestamp 查询使用；GLES 后端不支持时回退到 CPU 计时（设计文档 §16.5）。
+///
+/// 注意 `target_fps = 0` 会返回 `inf`。v1 无调用方，等它有了调用方再补测试与守卫。
 pub fn frame_budget_ms(target_fps: u32) -> f32 {
     1000.0 / target_fps as f32
 }
-
-#[allow(dead_code)]
-fn _assert_duration_used(_: Duration) {}
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
@@ -1155,6 +1157,18 @@ cargo test -p dslsmusic --test metrics
 ```
 
 Expected: 4 passed。
+
+> ⚠️ **两条测量语义（审查实测确认，M3 之前必须知道）**：
+>
+> 1. **`n=600` 时 p99 是第 6 差的样本**——实测 `[16.7;599] + [1002.0]` 的 p99
+>    仍是 16.7，**要 ≥7 个慢样本才能推动它**。孤立的一次卡顿 p99 看不见，
+>    **只有 `max` 能抓到**。§16.5 说「要看 p99 而非平均值」仍然成立，
+>    但**不能只靠 p99**。
+> 2. **测量窗口排除了 `poll_events` 与推迟的 `configure`**（两者都在
+>    `begin_frame` 之前，见 `main.rs`）。所以**事件循环与重配的停顿对五个
+>    统计量全部不可见**——而那正是 **M3 玻璃原型要反复触发的区域**。
+>    若要让那类停顿进入统计，需把 `begin_frame()` 上移到 `poll_events` 之前。
+>    **这是 M3 前要重新决定的事，不是现在改。**
 
 - [ ] **Step 6: 运行并观察真实数据**
 
