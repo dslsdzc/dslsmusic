@@ -3392,6 +3392,86 @@ git commit -m "feat(audio): 无锁 AudioRing + symphonia 解码 + cpal 输出"
 
 ---
 
+## Task 10: 采样率对齐 —— 按源率建流，设备不支持才重采样
+
+> **为什么有这个任务**：Task 9 的实现者量出来一个缺陷 —— **`dsls-audio` 不重采样**：
+> `decode_to_i16` 按**源**采样率产出，而 `AudioEngine` 按**设备**采样率建流。
+> ⇒ **44.1kHz 的歌在 48kHz 设备上放 1.0884 倍速、+1.46 半音**，
+> **而 xrun 恒 0、无任何告警**。实测：42.893 秒的歌 **39.4 秒放完**。
+>
+> **用户裁决：「不是最省而是最好」+「连 ③ 一起」。** 所以本任务按音质最优做，
+> **不是**按最省事做。
+
+**Files:**
+- Modify: `crates/audio/Cargo.toml`（只加 `rubato`）
+- Modify: `crates/audio/src/lib.rs`（`AudioEngine` 构造 + 重采样）
+- Modify: `crates/audio/src/decode.rs`（加 `probe_sample_rate`）
+- Modify: `app/src/main.rs`（先 probe 再建引擎）
+
+**Interfaces:**
+- Consumes: Task 8 的 `AudioEngine` / `decode_to_i16`
+- Produces:
+  - `AudioEngine::new(desired_rate: u32) -> anyhow::Result<Self>`（**签名变更**）
+  - `AudioEngine::is_passthrough(&self) -> bool`、`output_rate(&self) -> u32`
+  - `decode::probe_sample_rate(stream) -> anyhow::Result<Option<u32>>`
+
+### 设计（三条，缺一不可）
+
+**① 先试以「源采样率」建流 —— 这一档是音质最优，不只是最省。**
+
+> **任何重采样都是失真，哪怕是高质量算法。** 能不做就不做，
+> **在音质上就是最好的**。设备支持源率 ⇒ **零处理、逐位精确**。
+
+**② 设备不支持时才重采样，且必须是高质量的。**
+
+用 **`rubato`**（已核实其 `Cargo.toml` 原文 `license = "MIT OR Apache-2.0"`、
+v5.0.0、**1175 万下载**、★356、未归档）—— **纯 Rust、无 C 依赖、许可与 GPLv3 兼容**。
+⚠️ **不要用线性插值那种** —— 用户要的是「最好」。
+
+**③ 重采样必须放在「解码与 ring 之间」，绝不放进回调。**
+
+- 放解码侧 ⇒ ring 里就是**设备率**的样本 ⇒ **回调仍然只是 memcpy + 转换**（§16.2）
+- 放回调里 ⇒ 实时路径变重，正是 §16.2 禁止的方向
+
+**落点就是 §6.1 留的 PCM graph 挂载点。**
+
+⚠️ **一个实质的 API 后果**：`PcmGraph::process(&mut [i16])` 是**原地、等长**的，
+而重采样**改变长度**。所以重采样器**不能**直接做成一个 `PcmStage`
+—— 需要一个**变长的 stage 概念**（或让 `AudioEngine` 自己持有重采样器，
+绕过 `PcmGraph`）。**实现者需要就这一点做判断并说明理由。**
+
+### 设备能力查询
+
+```rust
+// 遍历 device.supported_output_configs()，找有没有 sample_rate == desired_rate 且
+// 采样格式受支持的配置。找到 ⇒ 按源率建流（passthrough）；
+// 找不到 ⇒ 按 default_output_config() 建流 + 启用重采样。
+```
+
+**⇒ 必须把结果暴露出来**（`is_passthrough()`），因为**用户有权知道**
+「我现在是逐位精确，还是系统在替我重采样」。CLI 要打印它。
+
+### ⚠️ 验收：**掐表验时长**，不是靠耳朵
+
+Task 9 已经把这条写进验收标准了 —— **保持**。
+
+```
+播放一首【44.1kHz】的歌，掐表对比时长
+  源 42.893s ⇒ 输出应当 ≈42.9s（不是 39.4s）
+```
+
+**为什么不用耳朵**：8.8% 的速度差**在没有参照物时很多人听不出来**。
+用时长是**客观、可复现、不依赖听感**的判据。
+
+### 不做的（本任务范围外，且要写进文档）
+
+**独立的设备独占访问**（绕开系统混音器）是 **Task 11** 的事。
+⚠️ **但必须写明**：**本任务做完 `is_passthrough() == true` 只代表「我们没重采样」，
+不代表「整条链路逐位精确」** —— PipeWire/Pulse 仍可能替我们重采样。
+**不写清这一点，会给人一种「已经 bit-perfect」的错觉。**
+
+---
+
 ## Task 9: CLI 端到端串联
 
 **Files:**
