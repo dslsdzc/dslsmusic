@@ -5,66 +5,240 @@
 //! **实时约束（设计文档 §16.2）**：音频回调线程内禁止分配内存、加锁、IO。
 //! 回调体是 [`output::fill_from_ring`]，它只做 `pop_slice` + 采样格式转换 +
 //! 无分支的尾部填充；`scratch` 在**建流时**一次性分配好再 move 进闭包。
+//!
+//! # 采样率对齐（本 crate 最容易静默出错的地方）
+//!
+//! 全链路只有**一个**采样率进入 ring：**设备率**。
+//!
+//! ```text
+//! 解码（源率）→ PcmGraph（源率）→ resample（源率→设备率）→ ring（设备率）→ 回调
+//! ```
+//!
+//! 这条规则是硬的：`decode::decode_to_i16` 按**源**采样率产出样本，而 cpal 的流按
+//! **建流时那个**采样率消费。两者不一致时，若中间什么都不做，就会**变速变调**
+//! （44.1kHz 的素材在 48kHz 设备上是 1.0884 倍速、+1.46 半音），
+//! **而 xrun 恒为 0、不报任何错** —— 实测一首 42.893 秒的歌 39.4 秒就放完了。
+//!
+//! [`AudioEngine::new`] 按用户裁定的「不是最省而是最好」处理这件事：
+//!
+//! 1. **先试以「源采样率」建流** —— 设备支持就**一个样本都不动**（直通）。
+//!    **任何重采样都是失真，哪怕是高质量算法**，所以这一档在音质上就是最优。
+//! 2. 设备不支持才退回设备默认率，**并且重采样**（[`resample::StreamResampler`]，
+//!    高质量 FFT 同步重采样器 —— 不是线性插值那种）。
+//!
+//! 走的是哪条路由 [`AudioEngine::is_passthrough`] 如实报出来，CLI 会打印它。
 
 pub mod decode;
 pub mod output;
 pub mod pcm;
+pub mod resample;
 
 pub use output::{AudioRing, AudioRingConsumer, AudioRingProducer};
 pub use pcm::{PcmGraph, PcmStage};
+pub use resample::StreamResampler;
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+/// ring 缓冲的时长（秒）。**按秒而不是按样本数**定容量：输出率可能是 44.1k 也可能
+/// 是 48k，写死样本数会让「几秒缓冲」随设备而变（44.1k 的 4 秒样本数在 48k 上
+/// 只有 3.675 秒）。
+const RING_SECONDS: usize = 4;
 
 pub struct AudioEngine {
     _stream: cpal::Stream,
     /// 生产端留在这里（解码线程用）。`HeapProd` 是 `!Sync`，所以
     /// `AudioEngine` 也 `!Sync` —— 它在单线程里使用，没有问题。
     producer: AudioRingProducer,
+    /// 输出流实际建在哪个采样率上（`output_rate()`）。
+    output_rate: u32,
+    /// 输出流实际的声道数（`output_channels()`）。
+    output_channels: u16,
+    /// `None` = **直通**：设备支持源采样率，我们一个样本都没动。
+    /// `Some` = 设备不支持，样本在进 ring 之前被换算到设备率。
+    resampler: Option<StreamResampler>,
+    /// 重采样输出的暂存。复用同一个 `Vec`，避免每次 `push_samples` 都分配。
+    /// （这里在**解码线程**上，分配是允许的 —— §16.2 只约束回调线程；
+    /// 但没有必要每包都分配一次。）
+    conv: Vec<i16>,
+    /// ring 容量（样本数），按**输出率**算出来的。
+    ring_capacity: usize,
 }
 
 impl AudioEngine {
-    pub fn new() -> anyhow::Result<Self> {
+    /// 按**源采样率 `desired_rate`** 尽量建一条直通流；设备不支持时才重采样。
+    ///
+    /// `desired_rate` 是**解码产出的**采样率（来自 `decode::probe_sample_rate`），
+    /// 不是「想要多少」—— 建流成功后 [`AudioEngine::push_samples`] 收的就是这个
+    /// 采样率的样本。
+    ///
+    /// `desired_rate == 0` 直接报错：0 不是「没意见」，是调用方的实现错误。
+    /// 别把它当成「用设备默认率」—— 那样会静默退回本文件顶部描述的那个缺陷。
+    pub fn new(desired_rate: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            desired_rate > 0,
+            "desired_rate 不能为 0（它不是「用默认率」的意思，见 AudioEngine::new 文档）"
+        );
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .context("没有可用的音频输出设备")?;
-        let supported = device.default_output_config()?;
+
+        // ① **音质最优的一档**：按源采样率建流 ⇒ 零处理、逐位精确。
+        if let Some(supported) = find_config_at_rate(&device, desired_rate) {
+            match Self::build(&device, supported, desired_rate) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => log::warn!(
+                    "按源采样率 {desired_rate}Hz 建流失败（{e}）；\
+                     退回设备默认率并重采样。这不会是静音，但会有一次重采样。"
+                ),
+            }
+        } else {
+            log::info!("设备未报告 {desired_rate}Hz 下我们支持的输出配置");
+        }
+
+        // ② 兜底：设备默认率 + 重采样。
+        //    ⚠️ **它在 `desired_rate` 恰好等于默认率时也会走到**（例如
+        //    `supported_output_configs()` 枚举失败的后端）。`build` 里按
+        //    「输出率 == 源率 ⇒ 直通」判，所以那种情况仍然不会白白重采样。
+        let default = device.default_output_config()?;
+        Self::build(&device, default, desired_rate)
+    }
+
+    /// 把一条**已选定的**输出配置变成能出声的引擎。
+    ///
+    /// 直通与否**由「输出率 == 源率」决定**，而不是由调用方传进来的意图决定 ——
+    /// 这样上面那条兜底路径不会在采样率其实相同时白白插进一次重采样。
+    fn build(
+        device: &cpal::Device,
+        supported: cpal::SupportedStreamConfig,
+        desired_rate: u32,
+    ) -> anyhow::Result<Self> {
         let sample_format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
+        let config: cpal::StreamConfig = supported.config();
+        let output_rate = config.sample_rate;
+        let channels = config.channels;
+
+        let resampler = if output_rate == desired_rate {
+            None
+        } else {
+            Some(StreamResampler::new(desired_rate, output_rate)?)
+        };
+
         // ⚠️ cpal 0.18 已删除 `DeviceTrait::name()`（已核实·编译：
         //    error[E0599]: no method named `name` found for struct `Device`），
         //    换成 `description()?` 再取 `.name()`。
         // ⚠️ `SampleRate` 在 0.18 是**裸 `u32` 别名**，不是 newtype
         //    （已核实·源码 cpal-0.18.2/src/lib.rs:220-233），
         //    所以 `config.sample_rate().0` 编译不过，要写 `config.sample_rate`。
-        log::info!(
-            "音频输出: {} @ {}Hz {}ch fmt={:?}",
-            device.description()?.name(),
-            config.sample_rate,
-            config.channels,
-            sample_format
-        );
+        match &resampler {
+            None => log::info!(
+                "音频输出: {} @ {}Hz {}ch fmt={:?} | 直通：按源采样率建流，未重采样",
+                device.description()?.name(),
+                output_rate,
+                channels,
+                sample_format
+            ),
+            Some(rs) => log::info!(
+                "音频输出: {} @ {}Hz {}ch fmt={:?} | 重采样 {}Hz → {}Hz（启动延迟 {} 帧）",
+                device.description()?.name(),
+                output_rate,
+                channels,
+                sample_format,
+                desired_rate,
+                output_rate,
+                rs.delay_frames()
+            ),
+        }
 
-        // ~4 秒缓冲（立体声 44.1kHz）。**split 之后消费端移进回调，全程无锁。**
-        let (producer, consumer) = AudioRing::new(44100 * 2 * 4).split();
+        // 缓冲时长按**输出率**折算 —— 见 `RING_SECONDS` 的说明。
+        // **split 之后消费端移进回调，全程无锁。**
+        let ring_capacity = output_rate as usize * resample::CHANNELS * RING_SECONDS;
+        let (producer, consumer) = AudioRing::new(ring_capacity).split();
 
         // ⚠️ **不要硬写 `f32`。** `build_output_stream<T>` 是泛型，`T` 由调用方选；
         //    而设备默认格式是运行时才知道的（本机实测 F32/48000，但换台设备可能是
         //    别的）。硬写 f32 等于假设「所有设备的默认格式都是 F32」——
         //    在不是的设备上直接建流失败，**而这个任务的出口标准就是「出声」**。
-        let stream = build_stream_for(&device, config, sample_format, consumer)?;
+        let stream = build_stream_for(device, config, sample_format, consumer)?;
         stream.play()?;
 
         Ok(Self {
             _stream: stream,
             producer,
+            output_rate,
+            output_channels: channels,
+            resampler,
+            conv: Vec::new(),
+            ring_capacity,
         })
     }
 
     /// 供解码线程推送样本。
+    ///
+    /// ⚠️ **收的是【源采样率】的样本**（即 `AudioEngine::new` 的 `desired_rate`），
+    /// 不是设备率。直通时它们原样进 ring；否则在这里被换算到设备率。
+    /// 换算在**解码线程**上做，所以 ring 里永远是设备率样本，
+    /// 音频回调仍然只是 memcpy + 转换（§16.2）。
     pub fn push_samples(&mut self, data: &[i16]) {
-        self.producer.push_samples(data);
+        match &mut self.resampler {
+            // 直通：一个样本都不动。零拷贝、零转换。
+            None => self.producer.push_samples(data),
+            Some(rs) => {
+                self.conv.clear();
+                rs.process(data, &mut self.conv);
+                self.producer.push_samples(&self.conv);
+            }
+        }
+    }
+
+    /// **整首歌喂完之后必须调一次。**
+    ///
+    /// 重采样器是有状态的：内部延迟线里还压着 `output_delay()` 个输出帧，暂存里
+    /// 还可能剩不足一整块的输入。不排空的话**结尾会被吞掉一截**，而「时长对不对」
+    /// 正是本任务的验收标准。它同时把开头为对齐而丢掉的帧补回来，所以总输出帧数
+    /// 恰好是 `ceil(输入帧数 × 比率)`。
+    ///
+    /// 直通时它什么都不做。
+    pub fn finish_stream(&mut self) {
+        if let Some(rs) = &mut self.resampler {
+            self.conv.clear();
+            rs.flush(&mut self.conv);
+            self.producer.push_samples(&self.conv);
+        }
+    }
+
+    /// **我们**有没有重采样。
+    ///
+    /// ⚠️ **`true` 只代表「我们没重采样」，不代表「整条链路逐位精确」。**
+    /// 样本出我们这一层之后还要经过系统混音器（PipeWire / PulseAudio / ALSA 的
+    /// `plug` 插件），**它仍可能替我们重采样到硬件实际跑的采样率**。
+    /// 真正的逐位精确需要设备独占访问 —— 那是 Task 11 的事。
+    ///
+    /// 不说清这一点，会给人一种「已经 bit-perfect」的错觉，而那是假的。
+    pub fn is_passthrough(&self) -> bool {
+        self.resampler.is_none()
+    }
+
+    /// 输出流实际建在哪个采样率上。
+    pub fn output_rate(&self) -> u32 {
+        self.output_rate
+    }
+
+    /// 输出流实际的声道数。
+    ///
+    /// 与 [`AudioEngine::output_rate`] 同一个理由：**用户/调用方有权知道我们实际
+    /// 建了什么流**。它不是「>= 2」就没事 —— 本机实测设备会报 1..64 声道的
+    /// 全部组合，挑中单声道就等于把右声道整条丢掉，而采样率、xrun 全都正常。
+    /// 把实际值报出来，这类事才可能被发现。
+    pub fn output_channels(&self) -> u16 {
+        self.output_channels
+    }
+
+    /// ring 容量（样本数）。调用方按它做背压 —— **不要自己写死 `44100 * 2 * 4`**：
+    /// 输出率随设备而变，写死的数字在 48kHz 设备上不是 4 秒。
+    pub fn ring_capacity(&self) -> usize {
+        self.ring_capacity
     }
 
     pub fn ring_available(&self) -> usize {
@@ -72,8 +246,91 @@ impl AudioEngine {
     }
 
     /// **硬指标：必须为 0**（设计文档 §16.2）。
+    ///
+    /// ⚠️ 口径比名字窄：它**只数我们自己那个 ring 被抽干**，看不见 ALSA/PipeWire
+    /// 设备侧的 xrun。设备卡顿而我方缓冲有货时，它照样是 0。
     pub fn xrun_count(&self) -> u64 {
         self.producer.underruns()
+    }
+}
+
+/// 在设备报告的、**我们确实建得出流**的配置里，找一个能跑 `rate` 的。
+///
+/// 排序依据见 [`config_rank`]；`None` 表示「没有可用的」，调用方应退回默认率 + 重采样。
+///
+/// ⚠️ `supported_output_configs()` 在少数后端上会**直接报错**（枚举不出来）。
+/// 那不该让播放失败 —— `.ok()?` 让它退回默认配置那条路，而
+/// [`AudioEngine::build`] 会按「输出率 == 源率」重新判一次直通。
+fn find_config_at_rate(device: &cpal::Device, rate: u32) -> Option<cpal::SupportedStreamConfig> {
+    let default = device.default_output_config().ok();
+    let mut best: Option<((u8, u8), cpal::SupportedStreamConfig)> = None;
+    for range in device.supported_output_configs().ok()? {
+        let format = range.sample_format();
+        let channels = range.channels();
+        // ⚠️ **单声道配置直接跳过。** 我们的内容恒为 2 声道（`resample::CHANNELS`），
+        //    而回调是「ch0←L、ch1←R、其余静音」的上混 —— 建成单声道流等于
+        //    **右声道被整条丢掉**，而采样率是对的、xrun 是 0，又是一个
+        //    「指标全正常但声音是错的」。宁可退回默认率 + 一次高质量重采样。
+        //    （本机实测：设备确实同时报了 1ch 与 2ch 的 48000Hz 配置，
+        //      早先只按格式排序会挑中 1ch 那条。）
+        if channels < resample::CHANNELS as u16 || !is_supported_format(format) {
+            continue;
+        }
+        let Some(config) = range.try_with_sample_rate(rate) else {
+            continue;
+        };
+        let rank = (
+            channel_rank(channels, default.as_ref().map(|c| c.channels())),
+            format_rank(format, default.as_ref().map(|c| c.sample_format())),
+        );
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, config));
+        }
+    }
+    best.map(|(_, config)| config)
+}
+
+/// `build_stream_for` 能处理的采样格式集合。**必须与它 match 的臂一致**：
+/// 这里说「支持」而那里掉进 `other` 分支，就等于白建一次流再失败。
+///
+/// 不一致也不会静音 —— [`AudioEngine::new`] 会把建流失败接住、退回默认配置 ——
+/// 但会白多一次失败尝试，而且日志会难读。改 `build_stream_for` 时记得回来同步这里。
+fn is_supported_format(format: cpal::SampleFormat) -> bool {
+    use cpal::SampleFormat as F;
+    matches!(format, F::F32 | F::I16 | F::I32 | F::I24 | F::U8)
+}
+
+/// 声道数的偏好，**越小越好**：
+///
+/// - **0：设备默认的声道数**（且 ≥2）。设备自己选的那一档最省转换。
+/// - **1：其余 ≥2 声道的配置。** 我们的 2 声道内容能完整送上，只是可能与
+///   设备默认的通道布局不同。
+/// - **2：单声道。** 右声道会被丢掉 —— `find_config_at_rate` 现在直接跳过它们，
+///   这个档位留着是为了让规则本身完整、可测。
+fn channel_rank(channels: u16, default_channels: Option<u16>) -> u8 {
+    if channels < resample::CHANNELS as u16 {
+        2
+    } else if Some(channels) == default_channels {
+        0
+    } else {
+        1
+    }
+}
+
+/// 采样格式的偏好，**越小越好**。
+///
+/// - **0：设备的默认格式。** 那是设备自己选的、需要最少转换的一档。
+/// - **1：i16 → T 无损**的其余格式。`i16 → i32`（`<<16`）、`i16 → I24`（`<<8`）、
+///   `i16 → f32`（`/32768`）都是**精确**的，所以这几档之间没有音质差别。
+/// - **2：`u8`。** 8 位只有 256 级，i16 进去要丢 8 位 —— 设备只给 u8 时也只能用
+///   它（总比不出声好），但**有别的选择时不该选它**。
+fn format_rank(format: cpal::SampleFormat, default_format: Option<cpal::SampleFormat>) -> u8 {
+    if Some(format) == default_format {
+        0
+    } else if format == cpal::SampleFormat::U8 {
+        2
+    } else {
+        1
     }
 }
 
@@ -369,5 +626,102 @@ mod tests {
         fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
         assert_eq!(out, [3, 4, 5, 6], "半个样本接下一帧 ⇒ L/R 配对不错位");
         assert_eq!(cons.underruns(), 1, "这次数据够，不再记欠载");
+    }
+
+    // ── 以下是**设备能力判定**的纯函数测试（不需要声卡） ──
+    //
+    // `find_config_at_rate` 本身要真设备才跑得起来（`AudioEngine::new` 那一路是
+    // 手动冒烟 + CLI 掐表验的），但它的两个判据是纯函数，而且正是「会不会静默退回
+    // 那个变速变调的缺陷」的分界线，所以单独钉住。
+
+    /// `is_supported_format` 必须与 `build_stream_for` 的 match 臂**逐条对齐**：
+    /// 说「支持」而那里掉进 `other` 分支，就会白建一次流再失败。
+    #[test]
+    fn supported_format_set_matches_build_stream_for_arms() {
+        use cpal::SampleFormat as F;
+        for f in [F::F32, F::I16, F::I32, F::I24, F::U8] {
+            assert!(is_supported_format(f), "{f:?} 在 build_stream_for 里有分支");
+        }
+        // 其余变体（0.18 一共 15 个）都必须被判为「不支持」，
+        // 否则我们会拿一个注定失败去建流。
+        for f in [
+            F::I8,
+            F::I64,
+            F::U16,
+            F::U24,
+            F::U32,
+            F::U64,
+            F::F64,
+            F::DsdU8,
+            F::DsdU16,
+            F::DsdU32,
+        ] {
+            assert!(
+                !is_supported_format(f),
+                "{f:?} 在 build_stream_for 里没有分支"
+            );
+        }
+    }
+
+    /// 采样格式的偏好次序。这是「直通那一档到底有多直」的最后一道关：
+    /// 选到 `u8` 就等于把 16 位源砍成 8 位，**而采样率是对的、xrun 是 0** ——
+    /// 又一个「指标全正常但声音是错的」。
+    #[test]
+    fn format_rank_prefers_device_default_then_lossless_then_u8() {
+        use cpal::SampleFormat as F;
+
+        // 默认格式永远第一
+        for d in [F::F32, F::I16, F::U8, F::I32] {
+            assert_eq!(format_rank(d, Some(d)), 0, "{d:?} 是默认格式时排第一");
+        }
+        // 非默认时：u8 有损，排最后；其余（i16→T 无损）排中间。
+        // 这里用**永远不会出现在候选里**的 `F64` 当「设备的默认格式」，
+        // 否则循环到自己那一档时会因为「它就是默认」而拿到 0 —— 那是另一条规则，
+        // 会让这条断言测不到「无损 vs 有损」这件事。
+        let other_default = Some(F::F64);
+        assert!(
+            format_rank(F::U8, other_default) > format_rank(F::I16, other_default),
+            "u8 有损，必须比无损格式差"
+        );
+        for f in [F::F32, F::I16, F::I32, F::I24] {
+            assert_eq!(
+                format_rank(f, other_default),
+                1,
+                "{f:?} 相对 i16 是无损的，应与其它无损格式同级"
+            );
+        }
+        // 设备没报默认格式时（`default_output_config()` 失败）也不能把 u8 排前面
+        assert!(format_rank(F::U8, None) > format_rank(F::F32, None));
+    }
+
+    /// 声道数的偏好：**能装下 2 声道的排前面，单声道排最后**。
+    ///
+    /// 这条的来历是实测：本机设备同时报了 1ch 与 2ch 的 48000Hz 配置，
+    /// 而早先只按采样格式排序会**挑中 1ch 那条** —— 右声道被整条丢掉，
+    /// 而采样率是对的、xrun 是 0。CLI 实测日志里那行 `@ 48000Hz 1ch` 就是它。
+    #[test]
+    fn channel_rank_prefers_stereo_over_mono() {
+        assert_eq!(channel_rank(2, Some(2)), 0, "默认就是 2 声道时排第一");
+        assert_eq!(channel_rank(6, Some(6)), 0);
+        assert!(
+            channel_rank(2, Some(6)) < channel_rank(1, Some(6)),
+            "设备默认是 6 声道时，2 声道仍必须优于单声道（单声道会丢右声道）"
+        );
+        assert!(
+            channel_rank(1, Some(1)) > channel_rank(2, Some(1)),
+            "就算设备自己默认单声道，2 声道也比它好 —— 我们的内容本来就是 2 声道"
+        );
+        assert!(channel_rank(0, None) > channel_rank(2, None));
+    }
+
+    /// 组合起来的偏好次序：**声道数优先于采样格式**。
+    ///
+    /// 一个「2 声道 + u8」必须赢过「1 声道 + F32」：丢一个声道比 8 位量化严重得多。
+    #[test]
+    fn stereo_beats_mono_even_with_a_worse_sample_format() {
+        use cpal::SampleFormat as F;
+        let stereo_u8 = (channel_rank(2, Some(1)), format_rank(F::U8, Some(F::F32)));
+        let mono_f32 = (channel_rank(1, Some(1)), format_rank(F::F32, Some(F::F32)));
+        assert!(stereo_u8 < mono_f32, "2 声道 u8 应优于 1 声道 F32");
     }
 }

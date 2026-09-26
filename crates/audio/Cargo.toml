@@ -29,5 +29,11 @@ symphonia = { version = "0.5", features = [
 # 最新是 0.5.2；本计划按 0.4 的 API 写（traits::{Producer,Consumer,Observer,Split}
 # 在 0.4 里已核实存在）。升 0.5 是 dsls-audio 内部的封闭改动，v1 不冒这个险。
 ringbuf = "0.4"
+# 重采样（设备不支持源采样率时才走这条路，见 lib.rs 的 AudioEngine::new）。
+# **纯 Rust、无 C 依赖**，`license = "MIT OR Apache-2.0"` ⇒ 与 GPL-3.0-or-later 兼容。
+# 刻意**不开** default feature 之外的任何东西：`fft_resampler`（realfft + num-complex）
+# 是 default，Sinc 插值器不需要额外 feature。
+# ⚠️ 不要为了「省一点 CPU」换成多项式/线性插值 —— 用户裁决是「不是最省而是最好」。
+rubato = "5.0"
 anyhow.workspace = true
 log.workspace = true

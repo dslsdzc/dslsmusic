@@ -190,37 +190,96 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
         resp.status()
     );
     let bytes = resp.bytes().await?;
-    println!("已下载 {} KB，开始播放…（Ctrl-C 停止）", bytes.len() / 1024);
+    println!("已下载 {} KB", bytes.len() / 1024);
 
-    let mut engine = AudioEngine::new()?;
-    let cursor = std::io::Cursor::new(bytes.to_vec());
+    // ⚠️ **先 probe，再建引擎。** 引擎必须按**源采样率**建流才不用重采样
+    // （见 `dsls_audio::AudioEngine::new`），而建流不可事后修改 —— 所以源率要在
+    // 解码**之前**知道。`decode_to_i16` 的返回值来得太晚，Task 9 就是把它丢掉、
+    // 按设备率建的流，于是 44.1kHz 的歌在 48kHz 设备上变成了 1.0884 倍速，
+    // **而 xrun 恒 0、不报任何错**（实测 42.893 秒的歌 39.4 秒放完）。
+    //
+    // 做两次 `Cursor` 是**故意**的：`bytes` 是引用计数的 `Bytes`，`clone()` 只是
+    // 加一次计数，不会把整首歌复制一遍。symphonia 的 `MediaSource` 对
+    // `Cursor<T: AsRef<[u8]>>` 有实现（已核实·源码
+    // `symphonia-core-0.5.5/src/io/mod.rs:77`），所以两次都能喂。
+    let probed =
+        dsls_audio::decode::probe_sample_rate(Box::new(std::io::Cursor::new(bytes.clone())))?;
+    // ⚠️ 容器**没写**采样率时不要装作知道：44100 只是 `decode_to_i16` 的同一个兜底
+    // 值，猜错了就是变速变调。至少把「我在猜」说出来。
+    let src_rate = probed.unwrap_or_else(|| {
+        log::warn!(
+            "容器未声明采样率，按 44100Hz 建输出流（猜测）。若实际不是 44100，\
+             这首歌会变速变调 —— 解码时会再报一次实际值。"
+        );
+        44100
+    });
+
+    let mut engine = AudioEngine::new(src_rate)?;
+    // 用户有权知道**我们**有没有动过样本。⚠️ 但 `true` 只代表「我们没重采样」，
+    // 不代表整条链路逐位精确 —— 系统混音器仍可能替我们重采样到硬件率。
+    // 所以下面两句话要一起说，只说前半句就是给人一个「已经 bit-perfect」的错觉。
+    if engine.is_passthrough() {
+        println!(
+            "输出流 {}Hz {}ch：**直通**（按源采样率建流，我们未重采样；\
+             逐位精确到我们这一层为止）",
+            engine.output_rate(),
+            engine.output_channels()
+        );
+        println!(
+            "  ⚠️ 这不等于整条链路逐位精确 —— 系统混音器（PipeWire/PulseAudio）\
+             仍可能替我们重采样到硬件的实际采样率。"
+        );
+    } else {
+        println!(
+            "输出流 {}Hz {}ch：设备不支持源采样率 {src_rate}Hz，**已重采样**\
+             （rubato FFT 同步重采样器，抗混叠；不是线性插值）",
+            engine.output_rate(),
+            engine.output_channels()
+        );
+    }
+
+    println!("开始播放…（Ctrl-C 停止）");
+
+    let cursor = std::io::Cursor::new(bytes);
 
     // 闭包借用 engine 与 pcm（`push_samples` 要 `&mut`），闭包结束借用即释放，
     // 所以后面的 `ring_available()` / `xrun_count()` 可以直接用。
     const CHUNK: usize = 4096;
-    // v1 是空图（零开销）；v2 的 EQ / 响度 / 变速都挂在这里
+    // v1 是空图（零开销）；v2 的 EQ / 响度 / 变速都挂在这里。
+    // ⚠️ **它跑在【源采样率】上** —— 重采样是图**之后**的速率边界，
+    // 不是链上的一环（见 `dsls_audio::AudioEngine` 的文档）。v2 写 stage 时
+    // 按源率算系数，不要按设备率。
     let mut pcm = dsls_audio::PcmGraph::new();
-    let src_rate =
+    let decoded_rate =
         dsls_audio::decode::decode_to_i16(Box::new(cursor), Some("mp3"), &mut |samples| {
             for chunk in samples.chunks_mut(CHUNK) {
-                pcm.process(chunk); // ← 解码与 ring 之间：DSP 的位置
-                engine.push_samples(chunk);
+                pcm.process(chunk); // ← 解码与重采样之间：DSP 的位置（源率）
+                engine.push_samples(chunk); // ← 引擎内部换算到设备率后才进 ring
             }
             // 背压：`push_samples` 在环满时**丢数据**（只记一次 overflow，
             // 见 crates/audio/src/output.rs 的既定语义），而 `AudioEngine` 没有把
             // overflow 暴露出来 ⇒ 这里不压住就是**静默丢样本**。
-            // 阈值 3 秒，环容量 4 秒（`AudioRing::new(44100 * 2 * 4)`）。
-            while engine.ring_available() > 44100 * 2 * 3 {
+            // 阈值取环容量的 3/4 —— 环容量按**输出率**算出来的，所以这里不能写死
+            // `44100 * 2 * 3`：48kHz 设备上那个数字不是 3 秒。
+            while engine.ring_available() > engine.ring_capacity() / 4 * 3 {
                 std::thread::sleep(Duration::from_millis(20));
             }
         })?;
 
-    // ⚠️ **这个数必须与上面「音频输出」那行的 Hz 相同，否则一定是变速变调。**
-    // `decode_to_i16` 按**源**采样率产出样本（重采样是它文档里明说的 TODO），
-    // 而 cpal 那条流按**设备**采样率（本机 48000）消费 —— 中间没有任何转换。
-    // 44.1kHz 的 mp3 在 48kHz 设备上会是 1.088 倍速、+1.46 半音，
-    // **而 xrun 恒为 0、不报任何错**。打出来是为了让这件事可观测。
-    log::info!("解码源采样率 = {src_rate}Hz（必须与上面「音频输出」的 Hz 一致）");
+    // ⚠️ **必须排空重采样器的尾巴**：它内部还压着启动延迟那么多的输出帧，
+    // 不排空的话结尾会被吞掉一截（听不出来，但**时长会短**）。
+    engine.finish_stream();
+
+    // 解码报出来的实际采样率。**它必须与建流用的那个一致**，否则就是变速变调。
+    // `decode_to_i16` 内部已经在两者不一致时告警了（容器声明 vs 解码器实际），
+    // 这里是最后一道：万一 probe 与 decode 分叉，至少不让它静默通过。
+    if decoded_rate != src_rate {
+        log::error!(
+            "probe 报 {src_rate}Hz 但解码实际是 {decoded_rate}Hz —— \
+             输出流是按前者建的，这首歌会以 {:.4} 倍速播放（音高也会变）。",
+            decoded_rate as f64 / src_rate as f64
+        );
+    }
 
     // ⚠️ **xrun 必须在「解码结束」这一刻采一次，不能只看收尾的总数。**
     // 环被**自然读空**（歌放完了）时回调必然记一次欠载 —— 那是流的终点，
@@ -237,6 +296,15 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     let xrun_tail = xrun_total.saturating_sub(xrun_during_playback);
 
     println!("\n播放结束。");
+    println!(
+        "采样率：源 {src_rate}Hz → 输出 {}Hz（{}）",
+        engine.output_rate(),
+        if engine.is_passthrough() {
+            "直通，未重采样"
+        } else {
+            "已重采样"
+        }
+    );
     println!(
         "xrun：播放期间 = {xrun_during_playback}（这条必须为 0）；\
          总计 = {xrun_total}（其中收尾抽干 {xrun_tail} 次 —— 歌放完、环读空，\

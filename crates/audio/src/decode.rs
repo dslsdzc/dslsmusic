@@ -6,7 +6,41 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// 解码为**恰好 2 声道交错**的 i16（重采样留给后续 DSP 阶段）。
+/// 只探测**采样率**，不解码任何样本 —— 供调用方在**建输出流之前**知道该按哪个
+/// 采样率建流。
+///
+/// 为什么需要它：`AudioEngine` 必须按**源采样率**建流（那样才不用重采样，
+/// 见 `crate::AudioEngine::new`），而建流是一次性的、不可事后修改。所以在解码
+/// **之前**就得知道源率。调用方对同一个源开两次 `Cursor` 即可（CLI 是全量下载到
+/// 内存的，两次 `Cursor<Bytes>` 只是两次引用计数拷贝）。
+///
+/// 与 [`decode_to_i16`] 的一致性由**代码**保证，不是靠约定：两者用的是同一句
+/// `track.codec_params.sample_rate`。而且 symphonia 的 `Probe::format` 在 0.5.5
+/// 里**根本不看 `Hint`**（已核实·源码 `symphonia-core-0.5.5/src/probe.rs:314`
+/// 的形参名就是 `_hint`），所以本函数**不需要** `ext_hint` 参数 ——
+/// 传不传 hint，两次探测都是同一段扫描逻辑。
+///
+/// 返回 `None` 表示**容器没声明**采样率。⚠️ 调用方**不要**把它当成 44100：
+/// 那正是 [`decode_to_i16`] 里 `unwrap_or(44100)` 的兜底值，猜错了就是变速变调。
+/// 猜的时候至少要 `log::warn!`。
+pub fn probe_sample_rate(
+    stream: Box<dyn symphonia::core::io::MediaSource>,
+) -> anyhow::Result<Option<u32>> {
+    let mss = MediaSourceStream::new(stream, Default::default());
+    let probed = symphonia::default::get_probe().format(
+        &Hint::new(),
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    )?;
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| anyhow::anyhow!("文件中没有可解码的音轨"))?;
+    Ok(track.codec_params.sample_rate)
+}
+
+/// 解码为**恰好 2 声道交错**的 i16（重采样交给 `crate::resample`）。
 ///
 /// ⚠️ **契约：输出恰好 2 声道交错。** 下游 [`crate::output`] 与
 /// `fill_from_ring` **无条件**把相邻两个样本当成一帧的 L/R，所以声道数必须
@@ -48,7 +82,10 @@ pub fn decode_to_i16(
         .default_track()
         .ok_or_else(|| anyhow::anyhow!("文件中没有可解码的音轨"))?;
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    // ⚠️ 容器声明的采样率**不是权威**，解码器实际吐出来的才是。两者不一致时下面
+    //    会告警（只报一次），并以**实际值**为准返回 —— 返回值就是「这批样本是多少
+    //    赫兹」，调用方拿它去建流，所以它必须是实际值。
+    let mut sample_rate = track.codec_params.sample_rate;
     let mut decoder =
         symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
@@ -56,6 +93,8 @@ pub fn decode_to_i16(
     // 声道归一化的告警整轨只打一次（不是每个 packet 一条，否则 4 分钟的歌
     // 会刷出几千行同样的日志）。
     let mut warned_remix = false;
+    // 采样率一致性只在**第一个** packet 上核一次。
+    let mut checked_rate = false;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -70,11 +109,33 @@ pub fn decode_to_i16(
             continue;
         }
         let decoded = decoder.decode(&packet)?;
+        if !checked_rate {
+            checked_rate = true;
+            let actual = decoded.spec().rate;
+            match sample_rate {
+                Some(declared) if declared == actual => {}
+                // 这条告警是本任务的核心防线之一：调用方**已经**按 `declared`
+                // 建好输出流了，此刻改不了。说清楚后果，别让人以为只是「有点怪」。
+                Some(declared) => log::warn!(
+                    "容器声明 {declared}Hz，解码器实际输出 {actual}Hz。\
+                     按实际值处理；⚠️ 上层若已按 {declared}Hz 建了输出流，\
+                     这首歌会以 {:.4} 倍速播放（音高也会跟着变）。",
+                    actual as f64 / declared as f64
+                ),
+                None => log::warn!(
+                    "容器未声明采样率，按解码器实际输出的 {actual}Hz 处理。\
+                     （若上层是按别的值建的流，这首歌会变速变调。）"
+                ),
+            }
+            sample_rate = Some(actual);
+        }
         scratch.clear();
         push_interleaved_i16(&decoded, &mut scratch, &mut warned_remix);
         on_samples(&mut scratch);
     }
-    Ok(sample_rate)
+    // 一个 packet 都没解出来（空文件）时，`sample_rate` 还是容器声明的那个值；
+    // 都没有就退回 44100 —— 这是本函数**唯一**的猜测，且不是静默的（上面已告警）。
+    Ok(sample_rate.unwrap_or(44100))
 }
 
 /// 把任意采样格式的解码结果摊成**恰好 2 声道交错的 i16**（见 `decode_to_i16`
@@ -328,5 +389,52 @@ mod tests {
             "非音频输入必须返回 Err，不能 panic 也不能谎报成功"
         );
         assert!(got.is_empty(), "失败时不该吐出任何样本");
+    }
+
+    // ── `probe_sample_rate`：建流**之前**就要拿到源率，所以它是本任务的关键路径 ──
+
+    /// **probe 报出来的采样率必须与 `decode_to_i16` 报出来的完全一致。**
+    ///
+    /// 这条是整个采样率对齐的基石：CLI 按 probe 的值建输出流，而实际样本是按
+    /// decode 的值产出的。**两者只要差一点，就是变速变调**，而且不会报任何错。
+    /// 逐个采样率都验一遍，别只验 44100。
+    #[test]
+    fn probe_rate_agrees_with_decode_rate_for_every_wav_rate() {
+        for rate in [8000u32, 22050, 44100, 48000, 96000] {
+            let bytes = wav_pcm(16, 2, rate, &[0u8; 32]);
+            let probed = probe_sample_rate(Box::new(std::io::Cursor::new(bytes.clone())))
+                .expect("probe 不该失败");
+            let (decoded, _) = decode_bytes(bytes, Some("wav")).expect("同一个源解码也该成功");
+
+            assert_eq!(probed, Some(rate), "probe 要从容器里读出 {rate}Hz");
+            assert_eq!(
+                probed,
+                Some(decoded),
+                "probe 与 decode 报的采样率必须一致 —— 不一致就是变速变调"
+            );
+        }
+    }
+
+    /// probe **不产出任何样本**（它只读容器头就返回），且不消费调用方的数据。
+    #[test]
+    fn probe_reads_no_samples() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let bytes = wav_pcm(16, 2, 44100, &data);
+        let probed = probe_sample_rate(Box::new(std::io::Cursor::new(bytes))).expect("probe 成功");
+        assert_eq!(probed, Some(44100));
+        // 函数签名里根本没有产出样本的地方（没有回调参数）—— 这条测试钉住的是
+        // 「它没有被写成『先解一段再返回』」，那种实现会在建流前就把整首歌解一遍。
+    }
+
+    /// 非音频输入：probe 也必须返回 `Err`，不能返回 `Ok(None)`。
+    ///
+    /// 两者混起来是危险的：`Ok(None)` 的意思是「是音频，但容器没写采样率」，
+    /// 调用方会继续往下走；`Err` 才是「这根本不是音频，别浪费时间了」。
+    #[test]
+    fn probe_rejects_non_audio_instead_of_guessing_none() {
+        let r = probe_sample_rate(Box::new(std::io::Cursor::new(
+            b"this is definitely not audio".to_vec(),
+        )));
+        assert!(r.is_err(), "非音频必须是 Err，不能是 Ok(None)");
     }
 }
