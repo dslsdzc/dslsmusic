@@ -1530,6 +1530,9 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
   - `pub enum Quality { Low, Standard, High, Lossless, HiRes }`
     （**`Super` 改名为 `Lossless`，新增 `HiRes`**）
   - `Quality::lower()`：`HiRes → Lossless → High → Standard → Low → None`
+    ⚠️ 实现者实测发现初稿的 `ladder_has_exactly_five_rungs` **起点写反了**
+    （从 `Low` 起步数数，循环体一次不进，恒为 1）——已按下面的版本改成
+    穷尽 `match` + 从 `HiRes` 起步
   - `pub enum AudioEffect { Jyeffect, Jymaster, Sky, Dolby, Vivid }`
     —— **与 `Quality` 之间没有 `Ord` 关系**
 
@@ -1548,16 +1551,47 @@ git commit -m "feat(provider-api): MusicSource trait + typed SourceError + Capab
         assert_eq!(Quality::Low.lower(), None);
     }
 
-    /// 钉住**档位总数**。加档位却忘了接进 `lower()` 的话，这条会失败。
+    /// 钉住**保真度梯度就是这 5 档、且是一条直线**。
+    ///
+    /// ⚠️ **不要从 `Low` 起步往下数。** `lower()` 是**向下降级**的，
+    /// 从最低档起步循环体一次都不进，`n` 恒为 1 ——
+    /// **那条测试无论实现怎么写都不可能通过。**（本计划的初稿正是这么写的，
+    /// 实现者实测 `left: 1, right: 5` 才发现。）
+    ///
+    /// ⚠️ **也不要只从 `HiRes` 起步数个数。** 那样「在 `HiRes` **之上**
+    /// 再加一档」会**静默通过**，与这条测试自称的用途不符。
+    ///
+    /// 所以用两件事合起来钉：
+    /// **(a)** 一个**穷尽 `match`** —— 加变体而没列进这里，`match` 会因为
+    /// 不穷尽而**编译失败**（`Quality` 虽标了 `#[non_exhaustive]`，
+    /// 但那只约束**下游** crate，crate 内部的 `match` 仍是穷尽的）；
+    /// **(b)** 从**最高档**起步逐级降，必须正好 4 步落到 `Low`。
     #[test]
-    fn ladder_has_exactly_five_rungs() {
-        let mut n = 1;
-        let mut q = Quality::Low;
+    fn ladder_is_exactly_the_five_fidelity_tiers() {
+        // 这个函数的唯一作用是**编译期的穷尽性检查**，没有运行期效果。
+        // 它不调用任何东西，所以不会被执行 —— 加变体时它会先编译失败。
+        #[allow(dead_code)]
+        fn exhaustive_check(q: Quality) {
+            match q {
+                Quality::Low
+                | Quality::Standard
+                | Quality::High
+                | Quality::Lossless
+                | Quality::HiRes => {}
+            }
+        }
+
+        let mut q = Quality::HiRes;
+        let mut steps = 0usize;
         while let Some(next) = q.lower() {
-            n += 1;
+            steps += 1;
+            // 防死循环（不是对梯子形状的断言）：`lower()` 是总函数，
+            // 理论上可以配出环，跑测试时挂死比断言失败更难查。
+            assert!(steps < 16, "降级链出现环");
             q = next;
         }
-        assert_eq!(n, 5, "保真度梯度应为 5 档；加档位时必须同时更新 lower()");
+        assert_eq!(q, Quality::Low, "降级链的终点必须是 Low");
+        assert_eq!(steps, 4, "HiRes→Low 应正好 4 步（5 档）");
     }
 ```
 
