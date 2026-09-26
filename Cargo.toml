@@ -9,12 +9,23 @@ members = ["crates/*", "app"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-# MSRV。edition 2024 本身要求 ≥1.85，所以这个值是自洽的下限。
+# MSRV。edition 2024 本身要求 ≥1.85。
 # 与 rust-toolchain.toml 的 channel pin 是两件事：
 #   - channel pin  → 保证「编出相同的代码」（可复现），代价是每个贡献者多下一份工具链
 #   - rust-version → 保证「旧工具链得到清晰错误」而非难解失败
-# 依赖的 MSRV 可能更高，那种情况 cargo 会指名报错，不会静默失败。
-rust-version = "1.85"
+#
+# ⚠️ **这里早先写着「依赖的 MSRV 更高时 cargo 会指名报错，不会静默失败」——
+# 那句是假的，已更正。**（Task 10 实测：`rubato 5.0.0` 声明 MSRV 1.87，
+# 而本文件的 rust-version 是 1.85，**cargo 解析与构建全程零提示**
+# —— 实现者 grep 了两份日志确认零命中。）
+#
+# ⇒ **`rust-version` 只声明「本 crate 自己需要什么」，它对依赖的 MSRV 没有任何约束力**，
+#   也不会替我们检查。**唯一可靠的保障是 `rust-toolchain.toml` 的 channel pin。**
+#
+# 1.85 → 1.87 是因为 `rubato 5.0.0`（§18.10 依赖裁剪时核实过版本与许可的那个）
+# 要求 1.87。**降回 rubato 4.0 可以保住 1.85，但 4.0 没有核实过** ——
+# 而用户的裁决是「不是最省而是最好」。
+rust-version = "1.87"
 
 [workspace.dependencies]
 # ── 平台层 ──
