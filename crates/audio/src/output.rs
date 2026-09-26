@@ -100,6 +100,15 @@ impl AudioRingConsumer {
         self.inner.pop_slice(out)
     }
 
+    /// 当前环内可读样本数。**无锁**（两次原子读 + 本地缓存），回调里可用。
+    ///
+    /// 回调靠它把 pop 长度**向下取到偶数**（整帧立体声），见 `fill_from_ring`：
+    /// 环里可能装着奇数个样本（push 端按任意边界切分同一个立体声流是合法的），
+    /// 那半个样本必须留在环里，不能取出来丢掉。
+    pub fn available(&self) -> usize {
+        self.inner.occupied_len()
+    }
+
     /// 记一次欠载。**按「事件」计，不按缺失样本数计**——与 `pop_samples`
     /// 的口径一致，这样「xrun 必须为 0」这条硬指标才有可比性。
     pub fn count_underruns(&self, n: u64) {
@@ -129,7 +138,11 @@ mod tests {
     fn counts_underrun_when_empty() {
         let ring = AudioRing::new(8);
         let (_prod, mut cons) = ring.split();
-        let mut out = [0i16; 4];
+        // ⚠️ 预填 99、**不是** 0：`out` 若初值就是 0，下面那条断言**恒真**
+        //    （不管 `pop_samples` 有没有补静音都通过），等于没测。
+        //    这是「空环」那一路；「取到一部分」那一路在
+        //    `partial_underrun_still_fills_silence`。
+        let mut out = [99i16; 4];
         assert_eq!(cons.pop_samples(&mut out), 0);
         assert_eq!(cons.underruns(), 1);
         // 回调必须填满整块缓冲 —— 没数据时填静音，绝不能留垃圾值（那是爆音）

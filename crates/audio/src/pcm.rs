@@ -47,6 +47,17 @@ mod tests {
         }
     }
 
+    /// 测试用 stage：加一个常数（饱和）。**故意与 `Gain` 不可交换** —— 见
+    /// `stages_apply_in_order`。
+    struct Offset(i16);
+    impl PcmStage for Offset {
+        fn process(&mut self, samples: &mut [i16]) {
+            for s in samples.iter_mut() {
+                *s = s.saturating_add(self.0);
+            }
+        }
+    }
+
     #[test]
     fn empty_graph_is_identity() {
         let mut g = PcmGraph::new();
@@ -58,12 +69,23 @@ mod tests {
 
     #[test]
     fn stages_apply_in_order() {
-        let mut g = PcmGraph::new();
-        g.push(Box::new(Gain(2.0)));
-        g.push(Box::new(Gain(0.5)));
+        // ⚠️ 两个 stage **必须不可交换**，否则顺序对调照样通过，测不出
+        //    「按 push 顺序」。原来用的 ×2 与 ×0.5 都是正增益、彼此可交换
+        //    （`(x*2)*0.5 == (x*0.5)*2`），那条断言对顺序不敏感 —— 已换掉。
+        //    这里用 ×2 与 +10：先乘后加 ≠ 先加后乘。
+        let mut mul_then_add = PcmGraph::new();
+        mul_then_add.push(Box::new(Gain(2.0)));
+        mul_then_add.push(Box::new(Offset(10)));
         let mut s = [10i16, -20, 30];
-        g.process(&mut s);
-        assert_eq!(s, [10, -20, 30], "×2 再 ×0.5 应回到原值");
+        mul_then_add.process(&mut s);
+        assert_eq!(s, [30, -30, 70], "先 ×2 再 +10");
+
+        let mut add_then_mul = PcmGraph::new();
+        add_then_mul.push(Box::new(Offset(10)));
+        add_then_mul.push(Box::new(Gain(2.0)));
+        let mut s = [10i16, -20, 30];
+        add_then_mul.process(&mut s);
+        assert_eq!(s, [40, -20, 80], "先 +10 再 ×2：与上面不同 ⇒ 顺序真的生效");
     }
 
     #[test]

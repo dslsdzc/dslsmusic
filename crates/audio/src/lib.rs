@@ -140,6 +140,9 @@ where
 ///
 /// 前置条件（唯一的调用点 `build_output` 两条都满足；违反了会 panic）：
 /// `channels >= 1`，且 `scratch.len() >= 2`（至少要装得下一帧立体声）。
+///
+/// 环里承载的是**2 声道交错**的样本（`decode::decode_to_i16` 的契约）。推入的
+/// 样本数**允许是奇数**（切片边界随调用方），本函数按**整帧**消费，见下面的注释。
 fn fill_from_ring<T>(
     out: &mut [T],
     channels: usize,
@@ -153,9 +156,25 @@ fn fill_from_ring<T>(
     let mut frame = 0usize;
     let mut starved = false;
 
+    // ⚠️ **尾部槽位必须先写。** 若 `out.len()` 不是 `channels` 的整数倍，
+    //    最后那几个槽位**永远不会被下面的循环写到**，会留下 cpal 缓冲里的旧值
+    //    （听感＝爆音）。先整体铺静音、再让循环覆盖，是唯一稳妥的顺序。
+    out.fill(T::EQUILIBRIUM);
+
     while frame < total_frames {
         let want_frames = (total_frames - frame).min(cap_frames);
-        let got = consumer.pop_raw(&mut scratch[..want_frames * 2]);
+        let want = want_frames * 2;
+        // ⚠️ **只取整帧。** 环里可能装着**奇数**个样本：push 端按任意边界切分
+        //    同一个立体声流是合法的（先推 [L0,R0,L1]，再推 [R1,L2,R2]）。
+        //    按 `available()` 把 pop 长度向下取到偶数，那**半个样本就留在环里**，
+        //    下一次回调自然接在它后面。
+        //    反过来（直接 pop 奇数个再 `got / 2`）会把它**丢掉** —— 而它后面的
+        //    样本还在环里 ⇒ 此后所有 L/R 配对整体错位，听感是**声道互换**，
+        //    而且**不可恢复**（比丢一个样本难查得多）。
+        let avail = consumer.available();
+        // `want` 本身是偶数，只有 `avail` 更小时才可能算出半个帧 ⇒ 清掉最低位。
+        let n = want.min(avail) & !1;
+        let got = consumer.pop_raw(&mut scratch[..n]);
         let got_frames = got / 2;
 
         for f in 0..want_frames {
@@ -178,7 +197,7 @@ fn fill_from_ring<T>(
             }
         }
 
-        if got < want_frames * 2 {
+        if got < want {
             starved = true;
         }
         frame += got_frames;
@@ -191,6 +210,8 @@ fn fill_from_ring<T>(
         consumer.count_underruns(1);
         // ⚠️ 静音值随 T 而变：f32→0.0、i16→0、**u8→128**。
         //    手写 `*s = 0` 在 u8 设备上会产生满幅直流噪声。必须用 EQUILIBRIUM。
+        //    （上面的预填充在语义上已经覆盖到这里；保留这一句是为了让
+        //      「饿死 ⇒ 后半块是静音」这条不变量在本地可见。）
         out[frame * channels..].fill(T::EQUILIBRIUM);
     }
 }
@@ -297,10 +318,20 @@ mod tests {
         let mut out = [I24::EQUILIBRIUM; 4];
         fill_from_ring::<I24>(&mut out, 2, &mut cons, &mut scratch);
 
-        assert_eq!(out[0], I24::from_sample(0i16), "静音");
-        assert_eq!(out[1], I24::from_sample(-32768i16), "负满幅");
-        assert_eq!(out[2], I24::from_sample(32767i16), "正满幅");
-        assert_eq!(out[3], I24::from_sample(100i16));
+        // ⚠️ 期望值**硬写 I24 的位模式**，不要写 `I24::from_sample(同一个输入)` ——
+        //    那**就是实现里的表达式**（`fill_from_ring` 里的 `T::from_sample(v)`），
+        //    只能抓路由/索引错，抓不到转换错（「把同样的算术抄一遍」）。
+        //    I24 是「i32 里放 24 位有效位」，i16 → I24 是 `<< 8`
+        //    （已核实 dasp_sample-0.11.0/src/conv.rs:186 `I24::new_unchecked((s as i32) << 8)`）：
+        //    -32768 → -8388608（= I24::MIN）、32767 → 8388352、100 → 25600。
+        assert_eq!(out[0], I24::EQUILIBRIUM, "静音仍是 0");
+        assert_eq!(
+            out[1],
+            I24::new_unchecked(-8_388_608),
+            "负满幅 = -32768 << 8"
+        );
+        assert_eq!(out[2], I24::new_unchecked(8_388_352), "正满幅 = 32767 << 8");
+        assert_eq!(out[3], I24::new_unchecked(25_600), "100 << 8");
         assert_eq!(cons.underruns(), 0);
         // 回调整体在 i16 域里补静音，靠 `from_sample` 转成目标格式的静音值。
         // I24 的静音是 0（不是 u8 的 128）—— 这条把该假设对 I24 钉死。
@@ -309,5 +340,34 @@ mod tests {
             I24::EQUILIBRIUM,
             "i16 域的静音在 I24 上应映射到 I24 的静音"
         );
+    }
+
+    /// 环里只剩**半个**立体声帧时，那半个样本必须**留在环里**，不能取出来丢掉。
+    ///
+    /// 丢掉它不会当场出错（本次回调只是补静音 + 记一次欠载），但它后面的样本
+    /// 还在环里 ⇒ **此后所有 L/R 配对整体错位**，听感是声道互换，且不可恢复。
+    #[test]
+    fn callback_leaves_a_half_frame_in_the_ring_instead_of_dropping_it() {
+        let ring = AudioRing::new(16);
+        let (mut prod, mut cons) = ring.split();
+        prod.push_samples(&[1, 2, 3]); // 1.5 帧：3 是下一帧的左声道
+        let mut scratch = vec![0i16; 8];
+        let mut out = [7i16; 4]; // 2 帧，预填 7 用来暴露「没写到的槽位」
+
+        fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
+        assert_eq!(out, [1, 2, 0, 0], "只有整帧可用，尾部补静音");
+        assert_eq!(cons.underruns(), 1, "半个帧也算饿死");
+        assert_eq!(
+            cons.available(),
+            1,
+            "那半个样本必须还在环里，不能被取走丢掉"
+        );
+
+        // 下一帧的右声道到了：它必须**接在那半个样本后面**。
+        // 若上一步把 3 丢了，这里会读成 [4, 5, ...] —— 也就是 L/R 互换。
+        prod.push_samples(&[4, 5, 6]);
+        fill_from_ring::<i16>(&mut out, 2, &mut cons, &mut scratch);
+        assert_eq!(out, [3, 4, 5, 6], "半个样本接下一帧 ⇒ L/R 配对不错位");
+        assert_eq!(cons.underruns(), 1, "这次数据够，不再记欠载");
     }
 }
