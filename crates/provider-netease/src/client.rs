@@ -1,16 +1,29 @@
-use dsls_provider_api::SourceError;
+use dsls_provider_api::{
+    Capability, CapabilitySet, MusicSource, Quality, SourceError, SourceResult, Track,
+};
 use ncm_api_rs::{ApiClient, Query, create_client};
 use serde_json::Value;
 
 pub struct NeteaseClient {
     inner: ApiClient,
     cookie: Option<String>,
+    capabilities: CapabilitySet,
 }
 
 impl NeteaseClient {
     pub fn new(cookie: Option<String>) -> Self {
         let inner = create_client(cookie.clone());
-        Self { inner, cookie }
+        // 只列已实现的。歌词 / 封面 / 歌单 / 专辑 的 provider 方法随各自的
+        // M2+ 任务落地时再加进来 —— 现在申报它们，resolver 会把请求路由过来，
+        // 然后撞上 Unimplemented。
+        let capabilities = CapabilitySet::new()
+            .with(Capability::Search)
+            .with(Capability::StreamUrl);
+        Self {
+            inner,
+            cookie,
+            capabilities,
+        }
     }
 
     pub fn with_cookie(cookie: String) -> Self {
@@ -112,6 +125,86 @@ impl NeteaseClient {
         // `from_code` 自己返回 `Result`（803 拿不到会话 / 未知状态码都是 `Err`），
         // 所以这里**不要**再包一层 `Ok(..)`。
         crate::qr_login::QrState::from_code(code, &resp.cookie)
+    }
+}
+
+#[async_trait::async_trait]
+impl MusicSource for NeteaseClient {
+    fn name(&self) -> &str {
+        crate::PLATFORM
+    }
+
+    fn capabilities(&self) -> &CapabilitySet {
+        &self.capabilities
+    }
+
+    /// **三态契约**（设计文档 §4.5）：
+    /// `Ok(Some(vec![]))` = 查到了但没结果；`Err(Unsupported)` = 本音源不处理搜索。
+    /// 两者绝不可混淆 —— 前者不该触发换音源，后者应该。
+    async fn search(&self, keywords: &str, limit: u32) -> SourceResult<Vec<Track>> {
+        let resp = self
+            .inner
+            .cloudsearch(
+                &Query::new()
+                    .param("keywords", keywords)
+                    .param("limit", &limit.to_string())
+                    .param("type", "1"),
+            )
+            .await
+            .map_err(|e| SourceError::Network(e.to_string()))?;
+        crate::parse::parse_search_tracks(&resp.body).map(Some)
+    }
+
+    /// `Err(Unavailable)` 是**有意的**：版权 / 地区限制是「有能力但拿不到」，
+    /// 经 `should_retry_lower_quality()` 触发降档重试，而不是 Protocol。
+    async fn stream_url(&self, track_id: &str, quality: Quality) -> SourceResult<String> {
+        // 已核实方法名存在：ncm-api-rs src/api/song_url_v1.rs
+        //   pub async fn song_url_v1(&self, query: &Query) -> Result<ApiResponse>
+        let resp = self
+            .inner
+            .song_url_v1(
+                &Query::new()
+                    .param("id", track_id)
+                    .param("level", level_for(quality)?),
+            )
+            .await
+            .map_err(|e| SourceError::Network(e.to_string()))?;
+        crate::parse::parse_stream_url(&resp.body, quality).map(Some)
+    }
+}
+
+/// 档位 → 网易云 `level` 参数。**请求侧与核对侧共用这一份映射**——
+/// 两边各写一份的话，请求发出的档位与响应核对的档位会静默分叉。
+///
+/// ⚠️ **通配臂是必需品，不是偷懒**（对 brief 的一处已上报偏离）。
+/// brief 期望「少一个变体这里就是编译错误」，但 `Quality` 在 `provider-api`
+/// 里标了 `#[non_exhaustive]`，而 `#[non_exhaustive]` 的**全部意义**就是
+/// 「下游 crate 加变体不构成破坏性变更」——所以**在下游永远拿不到 E0004**。
+/// 实测：不加通配臂直接 `error[E0004]: non-exhaustive patterns: '_' not covered`。
+///
+/// 编译期这条路堵死之后，退而求其次的**唯一**正确做法是让失败**响亮**：
+/// 未知变体返回 `Err(Protocol)` 而不是随便挑一个档位 —— 后者正是本项目
+/// 反复禁止的「静默的谎言」（要无损却发 320k）。
+/// `Protocol` 会让 `is_upstream_changed()` 为真，逼出人工介入，
+/// 这是最接近「编译期报错」的运行时替代品。
+///
+/// ⚠️ **故意不返回 `Unavailable`**：那会走降档链，看起来与正常的
+/// 版权降档一模一样 —— 「有人加了档位却忘了接线」这个维护信号就丢了。
+///
+/// `pub(crate)`：`parse.rs` 的 `parse_stream_url` 要拿同一个映射去核对响应。
+pub(crate) fn level_for(q: Quality) -> Result<&'static str, SourceError> {
+    match q {
+        Quality::Low => Ok("standard"),
+        Quality::Standard => Ok("higher"),
+        Quality::High => Ok("exhigh"),
+        Quality::Lossless => Ok("lossless"),
+        Quality::HiRes => Ok("hires"),
+        // `Quality` 是 #[non_exhaustive] 且定义在别的 crate，
+        // 这个臂**必须**存在（见上）。走到这里说明 provider-api 加了新档位
+        // 而本 crate 没跟上。
+        _ => Err(SourceError::Protocol(format!(
+            "provider-netease 未接线 Quality 变体 {q:?}，请更新 level_for"
+        ))),
     }
 }
 
@@ -296,5 +389,23 @@ mod tests {
         assert_eq!(json_code(&serde_json::json!("等待扫码")), None);
         assert_eq!(json_code(&serde_json::json!(null)), None);
         assert_eq!(json_code(&serde_json::json!({})), None);
+    }
+
+    /// 编译期契约：`NeteaseClient` 必须能当 `dyn MusicSource` 用。
+    ///
+    /// 若有人删掉 `impl MusicSource`、或把 `name()` 改成别的字面量，
+    /// **这个测试编译不过 / 断言失败** —— 那正是它存在的意义。
+    /// 它守的是那条「`Track::platform` 与 `MusicSource::name()` 必须同源」
+    /// 的约束（见 Task 6 的 `PLATFORM` 常量）。
+    #[test]
+    fn netease_is_a_music_source_with_matching_platform_id() {
+        let client = NeteaseClient::new(None);
+        let src: &dyn MusicSource = &client;
+
+        assert_eq!(src.name(), crate::PLATFORM);
+
+        // 只申报已实现的 —— 多申报会让 resolver 路由到未实现的方法
+        assert!(src.capabilities().supports(Capability::Search));
+        assert!(src.capabilities().supports(Capability::StreamUrl));
     }
 }

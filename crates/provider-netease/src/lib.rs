@@ -1,6 +1,7 @@
 //! 网易云音源实现。**本 crate 不得依赖任何 UI crate。**
 
 pub mod client;
+pub mod parse;
 pub mod qr_login;
 
 /// 本 provider 的平台标识。
