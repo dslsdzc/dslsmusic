@@ -315,6 +315,7 @@ impl AudioEngine {
             Some(rs) => {
                 self.conv.clear();
                 rs.process(data, &mut self.conv);
+                debug_assert_whole_frames(&self.conv, "process");
                 self.producer.push_samples(&self.conv);
             }
         }
@@ -338,6 +339,7 @@ impl AudioEngine {
         if let Some(rs) = &mut self.resampler {
             self.conv.clear();
             rs.flush(&mut self.conv);
+            debug_assert_whole_frames(&self.conv, "flush");
             self.producer.push_samples(&self.conv);
         }
     }
@@ -409,6 +411,22 @@ impl AudioEngine {
         self.producer.underruns()
     }
 
+    /// ring **溢出**次数 —— 环满、样本被丢。**按「事件」计**（不按缺失样本数计），
+    /// 与 [`AudioEngine::xrun_count`] 同口径。
+    ///
+    /// ⚠️ 与 [`AudioEngine::xrun_count`] 是**相反方向**的一对，**两个都要看**：
+    /// 那个数的是环被**抽干**（消费者饿），本方法数的是环被**填满**（生产者丢）。
+    ///
+    /// **本方法存在的唯一理由**：丢样本是**静默**的 —— WAV 文件完整、
+    /// `xrun_count` 为 0、波形统计正常，都**不代表你听到的等于我们产出的**。
+    /// `overflow_count() == 0` 才是这一条的唯一证据（设计文档 §16.2）。
+    ///
+    /// 口径：**丢弃数恒为偶数**（见 [`AudioRing`] 的帧对齐不变量 —— 丢奇数个会
+    /// 永久翻转左右声道）。所以非零同样只说明「丢过」，不是「丢了多少」。
+    pub fn overflow_count(&self) -> u64 {
+        self.producer.overflows()
+    }
+
     /// **设备侧**报错次数（ALSA 的 underrun/overrun 就从这里来）。
     ///
     /// 补的是 [`AudioEngine::xrun_count`] 那条明确写着的盲区：设备卡顿而我方缓冲
@@ -421,6 +439,28 @@ impl AudioEngine {
     pub fn device_error_count(&self) -> u64 {
         self.device_errors.load(Ordering::Relaxed)
     }
+}
+
+/// `conv` 必须**整帧**（长度偶数）—— 它是 `AudioEngine` 推给 ring 的样本，
+/// `push_samples` 与 `finish_stream` 两条路都从它走。
+///
+/// 为什么值得断言：重采样器只按**整帧**追加（`resample::pump` 里是
+/// `start * CHANNELS .. end * CHANNELS`），所以这条**今天恒成立**；
+/// 写成断言是为了让它**继续**成立 —— 半个帧意味着重采样器把一个样本吞了、
+/// 或多吐了半个，那是**样本丢失**。
+///
+/// ⚠️ 别和「环里可以有半个帧」混为一谈，那是合法的另一件事：
+/// 调用方按任意边界切分立体声流时，那半个样本留在环里等它的另一半
+/// （见 [`AudioRing`] 的帧对齐不变量）。
+///
+/// 回归测试：本模块的 `resampled_conv_is_always_whole_frames`。
+fn debug_assert_whole_frames(conv: &[i16], stage: &str) {
+    debug_assert_eq!(
+        conv.len() % 2,
+        0,
+        "{stage} 产出的 conv 不是整帧（长度 {}）：重采样输出必须整帧",
+        conv.len()
+    );
 }
 
 /// 首选拿来做**独占**的物理设备（`hw:`），没有就 `None`。
@@ -987,6 +1027,79 @@ mod tests {
             "就算设备自己默认单声道，2 声道也比它好 —— 我们的内容本来就是 2 声道"
         );
         assert!(channel_rank(0, None) > channel_rank(2, None));
+    }
+
+    // ── 以下是 `AudioEngine` **重采样分支**所依赖的那条契约 ──
+    //
+    // `AudioEngine` 本身要真声卡才建得起来（`AudioEngine::new` 会打开 cpal 设备），
+    // 单元测试里不能依赖它。但它在重采样那条路上的接线只有三行
+    // （`conv.clear(); rs.process(..); producer.push_samples(&conv)`），
+    // 依赖的是**已经能单独构造**的 `StreamResampler` 与 `AudioRing` ——
+    // 于是这里用同一对组件把契约钉住，见下。
+
+    /// **重采样分支推给 ring 的 `conv` 恒为整帧**（长度偶数），
+    /// 包括**不足一整块**的那段尾巴。
+    ///
+    /// `conv` 由 [`StreamResampler::process`] / [`StreamResampler::flush`] 追加填充，
+    /// 而它们只按整帧追加（`resample::pump` 里是 `start * CHANNELS .. end * CHANNELS`）。
+    /// 半个帧意味着重采样器把一个样本吞了或多吐了半个 —— 那是**样本丢失**，
+    /// 与「环里合法地留着半个帧等它的另一半」完全是两回事。
+    /// 这条也是 `AudioEngine::push_samples` / `finish_stream` 里的
+    /// `debug_assert_whole_frames` 敢断言的依据。
+    #[test]
+    fn resampled_conv_is_always_whole_frames() {
+        const SRC: u32 = 44100;
+        const DST: u32 = 48000;
+        // 一整块输入 = `resample::CHUNK_FRAMES (1024 帧) × CHANNELS`。
+        // 只在这里当切分粒度用：**切法本身不是被测对象**，就算块长变了，
+        // 下面的断言照样成立（喂法变一下而已）。
+        const BLOCK: usize = 1024 * 2;
+        const TAIL: usize = 700; // 不足一整块
+
+        let frames = (BLOCK * 3 + TAIL) / 2;
+        let input: Vec<i16> = (0..frames)
+            .flat_map(|i| {
+                let x = (i as f32 / SRC as f32 * 440.0 * std::f32::consts::TAU).sin() * 8000.0;
+                [x as i16, x as i16]
+            })
+            .collect();
+        assert_eq!(input.len() % 2, 0, "前提：输入本来就是整帧的");
+
+        let mut rs = StreamResampler::new(SRC, DST).expect("建重采样器");
+        let ring = AudioRing::new(64 * 1024);
+        let (mut prod, _cons) = ring.split();
+        // 与 `AudioEngine::conv` 同一个角色：复用同一块暂存。
+        let mut conv: Vec<i16> = Vec::new();
+
+        let mut calls = 0usize;
+        let mut produced = 0usize;
+        for chunk in input.chunks(BLOCK) {
+            conv.clear();
+            rs.process(chunk, &mut conv);
+            assert_eq!(
+                conv.len() % 2,
+                0,
+                "第 {calls} 次 process（喂了 {} 个样本）产出奇数个样本（{}）—— conv 必须整帧",
+                chunk.len(),
+                conv.len()
+            );
+            produced += conv.len();
+            calls += 1;
+            prod.push_samples(&conv);
+        }
+        // 收尾那一推走的是另一个入口，但同样落到 `conv` 上。
+        conv.clear();
+        rs.flush(&mut conv);
+        assert_eq!(
+            conv.len() % 2,
+            0,
+            "flush 产出奇数个样本（{}）—— conv 必须整帧",
+            conv.len()
+        );
+        produced += conv.len();
+
+        assert!(calls >= 2, "前提：至少喂两次，才谈得上「每一次」");
+        assert!(produced > 0, "前提：得真产出过样本，否则上面全是空断言");
     }
 
     /// 组合起来的偏好次序：**声道数优先于采样格式**。
