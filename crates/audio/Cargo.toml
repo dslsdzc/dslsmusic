@@ -1,0 +1,33 @@
+[package]
+name = "dsls-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 已核实：cpal 最新稳定版是 0.18.2
+cpal = "0.18"
+# ⚠️ 刻意钉在 0.5 —— 0.6 已发布（0.6.1），但 0.6 是破坏性变更：
+# `CodecRegistry::make` 改名 `make_audio_decoder`、`probe` 移到 `formats::probe`。
+# 升级是 dsls-audio 内部的封闭改动，v1 不冒这个险。
+# ⚠️ `pcm` 必须显式列出：`wav` 只是**容器**，PCM 解码器是**独立的 feature**。
+# 已核实：现在能解码 WAV 纯属默认 feature 没被关掉——一旦有人加
+# `default-features = false`，WAV 会**静默失效**（能打开文件、解不出样本）。
+symphonia = { version = "0.5", features = [
+    "mp3",
+    "aac",
+    "flac",
+    "isomp4",
+    "ogg",
+    "vorbis",
+    "wav",
+    "pcm",
+] }
+# 无锁 SPSC 环形缓冲。**音频回调线程里绝不允许加锁**（设计文档 §16.2 / 本计划 Global Constraints）
+# 已核实："0.4" 解析到 0.4.8。**不要写死 =0.4.9——那个版本已被 yank。**
+# 最新是 0.5.2；本计划按 0.4 的 API 写（traits::{Producer,Consumer,Observer,Split}
+# 在 0.4 里已核实存在）。升 0.5 是 dsls-audio 内部的封闭改动，v1 不冒这个险。
+ringbuf = "0.4"
+anyhow.workspace = true
+log.workspace = true
