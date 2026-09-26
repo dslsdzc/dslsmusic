@@ -16,7 +16,8 @@ use dsls_platform::{PlatformEvent, PlatformWindow, init_gpu};
 use dsls_provider_api::{MusicSource, Quality};
 use dsls_provider_netease::{NeteaseClient, QrState};
 use dslsmusic::metrics;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -46,6 +47,17 @@ enum Cmd {
         /// 可选值见 `cargo run -p dsls-audio --example probe_devices`。
         #[arg(long)]
         device: Option<String>,
+        /// 把**推进 ring 的样本**另存一份 16-bit PCM WAV 到这个路径。
+        ///
+        /// 采样率写**源采样率**、2 声道交错 —— 即**解码器的输出**
+        /// （重采样在 `AudioEngine` 内部，是这条链路之后的事）。
+        ///
+        /// 为什么要有这个开关：**VNC 的 RFB 协议没有音频通道**，
+        /// 「用耳朵当场验收」在那类环境下做不通 —— 而这个文件可以带走、
+        /// 可以反复验。⚠️ 它产出的是**证据**，不是判决：文件能打开、时长对，
+        /// 不等于「声音是对的」，后者仍要人听。
+        #[arg(long, value_name = "PATH")]
+        dump_wav: Option<PathBuf>,
     },
 }
 
@@ -70,7 +82,8 @@ async fn main() -> anyhow::Result<()> {
             keywords,
             quality,
             device,
-        }) => play(&keywords, &quality, device.as_deref()).await,
+            dump_wav,
+        }) => play(&keywords, &quality, device.as_deref(), dump_wav.as_deref()).await,
     }
 }
 
@@ -144,8 +157,13 @@ async fn login() -> anyhow::Result<()> {
     }
 }
 
-/// `play`：搜索 → 取流 → 下载 → 解码 → 出声。
-async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Result<()> {
+/// `play`：搜索 → 取流 → 下载 → 解码 → 出声（可选：同时 dump 一份 WAV）。
+async fn play(
+    keywords: &str,
+    quality: &str,
+    device: Option<&str>,
+    dump_wav: Option<&Path>,
+) -> anyhow::Result<()> {
     let cookie = load_cookie();
     if cookie.is_none() {
         log::warn!("未找到会话，将以游客身份播放（可能受限）。先跑 `login` 更稳。");
@@ -258,6 +276,32 @@ async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Re
         println!("  {note}");
     }
 
+    // ── `--dump-wav` ──────────────────────────────────────────────────────
+    // ⚠️ **建文件失败不中断播放**（dump 是辅助手段，不是主路径），
+    // 但**必须出声**：用户以为文件在写、跑完才发现什么都没有，比当场报错更糟。
+    // 用 `log::error!` 而不是 `eprintln!`，与文件里其它非致命错误同一口径
+    // （默认过滤级别是 `info`，所以它一定会被看见）。
+    let mut dump = match dump_wav {
+        Some(path) => match WavDump::create(path, src_rate) {
+            Ok(d) => {
+                println!(
+                    "WAV dump：{}（源率 {src_rate}Hz、{WAV_CHANNELS} 声道、16-bit PCM）",
+                    path.display()
+                );
+                Some(d)
+            }
+            Err(e) => {
+                log::error!(
+                    "打不开 dump 路径 {}（{e}）—— **这次不写 WAV，播放继续**。\
+                     检查父目录是否存在、有没有写权限。",
+                    path.display()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     println!("开始播放…（Ctrl-C 停止）");
 
     let cursor = std::io::Cursor::new(bytes);
@@ -275,6 +319,13 @@ async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Re
             for chunk in samples.chunks_mut(CHUNK) {
                 pcm.process(chunk); // ← 解码与重采样之间：DSP 的位置（源率）
                 engine.push_samples(chunk); // ← 引擎内部换算到设备率后才进 ring
+                // ⚠️ **与 `push_samples` 同一批字节**，不是「ring 取出的样本」：
+                // 回环判据已经证明推进去的东西原样从 `hw:` 出来，两件事合起来
+                // 覆盖整条路径。而这一批正是**解码器的输出**（重采样在
+                // `AudioEngine` 内部，是这条链路之后的事）—— 要验的就是它。
+                if let Some(d) = dump.as_mut() {
+                    d.write(chunk);
+                }
             }
             // 背压：`push_samples` 在环满时**丢数据**（只记一次 overflow，
             // 见 crates/audio/src/output.rs 的既定语义），而 `AudioEngine` 没有把
@@ -289,6 +340,49 @@ async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Re
     // ⚠️ **必须排空重采样器的尾巴**：它内部还压着启动延迟那么多的输出帧，
     // 不排空的话结尾会被吞掉一截（听不出来，但**时长会短**）。
     engine.finish_stream();
+
+    // ⚠️ **dump 在「解码结束」这一刻就收尾，不等缓冲播完。**
+    // 头的两个长度字段要 seek 回去补，补完文件才算数；而下面那个排空循环还要
+    // 几秒，期间 Ctrl-C 会直接杀掉进程 —— 那正好落在「内容已写满、头还是占位值」
+    // 的窗口里。收尾越早，这个窗口越小。
+    if let Some(d) = dump.as_mut() {
+        match d.finish() {
+            Ok(()) => {
+                let secs = d.seconds();
+                println!(
+                    "WAV 已写出：{}（{secs:.3} 秒，{src_rate}Hz，{WAV_CHANNELS} 声道，16-bit PCM{}）",
+                    d.path().display(),
+                    if d.incomplete() {
+                        "；⚠️ 写的过程中出过错，这个文件**不完整**"
+                    } else {
+                        ""
+                    }
+                );
+                // 与曲目元数据里的时长对一下 —— 这是 Task 10 那条「掐表」判据的
+                // 离线版。⚠️ 元数据本身常有取整误差（普遍在零点几秒），所以
+                // 差在 1 秒内说明不了什么；超过 1 秒才值得查。**这里不下结论**，
+                // 只把两个数和差值摆出来。
+                let meta = track.duration_ms as f64 / 1000.0;
+                if (secs - meta).abs() > 1.0 {
+                    log::warn!(
+                        "dump 时长 {secs:.3}s 与曲目元数据 {meta:.3}s 差 {:+.3}s —— \
+                         值得查（常见原因：解码被截断、容器声明与实际采样率不符）。\
+                         注意元数据本身也有取整误差。",
+                        secs - meta
+                    );
+                }
+            }
+            // 收尾失败 = 头还是占位值（长度写 0）。那种文件多数播放器照放，
+            // 但它是坏的 —— 必须说清，不能让它冒充证据。
+            Err(e) => log::error!(
+                "WAV 收尾失败（{}）：{e} —— 头里的两个长度字段仍是占位值 0，\
+                 **这个文件不能当证据用**。播放未受影响。",
+                d.path().display()
+            ),
+        }
+    } else if dump_wav.is_some() {
+        println!("WAV dump：**没有产出**（建文件时就失败了，见上方的错误）—— 播放未受影响。");
+    }
 
     // 解码报出来的实际采样率。**它必须与建流用的那个一致**，否则就是变速变调。
     // `decode_to_i16` 内部已经在两者不一致时告警了（容器声明 vs 解码器实际），
@@ -340,6 +434,174 @@ async fn play(keywords: &str, quality: &str, device: Option<&str>) -> anyhow::Re
         engine.device_error_count()
     );
     Ok(())
+}
+
+// ───────────────────────── `--dump-wav` 的落盘器 ─────────────────────────
+//
+// **自己写这 44 字节，零新依赖**（设计文档 §18.8 已论证过这条路：
+// `data` 偏移 36、payload 起始 44、RIFF size = 全长 − 8）。
+
+/// WAV 头固定 44 字节 —— 因为 16-bit PCM 的 `fmt ` 块是 16 字节，没有附加字段。
+const WAV_HEADER_LEN: usize = 44;
+/// **恰好 2 声道**：与 `dsls_audio::decode::decode_to_i16` 的契约一致
+/// （那个函数无条件把相邻两个样本当成一帧的 L/R）。
+const WAV_CHANNELS: u16 = 2;
+const WAV_BITS: u16 = 16;
+/// 1 帧的字节数 = `block_align`。
+const WAV_FRAME_BYTES: u16 = WAV_CHANNELS * WAV_BITS / 8;
+/// `RIFF` 的长度字段 = **本字段之后**的字节数 = 4("WAVE") + 8+16("fmt ") + 8+data。
+const WAV_RIFF_OVERHEAD: u32 = 36;
+
+/// `--dump-wav` 的落盘器：16-bit PCM、2 声道，**采样率写源率**。
+///
+/// **dump 的是「推进 ring 的那一批样本」**，不是「ring 取出的样本」。
+/// ⚠️ **采样率必须写源率**：`push_samples` 收的就是源率样本（重采样在
+/// `AudioEngine` 内部，是这条链路之后的事），写设备率会把一个 44.1kHz 的文件
+/// 标成 48kHz —— 时长与音高跟着错 8.84%，而那**不是格式小瑕疵，是把证据做假**。
+///
+/// ⚠️ **两个长度字段收尾时必须回填**（[`WavDump::finish`]）。不补的话多数
+/// 播放器仍能放（它们容忍），**但那是个坏文件** —— 而一个「能放」的坏文件
+/// 比一个打不开的文件更危险：它看起来像证据。
+struct WavDump {
+    file: std::fs::File,
+    /// 出错时要能说清是**哪个文件**，所以路径要留着。
+    path: PathBuf,
+    /// 源采样率（Hz），直接写进头。
+    rate: u32,
+    /// 已写出的**帧**数（1 帧 = L、R 两个 i16）。收尾时用它和磁盘上的真实
+    /// 字节数对账 —— 两者不等就说明中途写失败过。
+    frames: u64,
+    /// 头里 `data` 字段的**最终**值（收尾时按真实长度定），也是算秒数的依据。
+    data_len: u32,
+    /// i16 → 小端字节的中转缓冲。复用以免每 4096 个样本就分配一次。
+    buf: Vec<u8>,
+    /// **中间出过事**（写失败、或磁盘上的长度与预期对不上）—— 此时文件不能
+    /// 冒充「完整的证据」。名字不叫 truncated：写失败也可能一个字节都没写进去，
+    /// 说「截断」是**过度断言**，说「不完整」才是真的。
+    incomplete: bool,
+}
+
+impl WavDump {
+    /// 建文件 + 先写**占位**的头：`data` 有多长此刻还不知道，见 `finish`。
+    fn create(path: &Path, rate: u32) -> std::io::Result<Self> {
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&Self::header(rate, 0))?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            rate,
+            frames: 0,
+            data_len: 0,
+            buf: Vec::new(),
+            incomplete: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 44 字节的头。`data_len` 是 `data` 段的**字节**数，不是帧数。
+    fn header(rate: u32, data_len: u32) -> [u8; WAV_HEADER_LEN] {
+        let mut h = [0u8; WAV_HEADER_LEN];
+        h[0..4].copy_from_slice(b"RIFF");
+        h[4..8].copy_from_slice(&(WAV_RIFF_OVERHEAD + data_len).to_le_bytes());
+        h[8..12].copy_from_slice(b"WAVE");
+        // ⚠️ 是 "fmt "（**4 字节，带尾空格**），不是 "fmt"。
+        h[12..16].copy_from_slice(b"fmt ");
+        h[16..20].copy_from_slice(&16u32.to_le_bytes()); // fmt 块长度：PCM 固定 16
+        h[20..22].copy_from_slice(&1u16.to_le_bytes()); // 1 = 整数 PCM（不是 IEEE float）
+        h[22..24].copy_from_slice(&WAV_CHANNELS.to_le_bytes());
+        h[24..28].copy_from_slice(&rate.to_le_bytes());
+        h[28..32].copy_from_slice(&(rate * u32::from(WAV_FRAME_BYTES)).to_le_bytes()); // 字节率
+        h[32..34].copy_from_slice(&WAV_FRAME_BYTES.to_le_bytes());
+        h[34..36].copy_from_slice(&WAV_BITS.to_le_bytes());
+        h[36..40].copy_from_slice(b"data");
+        h[40..44].copy_from_slice(&data_len.to_le_bytes());
+        h
+    }
+
+    /// 写一批**源率、2 声道交错**的 i16。
+    ///
+    /// ⚠️ **失败只报一次、且不向上传播**：dump 是辅助手段不是主路径，
+    /// 不能因为它写不进去就让整首歌播不成。重复报也不行 —— 失败会在**每个**
+    /// chunk（4096 个样本 ≈ 46ms）重演，不设闸就是每 46ms 刷一条同样的错误，
+    /// 把真正该看的输出淹掉。
+    fn write(&mut self, samples: &[i16]) {
+        if self.incomplete {
+            return;
+        }
+        self.buf.clear();
+        // 复用缓冲：满了就不再分配（第一批之后 reserve 都是 no-op）。
+        self.buf.reserve(samples.len() * 2);
+        for s in samples {
+            self.buf.extend_from_slice(&s.to_le_bytes());
+        }
+        // 先记账再写：`finish` 用**磁盘上的真实长度**兜底，所以即使这里写到
+        // 一半失败，账错了也不会让头撒谎。⚠️ 顺带一提，`samples.len() / 2` 的
+        // 向下取整也是「解码输出必须是偶数个 i16」这条契约的哨兵：万一哪天它
+        // 被破坏（单声道源没归一化），账就会和真实长度对不上，`finish` 会报出来
+        // —— 而不是悄悄产出一个错位的 WAV。
+        self.frames += (samples.len() / 2) as u64;
+        if let Err(e) = self.file.write_all(&self.buf) {
+            self.incomplete = true;
+            log::error!(
+                "写 WAV 失败（{}）：{e} —— **dump 到此中断，播放继续**。\
+                 已写进去的部分收尾时会按真实长度补头，但它不再是完整的证据。",
+                self.path.display()
+            );
+        }
+    }
+
+    /// 回填 `RIFF` 与 `data` 两个长度字段。
+    ///
+    /// ⚠️ **用磁盘上的真实长度，不用帧计数。** 写失败可能停在某个 chunk 中间，
+    /// 那时计数比文件里真有的字节多；拿计数去回填会把 `data` 写得比 payload 长
+    /// —— 那正是「头撒谎」的坏文件，而它**照样能被多数播放器打开**。
+    /// 真实长度还顺带校验了计数：两者不等就说明中途出过事，一并标出来。
+    fn finish(&mut self) -> anyhow::Result<()> {
+        let bytes = self
+            .file
+            .metadata()?
+            .len()
+            .saturating_sub(WAV_HEADER_LEN as u64);
+        let expected = self.frames * u64::from(WAV_FRAME_BYTES);
+        if bytes != expected {
+            self.incomplete = true;
+            log::warn!(
+                "dump 记的是 {expected} 字节、文件里实际是 {bytes} 字节 —— 中间出过事。\
+                 头按**实际**长度补（这样文件自身是自洽的、能打开），\
+                 但它的内容不完整，**别拿它当证据**。"
+            );
+        }
+        // RIFF 的长度字段是 u32：能表达的 payload 上限是 4GiB − 44B
+        // （≈ 6.7 小时的 44.1kHz 立体声）。超了就没有诚实的头可写 —— 报错，
+        // 不写一个截断冒充的数字。
+        anyhow::ensure!(
+            bytes <= u64::from(u32::MAX) - u64::from(WAV_RIFF_OVERHEAD),
+            "dump 数据段 {bytes} 字节，超出 RIFF 的上限（4GiB − 44B）—— 写不出诚实的头，\
+             这个文件不可用",
+        );
+        self.data_len = u32::try_from(bytes)?;
+        // 两个字段在头里不挨着：RIFF size 在偏移 4，data size 在偏移 40。
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file
+            .write_all(&(WAV_RIFF_OVERHEAD + self.data_len).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&self.data_len.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// 已写出的**实际**秒数 —— 按头里那个 `data` 长度算，不按「以为写了多少」。
+    fn seconds(&self) -> f64 {
+        let frames = f64::from(self.data_len) / f64::from(WAV_FRAME_BYTES);
+        frames / f64::from(self.rate)
+    }
+
+    /// 文件是不是**不完整**（写失败过 / 长度对不上）。
+    fn incomplete(&self) -> bool {
+        self.incomplete
+    }
 }
 
 /// M0 的渲染循环。
@@ -497,4 +759,116 @@ fn render_triangle() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ─────────────────────────────── 测试 ───────────────────────────────
+//
+// 这些测试**不需要声卡**（也就不受 VNC 影响）：它们只验头和数据。
+// 为什么值得单独验：头里的两个长度字段写错**不会有任何运行期症状** ——
+// 多数播放器容忍长度为 0 的头、照放不误。**「能打开」根本不能证明「头是对的」**，
+// 唯一的办法是逐字节读回来对。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 落盘到一个临时文件并读回原始字节。
+    fn dump_and_read(name: &str, rate: u32, samples: &[i16]) -> Vec<u8> {
+        let path = std::env::temp_dir().join(name);
+        let mut d = WavDump::create(&path, rate).expect("建 dump");
+        d.write(samples);
+        d.finish().expect("收尾");
+        let bytes = std::fs::read(&path).expect("读回");
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    fn u32_at(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
+
+    fn u16_at(b: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
+    }
+
+    /// 头是不是**恰好** 44 字节、字段对不对、两个长度字段有没有回填。
+    #[test]
+    fn header_is_44_bytes_and_lengths_are_backfilled() {
+        // 100 帧 = 200 个 i16 = 400 字节 payload。
+        let samples: Vec<i16> = (0..200).map(|i| i as i16).collect();
+        let b = dump_and_read("dslsmusic-dump-test-header.wav", 44100, &samples);
+
+        assert_eq!(b.len(), WAV_HEADER_LEN + 400, "文件长 = 44 + payload");
+        assert_eq!(&b[0..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        assert_eq!(&b[12..16], b"fmt ", "块名是 4 字节的 fmt+空格");
+        assert_eq!(&b[36..40], b"data", "data 偏移必须是 36（设计文档 §18.8）");
+
+        assert_eq!(u32_at(&b, 16), 16, "fmt 块长度");
+        assert_eq!(u16_at(&b, 20), 1, "1 = 整数 PCM");
+        assert_eq!(u16_at(&b, 22), WAV_CHANNELS);
+        assert_eq!(u32_at(&b, 24), 44100, "采样率 = 源率");
+        assert_eq!(u32_at(&b, 28), 44100 * 4, "字节率 = 采样率 × 帧字节数");
+        assert_eq!(u16_at(&b, 32), WAV_FRAME_BYTES, "block_align");
+        assert_eq!(u16_at(&b, 34), WAV_BITS);
+
+        // 两个长度字段：写文件时是 0，`finish` 必须回填成真值。
+        assert_eq!(u32_at(&b, 40), 400, "data size");
+        assert_eq!(
+            u32_at(&b, 4) as usize,
+            b.len() - 8,
+            "RIFF size = 全长 − 8（含 'WAVE' 与两个块头）"
+        );
+
+        // payload 逐字节等于样本的小端表示 —— 头对不等于内容对。
+        let payload: Vec<u8> = (0..200i16).flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(&b[WAV_HEADER_LEN..], &payload[..]);
+    }
+
+    /// 秒数按**写入头里的那个采样率**算。写成设备率的话时长会差 8.84%
+    /// （44100 vs 48000），而文件照样能打开 —— 这是最容易被放过去的那种错。
+    #[test]
+    fn seconds_follow_the_header_rate() {
+        let path = std::env::temp_dir().join("dslsmusic-dump-test-seconds.wav");
+        let mut d = WavDump::create(&path, 44100).expect("建 dump");
+        let one_second: Vec<i16> = vec![0; 44100 * 2];
+        d.write(&one_second);
+        d.finish().expect("收尾");
+
+        assert!((d.seconds() - 1.0).abs() < 1e-9, "got {}", d.seconds());
+        assert!(!d.incomplete(), "正常写完不该标成不完整");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **头不能撒谎。** 模拟「写到一半文件被截断」：头必须按磁盘上**真实**的
+    /// 字节数补，而不是按我们以为写了多少 —— 后者会产出「头说 400 字节、
+    /// 实际 0 字节」的文件，而它照样能被多数播放器打开。
+    #[test]
+    fn header_follows_the_file_not_the_counter() {
+        let path = std::env::temp_dir().join("dslsmusic-dump-test-truncated.wav");
+        let mut d = WavDump::create(&path, 44100).expect("建 dump");
+        let samples: Vec<i16> = vec![0; 200];
+        d.write(&samples);
+        // 外部把 payload 全砍掉，只留 44 字节的头。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(WAV_HEADER_LEN as u64)
+            .unwrap();
+        d.finish().expect("收尾");
+
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(u32_at(&b, 40), 0, "data size 必须跟磁盘上的真实长度走");
+        assert_eq!(u32_at(&b, 4), WAV_RIFF_OVERHEAD, "RIFF size = 36 + 0");
+        assert!(d.incomplete(), "这种情况必须标成不完整");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 建文件失败要**返回 Err**（`play` 把它变成一条可见的错误日志 + 继续播放），
+    /// 不是 panic、更不是静默。
+    #[test]
+    fn create_failure_is_an_error_not_a_panic() {
+        let path = Path::new("/nonexistent-dir-dslsmusic-dump/x.wav");
+        assert!(WavDump::create(path, 44100).is_err());
+    }
 }
