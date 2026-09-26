@@ -3657,7 +3657,7 @@ M0 与 M1 全部完成当且仅当：
 
 | 遗留项 | 处理时机 |
 |---|---|
-| `ringbuf` 0.4 的实际 API 签名需在 Task 8 实现时对照 `cargo doc` | Task 8 |
+| ~~`ringbuf` 0.4 的实际 API 签名需在 Task 8 实现时对照 `cargo doc`~~ | **已解决** —— 2026-09-26 从 crates.io 发布包核实过（`overflows`/`underruns` **不存在**、`push_slice`/`pop_slice` 才是真名；`0.4.9` 已被 yank）；Task 8 已按核实结果实现并结案 |
 | 网易云 eapi 加密正确性未交叉验证 | M2，对照 `ddy314/netease-music` |
 | 未做 Android 真机验证 | M3 之后 |
 | 未做 `downlevel_webgl2_defaults()` 的 Tier B/C 路径实测 | M3 |
