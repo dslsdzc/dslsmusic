@@ -2449,6 +2449,9 @@ pub fn parse_search_tracks(body: &Value) -> Result<Vec<Track>, SourceError> {
 
 /// 从 `song/url/v1` 响应里取出可播放 URL，**并核对实际档位**。
 ///
+/// 核对侧复用 `client.rs` 的 `level_for`（`pub(crate)`）—— **同一份映射，
+/// 不各写一份**。
+///
 /// `want` 是**精确档位要求**，不是「取所能及的最高档」——这是 Task 5 的
 /// `MusicSource::stream_url` 文档定下的契约，也是
 /// `should_retry_lower_quality()` 唯一有意义的来源。
@@ -2572,7 +2575,7 @@ impl MusicSource for NeteaseClient {
             .song_url_v1(
                 &Query::new()
                     .param("id", track_id)
-                    .param("level", level_for(quality)),
+                    .param("level", level_for(quality)?),
             )
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
@@ -2580,15 +2583,37 @@ impl MusicSource for NeteaseClient {
     }
 }
 
-/// 档位 → 网易云 `level` 参数。**必须覆盖 `Quality` 的全部变体** ——
-/// 少一个变体这里就是编译错误，那是有意的（加档位不能忘了接线）。
-fn level_for(q: Quality) -> &'static str {
+/// 档位 → 网易云 `level` 参数。
+///
+/// ⚠️ **`#[non_exhaustive]` 让「少一个变体就是编译错误」在下游做不到。**
+///
+/// `Quality` 标了 `#[non_exhaustive]`，而本 crate 是**下游** crate ——
+/// 编译器**强制要求**这里写一个通配臂（不写就是 E0004）。也就是说
+/// **穷尽性检查在这里根本不存在**，通配臂是编译器逼出来的，不是我们偷懒。
+/// （Task 5b 那条阶梯测试能成立，只因它跑在**定义 crate 内部**。）
+///
+/// ⇒ 所以把「加了档位忘了接线」这件事**从编译期挪到运行期，并让它响亮**：
+/// 返回 `Result`，通配臂给 `Err(Protocol)`。
+///
+/// ⚠️ **通配臂故意不返回 `Unavailable`** —— 那个变体的语义是「有版权但当前
+/// 拿不到」，会触发正常的降档重试链。若用它，「加了档位忘了接线」就会
+/// **伪装成一次正常的版权降档**，维护信号彻底丢失。
+/// `Protocol` 会让 `is_upstream_changed()` 为真，是唯一的正确归类。
+///
+/// `pub(crate)`：`parse.rs` 的核对侧要用**同一份**映射。各写一份会静默分叉，
+/// 而那种分叉的表现是「请求要无损、核对说不是无损」，极难查。
+pub(crate) fn level_for(q: Quality) -> Result<&'static str, SourceError> {
     match q {
-        Quality::Low => "standard",
-        Quality::Standard => "higher",
-        Quality::High => "exhigh",
-        Quality::Lossless => "lossless",
-        Quality::HiRes => "hires",
+        Quality::Low => Ok("standard"),
+        Quality::Standard => Ok("higher"),
+        Quality::High => Ok("exhigh"),
+        Quality::Lossless => Ok("lossless"),
+        Quality::HiRes => Ok("hires"),
+        // `Quality` 是 #[non_exhaustive] 且定义在别的 crate，
+        // 这个臂**必须**存在。走到这里 = provider-api 加了新档位而本 crate 没跟上。
+        _ => Err(SourceError::Protocol(format!(
+            "provider-netease 未接线 Quality 变体 {q:?}，请更新 level_for"
+        ))),
     }
 }
 ```
