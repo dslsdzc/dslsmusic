@@ -2515,6 +2515,22 @@ impl AudioRingConsumer {
         n
     }
 
+    /// **不补静音、不计数**的原始取值。永不阻塞、永不分配。
+    ///
+    /// 音频回调用它，而不用 `pop_samples`——因为**静音必须补在目标采样格式
+    /// `T` 的域里**：`f32` 的静音是 `0.0`、`i16` 是 `0`、**`u8` 是 `128`**。
+    /// 在 i16 域里补 0 再转换是对的，但直接往 `T` 上写 `0` 在 u8 设备上
+    /// 是满幅直流噪声。回调侧的补静音见 `fill_from_ring` 的 `T::EQUILIBRIUM`。
+    pub fn pop_raw(&mut self, out: &mut [i16]) -> usize {
+        self.inner.pop_slice(out)
+    }
+
+    /// 记一次欠载。**按「事件」计，不按缺失样本数计**——与 `pop_samples`
+    /// 的口径一致，这样「xrun 必须为 0」这条硬指标才有可比性。
+    pub fn count_underruns(&self, n: u64) {
+        self.underruns.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
     }
@@ -2746,33 +2762,13 @@ impl AudioEngine {
         );
 
         // ~4 秒缓冲（立体声 44.1kHz）。**split 之后消费端移进回调，全程无锁。**
-        let (mut producer, mut consumer) = AudioRing::new(44100 * 2 * 4).split();
+        let (producer, consumer) = AudioRing::new(44100 * 2 * 4).split();
 
-        let channels = config.channels as usize;
-        // ⚠️ 回调内**绝不分配**：这里一次性预分配足够容量，
-        //    回调里的 resize 就不会触发重新分配（回调缓冲远小于 8192 帧）。
-        let mut scratch: Vec<i16> = Vec::with_capacity(8192 * 2);
-
-        // ⚠️ 0.18 的 `config` 是**按值传**的（旧版是引用），且多了第 4 个参数
-        //    `timeout: Option<Duration>`。已核实·源码 cpal-0.18.2/src/traits.rs:318-329。
-        //    错误类型也变了：没有 `BuildStreamError` 了，统一是 `cpal::Error`。
-        let stream = device.build_output_stream(
-            config,
-            move |out: &mut [f32], _| {
-                let frames = out.len() / channels;
-                scratch.resize(frames * 2, 0); // 引擎内部固定立体声
-                consumer.pop_samples(&mut scratch);
-
-                for (i, slot) in out.iter_mut().enumerate() {
-                    let frame = i / channels;
-                    let ch = (i % channels).min(1);
-                    // 上混：立体声 → N 声道
-                    *slot = scratch[frame * 2 + ch] as f32 / i16::MAX as f32;
-                }
-            },
-            |err| log::error!("音频流错误: {err}"),
-            None,
-        )?;
+        // ⚠️ **不要硬写 `f32`。** `build_output_stream<T>` 是泛型，`T` 由调用方选；
+        //    而设备默认格式是运行时才知道的（本机实测 F32/48000，但换台设备可能是
+        //    别的）。硬写 f32 等于假设「所有设备的默认格式都是 F32」——
+        //    在不是的设备上直接建流失败，**而这个任务的出口标准就是「出声」**。
+        let stream = build_stream_for(&device, config, sample_format, consumer)?;
         stream.play()?;
 
         Ok(Self { _stream: stream, producer })
@@ -2790,6 +2786,123 @@ impl AudioEngine {
     /// **硬指标：必须为 0**（设计文档 §16.2）。
     pub fn xrun_count(&self) -> u64 {
         self.producer.underruns()
+    }
+}
+
+/// 按**设备自己报的**采样格式分发。一份回调体覆盖全部受支持格式。
+///
+/// ⚠️ **不要照抄 cpal 官方文档的示例**（`cpal-0.18.2/src/lib.rs:104-124`）：
+/// 它只分支 `F32/I16/U16`、其余 `panic!`——而**本机实测 `u16` 会被拒**
+/// （`Sample format u16 is not supported in any byte order`），
+/// 照抄会在本机直接 panic。这里一律返回 `Err`，绝不 panic。
+fn build_stream_for(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    consumer: AudioRingConsumer,
+) -> anyhow::Result<cpal::Stream> {
+    use cpal::SampleFormat as F;
+    match format {
+        F::F32 => build_output::<f32>(device, config, consumer),
+        F::I16 => build_output::<i16>(device, config, consumer),
+        F::I32 => build_output::<i32>(device, config, consumer),
+        // I24 本机设备确实报告支持，**漏了它会掉进 other 分支**
+        F::I24 => build_output::<cpal::I24>(device, config, consumer),
+        F::U8 => build_output::<u8>(device, config, consumer),
+        other => anyhow::bail!(
+            "不支持的输出采样格式 {other:?}。请把这个值报上来，不要静默降级到无声。"
+        ),
+    }
+}
+
+fn build_output<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    mut consumer: AudioRingConsumer,
+) -> anyhow::Result<cpal::Stream>
+where
+    T: cpal::SizedSample + cpal::Sample + cpal::FromSample<i16> + Send + 'static,
+{
+    // 回调内**绝不分配**：scratch 在这里一次性分配好，再 move 进闭包。
+    // （旧写法在回调里 `scratch.resize()`——虽然容量预留着不会真重分配，
+    //   但那是把「不分配」这条硬约束押在容量估算上，换个大缓冲就破了。）
+    let mut scratch: Vec<i16> = vec![0; 8192];
+    // 通道数要在 move 进闭包**之前**取出来（`config` 下面会被按值消费掉）
+    let channels = config.channels as usize;
+
+    // ⚠️ 0.18 的 `config` **按值传**（旧版是引用），且多了第 4 个参数
+    //    `timeout: Option<Duration>`；错误类型没有 `BuildStreamError` 了，
+    //    统一是 `cpal::Error`。已核实·源码 cpal-0.18.2/src/traits.rs:318-329。
+    let stream = device.build_output_stream(
+        config,
+        move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+            fill_from_ring::<T>(out, channels, &mut consumer, &mut scratch);
+        },
+        |err| log::error!("音频流错误: {err}"),
+        None, // timeout：None = 无限等待后端初始化
+    )?;
+    Ok(stream)
+}
+
+/// **唯一的回调体。** 一份代码覆盖 f32 / i16 / i32 / I24 / u8。
+///
+/// 用**分块 `pop_slice`** 而不是逐样本 `try_pop`——实测快约 50 倍
+/// （0.4 ns/样本 vs 20.0 ns/样本，各 800 万样本）。本函数全程无锁、
+/// 无分配、无 IO（设计文档 §16.2）。
+fn fill_from_ring<T>(
+    out: &mut [T],
+    channels: usize,
+    consumer: &mut AudioRingConsumer,
+    scratch: &mut [i16],
+) where
+    T: cpal::SizedSample + cpal::Sample + cpal::FromSample<i16>,
+{
+    let total_frames = out.len() / channels;
+    let cap_frames = (scratch.len() / 2).max(1); // scratch 存的是立体声样本
+    let mut frame = 0usize;
+    let mut starved = false;
+
+    while frame < total_frames {
+        let want_frames = (total_frames - frame).min(cap_frames);
+        let got = consumer.pop_raw(&mut scratch[..want_frames * 2]);
+        let got_frames = got / 2;
+
+        for f in 0..want_frames {
+            let (l, r) = if f < got_frames {
+                (scratch[f * 2], scratch[f * 2 + 1])
+            } else {
+                (0, 0) // i16 域的静音；转换到 T 后自然就是该格式的静音
+            };
+            let base = (frame + f) * channels;
+            for ch in 0..channels {
+                // 上混：0→左、1→右，其余声道静音
+                let v = if ch == 0 {
+                    l
+                } else if ch == 1 {
+                    r
+                } else {
+                    0
+                };
+                out[base + ch] = T::from_sample(v);
+            }
+        }
+
+        if got < want_frames * 2 {
+            starved = true;
+        }
+        frame += got_frames;
+        if starved {
+            break;
+        }
+    }
+
+    if starved {
+        consumer.count_underruns(1);
+        // ⚠️ 静音值随 T 而变：f32→0.0、i16→0、**u8→128**。
+        //    手写 `*s = 0` 在 u8 设备上会产生满幅直流噪声。必须用 EQUILIBRIUM。
+        for slot in &mut out[frame * channels..] {
+            *slot = T::EQUILIBRIUM;
+        }
     }
 }
 ```
