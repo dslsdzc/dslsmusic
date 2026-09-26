@@ -1,5 +1,6 @@
 use dsls_provider_api::SourceError;
 use ncm_api_rs::{ApiClient, Query, create_client};
+use serde_json::Value;
 
 pub struct NeteaseClient {
     inner: ApiClient,
@@ -40,13 +41,15 @@ impl NeteaseClient {
         // 上游版本上**不会命中**。
         //
         // 那条 fallback 仍然保留：网易是该 provider 里唯一不受我们控制的、
-        // 无版本号的上游（设计文档 §13.1 整节都在讲这个），多留一条 `or_else`
+        // 无版本号的上游（设计文档 §13.1 整节都在讲这个），多留一条分支
         // 换的是「上游改形状时还能活着」而不是「更正确」。
-        // 要删就删这一行，删掉后本函数的行为在今天的上游上与保留时**完全一致**。
-        resp.body
-            .get("unikey")
-            .or_else(|| resp.body.pointer("/data/unikey"))
-            .and_then(|v| v.as_str())
+        //
+        // ⚠️ **fallback 的顺序很重要**（复审 Minor 8）：必须先 `and_then(as_str)`
+        // 再 `or_else`。旧写法 `.get(..).or_else(|| pointer(..))` 里 `or_else`
+        // 挂在 `Option<&Value>` 上——上游若发 `{"unikey": null, "data": {...}}`，
+        // `get` 得到的是 `Some(Null)` 而不是 `None`，**`or_else` 根本不会触发**，
+        // 最后仍是 `None`。那恰好是 fallback 本该救的场景，等于它白留了。
+        pick_unikey(&resp.body)
             .map(|s| s.to_string())
             .ok_or_else(|| SourceError::Protocol("login_qr_key 未返回 unikey".into()))
     }
@@ -54,7 +57,8 @@ impl NeteaseClient {
     /// 第二步：拿到扫码 URL，**在本地渲染**成 PNG。
     ///
     /// ⚠️ **crate 不提供二维码图片，这一步必须我们自己做。**
-    /// 已核实 `src/api/login_qr_create.rs` 全文 28 行：它**不发任何网络请求**，
+    /// 已核实 `src/api/login_qr_create.rs` 全文 **29 行**（892 字节、29 个换行、
+    /// 以换行结尾）：它**不发任何网络请求**，
     /// 只在本地拼出 `https://music.163.com/login?codekey=<key>`，且
     /// `qrimg` **恒为空字符串**、`qrimg` 参数**根本不被读取**。
     /// crate 的依赖里也没有任何二维码/图片库。
@@ -91,10 +95,11 @@ impl NeteaseClient {
 
         // ⚠️ 读 body 的 code，**不要读 resp.status** —— 800/801/802/803 在
         // request.rs:17-19 被折叠成 200，在 status 上无法区分（理由见 QrState 的文档）。
+        // `json_code` 容忍字符串码，与 crate 自己的折叠逻辑对齐（复审 Minor 3）。
         let code = resp
             .body
             .pointer("/code")
-            .and_then(|v| v.as_i64())
+            .and_then(json_code)
             .ok_or_else(|| SourceError::Protocol("login_qr_check 未返回 code".into()))?;
 
         // ⚠️ cookie **不在 body 里** —— 它在 `ApiResponse.cookie`，由响应头
@@ -104,8 +109,33 @@ impl NeteaseClient {
         // 所以「读 body.cookie」的写法在这里不适用。
         //
         // 传原始条目进去，由 `session_cookie` 负责拼装与清洗。
-        Ok(crate::qr_login::QrState::from_code(code, &resp.cookie))
+        // `from_code` 自己返回 `Result`（803 拿不到会话 / 未知状态码都是 `Err`），
+        // 所以这里**不要**再包一层 `Ok(..)`。
+        crate::qr_login::QrState::from_code(code, &resp.cookie)
     }
+}
+
+/// 从 `login_qr_key` 的响应体里取 unikey。**纯函数，可单测。**
+///
+/// 两条路径都试，谁先命中用谁。顺序是 `顶层 → /data`，且**每一步都先
+/// `as_str()` 再进 `or_else`**（理由见 `qr_key` 里的注释，复审 Minor 8）：
+/// 只有在顶层这个键**根本不存在**或**不是字符串**（含 `null`）时才轮到 fallback。
+fn pick_unikey(body: &Value) -> Option<&str> {
+    body.get("unikey")
+        .and_then(Value::as_str)
+        .or_else(|| body.pointer("/data/unikey").and_then(Value::as_str))
+}
+
+/// 从 JSON 值里读一个整数状态码，**容忍字符串数字**。
+///
+/// 与 crate 自己的折叠逻辑（`src/request.rs:473-484`）逐字对齐：
+/// 那边写的是 `as_i64().or_else(|| as_str().and_then(parse))`，
+/// 即 crate 作者预料到过 `"code": "801"` 这种形状。我们不对齐的话，
+/// 上游一旦改成字符串码，**crate 本来能扛住、我们却报 `Protocol` 错**
+/// （复审 Minor 3）。非数字串与 `null` 仍然返回 `None`。
+fn json_code(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// 把二维码内容渲染成 PNG 字节。**纯函数，可单测。**
@@ -139,5 +169,90 @@ mod tests {
             &png[..png.len().min(8)]
         );
         assert!(png.len() > 100, "PNG 太小，可能是空图: {} 字节", png.len());
+    }
+
+    #[test]
+    fn rendered_qr_is_a_scannable_image() {
+        // ★ 上一条只证明「是 PNG」，抓不到两类会让码扫不出来的回归：
+        //   (a) **反色**（dark_color/light_color 对调）—— 很多扫码器读不出反色码；
+        //   (b) **丢掉静默区**（`quiet_zone(false)`）—— 扫码率断崖式下降。
+        // 复审实测的基准（同一个内容）：259×259、像素只有 0 与 255、
+        // 静默区 4 模块。下面三条分别钉住尺寸、静默区、极性。
+        let png = render_qr_png("https://music.163.com/login?codekey=abc").unwrap();
+        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("渲染出来的字节必须能被 PNG 解码器读回")
+            .to_luma8();
+
+        let (w, h) = img.dimensions();
+        assert_eq!(w, h, "二维码必须是正方形，实得 {w}x{h}");
+        assert!(
+            w >= 250,
+            "边长必须 ≥250px（min_dimensions 的产物），实得 {w}"
+        );
+
+        // 静默区：左上角 16×16 必须全白。实测静默区是 4 模块 × 7px = 28px，
+        // 所以 16×16 必然整个落在静默区里 —— 反色或去掉静默区都会在这里断。
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = img.get_pixel(x, y).0[0];
+                assert_eq!(v, 255, "左上角 ({x},{y}) 应落在白色静默区里，实得 {v}");
+            }
+        }
+
+        // 极性：整张图只允许纯黑 0 与纯白 255。灰阶抖动（抗锯齿 / 缩放插值）
+        // 会引入中间值，而中间值会让二值化阈值不稳。
+        let mut dark = 0usize;
+        let mut light = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let v = img.get_pixel(x, y).0[0];
+                assert!(v == 0 || v == 255, "({x},{y}) = {v} 既不是黑也不是白");
+                if v == 0 {
+                    dark += 1;
+                } else {
+                    light += 1;
+                }
+            }
+        }
+        assert!(
+            dark > 0 && light > 0,
+            "图像必须同时含黑与白（全白/全黑都不可能是有效二维码），实得 dark={dark} light={light}"
+        );
+    }
+
+    #[test]
+    fn pick_unikey_falls_back_past_a_null_top_level_key() {
+        // ★ 回归测试（复审 Minor 8）。旧写法 `.get(..).or_else(..)` 里
+        // `or_else` 挂在 `Option<&Value>` 上：顶层是 `null` 时 `get` 得到
+        // `Some(Null)` 而非 `None`，**fallback 根本不触发** —— 恰好是它
+        // 本该救的场景。
+        let body = serde_json::json!({"unikey": null, "data": {"unikey": "x"}});
+        assert_eq!(pick_unikey(&body), Some("x"));
+
+        // 顶层命中时优先用顶层（2026-09-26 真机实测的形状）
+        let body = serde_json::json!({"code": 200, "unikey": "top", "data": {"unikey": "x"}});
+        assert_eq!(pick_unikey(&body), Some("top"));
+
+        // 顶层不是字符串也轮到 fallback
+        let body = serde_json::json!({"unikey": 123, "data": {"unikey": "x"}});
+        assert_eq!(pick_unikey(&body), Some("x"));
+
+        // 两条路径都没有 → None（调用方据此报 Protocol 错）
+        assert_eq!(pick_unikey(&serde_json::json!({"code": 200})), None);
+        assert_eq!(pick_unikey(&serde_json::json!({"unikey": null})), None);
+    }
+
+    #[test]
+    fn json_code_tolerates_string_status_codes() {
+        // ★ 回归测试（复审 Minor 3）。crate 自己（`request.rs:473-484`）容忍
+        // `"code": "801"`；我们不容忍的话，上游一次形状变化就会把本来能扛住的
+        // 情况变成 `Protocol` 错。
+        assert_eq!(json_code(&serde_json::json!(801)), Some(801));
+        assert_eq!(json_code(&serde_json::json!("801")), Some(801));
+
+        // 但真正的垃圾仍要被拒 —— 不能为了容忍字符串把非数字也放进来
+        assert_eq!(json_code(&serde_json::json!("等待扫码")), None);
+        assert_eq!(json_code(&serde_json::json!(null)), None);
+        assert_eq!(json_code(&serde_json::json!({})), None);
     }
 }

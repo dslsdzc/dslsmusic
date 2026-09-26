@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# ⚠️ 这里**刻意没有 `anyhow`**：音源层对外一律 typed `SourceError`（设计文档 §4.5），
+# `anyhow` 只允许出现在 `app` 的边界。作为一条声明了的依赖，它与这条约束方向相反，
+# 且是一条活隐患 —— 任何人往这个 crate 里写 `use anyhow::Result` 都没有工具会报错。
 dsls-provider-api = { path = "../provider-api" }
 # 已核实：全 crate 只有 0.1.0 一个发布版本（2026-04-07，作者 imsyy/SPlayer）。
 # 保持 "0.1"（= ^0.1 = >=0.1.0,<0.2.0）而不是 =0.1.0：
@@ -17,8 +20,12 @@ dsls-provider-api = { path = "../provider-api" }
 ncm-api-rs = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 async-trait = "0.1"
-anyhow.workspace = true
 log.workspace = true
 serde_json = "1"
 qrcode = { version = "0.14.1", features = ["image"] }
-image = "0.25.9"
+# ⚠️ **必须关掉默认 feature。** `image` 的 default-formats 含 `avif`（走
+# `ravif` 纯 Rust AV1 编码器），而我们只用 `ImageFormat::Png` 这一个编解码器。
+# 实测本 crate 的依赖树：默认 feature 下 227 个唯一 crate（`ravif` / `avif-serialize`
+# 在树里），关掉后 164 个，两者都不在。详见 Task 6 报告「修复轮」。
+# （`png` feature 同时含编码与解码，够 `write_to` 与测试里的 `load_from_memory_with_format` 用。）
+image = { version = "0.25.9", default-features = false, features = ["png"] }
