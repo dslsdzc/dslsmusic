@@ -1558,23 +1558,56 @@ mod tests {
 
     #[test]
     fn maps_code_801_to_waiting_scan() {
-        assert_eq!(QrState::from_code(801, ""), QrState::WaitingScan);
+        assert_eq!(QrState::from_code(801, &[]), QrState::WaitingScan);
     }
 
     #[test]
     fn maps_code_802_to_waiting_confirm() {
-        assert_eq!(QrState::from_code(802, ""), QrState::WaitingConfirm);
+        assert_eq!(QrState::from_code(802, &[]), QrState::WaitingConfirm);
     }
 
     #[test]
     fn maps_code_800_to_expired() {
-        assert_eq!(QrState::from_code(800, ""), QrState::Expired);
+        assert_eq!(QrState::from_code(800, &[]), QrState::Expired);
     }
 
     #[test]
     fn maps_code_803_to_confirmed_with_cookie() {
-        let s = QrState::from_code(803, "MUSIC_U=tok; __csrf=y");
-        assert_eq!(s, QrState::Confirmed { cookie: "tok".to_string() });
+        let s = QrState::from_code(803, &["MUSIC_U=tok; __csrf=y".to_string()]);
+        assert_eq!(
+            s,
+            QrState::Confirmed { cookie: "MUSIC_U=tok; __csrf=y".to_string() }
+        );
+    }
+
+    #[test]
+    fn session_cookie_keeps_key_value_form() {
+        // ★ 回归测试。曾经的实现是「只留 MUSIC_U 的值」→ "tok"，
+        // 那个字符串喂给 create_client 后会被 cookie_to_json 整个丢掉，
+        // 表现为「登录成功但仍是游客」。**必须保留 k=v 形式。**
+        let s = session_cookie(&["MUSIC_U=tok; __csrf=y".to_string()]).unwrap();
+        assert_eq!(s, "MUSIC_U=tok; __csrf=y");
+        assert!(s.contains('='), "不能退化成裸 token");
+    }
+
+    #[test]
+    fn session_cookie_drops_set_cookie_attributes() {
+        // 真实的 Set-Cookie 长这样（crate 只删了 Domain=）。
+        // Path/Expires/HttpOnly 混进会话串后会变成垃圾 cookie 再注入请求头。
+        let raw = vec![
+            "MUSIC_U=tok; Path=/; Expires=Wed, 01 Jan 2027 00:00:00 GMT; HttpOnly".to_string(),
+            "__csrf=xyz; Path=/".to_string(),
+        ];
+        let s = session_cookie(&raw).unwrap();
+        assert_eq!(s, "MUSIC_U=tok; __csrf=xyz");
+        assert!(!s.contains("Path"), "属性不该进会话串: {s}");
+        assert!(!s.contains("HttpOnly"), "属性不该进会话串: {s}");
+    }
+
+    #[test]
+    fn session_cookie_is_none_without_music_u() {
+        assert_eq!(session_cookie(&["__csrf=y".to_string()]), None);
+        assert_eq!(session_cookie(&[]), None);
     }
 }
 ```
@@ -1601,19 +1634,57 @@ rust-version.workspace = true
 
 [dependencies]
 dsls-provider-api = { path = "../provider-api" }
+# 已核实：全 crate 只有 0.1.0 一个发布版本（2026-04-07，作者 imsyy/SPlayer）。
+# 保持 "0.1"（= ^0.1 = >=0.1.0,<0.2.0）而不是 =0.1.0：
+#   (a) semver 下 0.2 本来就不会被自动选中，破坏性升级不会悄悄进来；
+#   (b) =0.1.0 会把后续 0.1.x 的修 bug 版本也一起挡在门外；
+#   (c) 真正的防线是提交进仓库的 Cargo.lock。
+# 单版本 crate 的长期风险是真的 —— 缓解手段是把它整个包在我们自己的
+# NeteaseClient 后面（本任务就是这么做的），换实现时改动能收敛在这里。
 ncm-api-rs = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 async-trait = "0.1"
 anyhow.workspace = true
 log.workspace = true
 serde_json = "1"
+qrcode = { version = "*", features = ["image"] }
+image = "*"
 ```
+
+> **⚠️ 上面两个 `*` 是刻意的**：`qrcode` 的 `image` feature 与 `image` 主版本
+> 必须配套，写死版本号极易撞车。**用 `cargo add` 让 cargo 自己解**：
+>
+> ```bash
+> cargo add qrcode --features image -p dsls-provider-netease
+> ```
+>
+> 然后 `cargo add image -p dsls-provider-netease`。
+>
+> **注意 `Luma` 的类型一致性**：`qrcode` 的 `image` feature 会依赖它自己
+> 那一版的 `image`。若 `cargo add` 给 `image` 选了一个不同的大版本，
+> `code.render::<Luma<u8>>()` 会因为 `Luma` 是两个不同的类型而编译失败。
+> 届时**把 `image` 钉到 `cargo tree -p dsls-provider-netease -i image` 显示的
+> 那个版本**即可。
+>
+> **把 cargo 实际写入的版本号回报到本任务的报告里**，下一版计划据此钉死。
+> 不要把 `*` 提交上去——那是过渡态。
 
 `crates/provider-netease/src/qr_login.rs`：
 
 ```rust
 /// 网易云扫码登录返回码。
 /// 801 = 等待扫码，802 = 待确认，803 = 成功（带 cookie），800 = 二维码过期。
+///
+/// ⚠️ **这四个码必须从响应体的 `code` 字段读，绝不能读 `ApiResponse.status`。**
+/// 已核实 crate 源码 `src/request.rs:17-19`：
+/// ```ignore
+/// static SPECIAL_STATUS_CODES: LazyLock<HashSet<i64>> =
+///     LazyLock::new(|| [201, 302, 400, 502, 800, 801, 802, 803].into());
+/// ```
+/// 配合 `:473-484` 的折叠逻辑，**800/801/802/803 全被改写成 `200`**。
+/// 所以在 `resp.status` 上这四个状态完全不可区分——读到 200 不等于登录成功。
+/// （同样的原因：业务错误码 400 也被折叠成 `Ok(status=200)`。**`Ok` ≠ 成功**，
+/// 任何接口都应先看 `body["code"]`。）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QrState {
     WaitingScan,
@@ -1623,25 +1694,59 @@ pub enum QrState {
 }
 
 impl QrState {
-    pub fn from_code(code: i64, raw_cookie: &str) -> Self {
+    /// `raw_cookies` 是 `ApiResponse.cookie`，即响应头 `Set-Cookie` 的**原始条目**
+    /// （每条含 `Path=` / `Expires=` / `HttpOnly` 等属性，crate 只删了 `Domain=`）。
+    pub fn from_code(code: i64, raw_cookies: &[String]) -> Self {
         match code {
             801 => QrState::WaitingScan,
             802 => QrState::WaitingConfirm,
             803 => QrState::Confirmed {
-                cookie: extract_music_u(raw_cookie).unwrap_or_default(),
+                cookie: session_cookie(raw_cookies).unwrap_or_default(),
             },
             _ => QrState::Expired,
         }
     }
 }
 
-/// 从 `key=value; key=value` 形式的 cookie 串里取出 MUSIC_U。
-/// 登录态只需要这一个 key（设计文档 §4.2）。
-pub fn extract_music_u(raw: &str) -> Option<String> {
+/// 从 `key=value; key=value` 串里取出某个 cookie 的值。
+fn extract_cookie(raw: &str, key: &str) -> Option<String> {
     raw.split(';')
         .filter_map(|part| part.trim().split_once('='))
-        .find(|(k, _)| *k == "MUSIC_U")
+        .find(|(k, _)| *k == key)
         .map(|(_, v)| v.to_string())
+}
+
+/// 取出 MUSIC_U 的值。**这是给测试与诊断用的，不是要持久化的东西**——
+/// 要持久化请用 `session_cookie`。
+pub fn extract_music_u(raw: &str) -> Option<String> {
+    extract_cookie(raw, "MUSIC_U")
+}
+
+/// 从 `Set-Cookie` 原始条目里拼出**要持久化的会话 cookie 串**。
+///
+/// ⚠️ **这里只留 `MUSIC_U` 的值是错的。** `create_client(Some(s))` 要的是
+/// `k=v; k=v` 形式的 cookie 串；塞进去一个裸的 `"abc123"`，crate 的
+/// `cookie_to_json`（`src/util/cookie.rs:5-17`，按 `;` 切、按 `=` 分）
+/// 会把它整个丢掉——**结果是每个请求一个 cookie 都没带上**，
+/// 表现为「登录成功了但还是游客」。
+///
+/// 同时把 `__csrf` 一起留下（部分接口需要），并**丢掉 `Path=` /
+/// `Expires=` / `HttpOnly` 这些属性**——它们不是 cookie 键值对，
+/// 混进去会被当成垃圾 cookie 重新注入 Cookie 头。
+pub fn session_cookie(raw_cookies: &[String]) -> Option<String> {
+    let joined = raw_cookies.join("; ");
+    let music_u = extract_cookie(&joined, "MUSIC_U")?;
+    if music_u.is_empty() {
+        return None;
+    }
+
+    let mut out = format!("MUSIC_U={music_u}");
+    if let Some(csrf) = extract_cookie(&joined, "__csrf") {
+        if !csrf.is_empty() {
+            out.push_str(&format!("; __csrf={csrf}"));
+        }
+    }
+    Some(out)
 }
 ```
 
@@ -1676,33 +1781,46 @@ impl NeteaseClient {
             .login_qr_key(&Query::new())
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
+        // ⚠️ unikey 的嵌套层级**未从 crate 源码核实**：`login_qr_key` 把网易的
+        // 原始响应原样透传（`login_qr_key.rs:15-20`），不做任何整形，所以形状
+        // 由网易决定、不在 crate 里。两个路径都试，谁先命中用谁。
+        // 落地时打一次 `RUST_LOG=debug` 看一眼真实 body，即可定案并删掉另一条。
         resp.body
-            .pointer("/data/unikey")
+            .get("unikey")
+            .or_else(|| resp.body.pointer("/data/unikey"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| SourceError::Protocol("login_qr_key 未返回 unikey".into()))
     }
 
-    /// 第二步：用 key 生成二维码图片（PNG 字节）。
+    /// 第二步：拿到扫码 URL，**在本地渲染**成 PNG。
+    ///
+    /// ⚠️ **crate 不提供二维码图片，这一步必须我们自己做。**
+    /// 已核实 `src/api/login_qr_create.rs` 全文 28 行：它**不发任何网络请求**，
+    /// 只在本地拼出 `https://music.163.com/login?codekey=<key>`，且
+    /// `qrimg` **恒为空字符串**、`qrimg` 参数**根本不被读取**。
+    /// crate 的依赖里也没有任何二维码/图片库。
+    ///
+    /// （Node 参考实现是在客户端用 npm `qrcode` 库现渲染的，见
+    /// `api-enhanced/module/login_qr_create.js`。Rust 版把这个能力丢了。）
+    ///
+    /// 附带一句：该 crate 自带的 `docs/API.md:112,116` 仍写着「返回二维码
+    /// base64」——**那是从 Node 文档逐字继承的，与本 crate 的实现矛盾**。
     pub async fn qr_image(&self, key: &str) -> Result<Vec<u8>, SourceError> {
         let resp = self
             .inner
-            .login_qr_create(&Query::new().param("key", key).param("qrimg", "true"))
+            .login_qr_create(&Query::new().param("key", key))
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
 
-        let data_url = resp
+        let qrurl = resp
             .body
-            .pointer("/data/qrimg")
+            .pointer("/data/qrurl")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| SourceError::Protocol("login_qr_create 未返回 qrimg".into()))?;
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SourceError::Protocol("login_qr_create 未返回 qrurl".into()))?;
 
-        // 返回形如 "data:image/png;base64,...."
-        let b64 = data_url
-            .split_once("base64,")
-            .map(|(_, b)| b)
-            .ok_or_else(|| SourceError::Protocol("qrimg 不是 base64 data URL".into()))?;
-        decode_base64(b64)
+        render_qr_png(qrurl)
     }
 
     /// 第三步：轮询扫码状态。
@@ -1713,33 +1831,63 @@ impl NeteaseClient {
             .await
             .map_err(|e| SourceError::Network(e.to_string()))?;
 
+        // ⚠️ 读 body 的 code，**不要读 resp.status** —— 800/801/802/803 在
+        // request.rs:17-19 被折叠成 200，在 status 上无法区分（理由见 QrState 的文档）。
         let code = resp
             .body
             .pointer("/code")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| SourceError::Protocol("login_qr_check 未返回 code".into()))?;
 
-        // ⚠️ cookie 不在 body 里 —— 它在 ApiResponse.cookie（由 Set-Cookie 头填充）。
-        // 已核实：ncm-api-rs 的 ApiResponse 是
-        //   { status: i64, body: Value, cookie: Vec<String> }
-        let cookie = resp.cookie.join("; ");
-
-        Ok(crate::qr_login::QrState::from_code(code, &cookie))
+        // ⚠️ cookie **不在 body 里** —— 它在 `ApiResponse.cookie`，由响应头
+        // `Set-Cookie` 填充（request.rs:448-458，crate 只删了 `Domain=`）。
+        // 已核实 `ApiResponse` 是 { status: i64, body: Value, cookie: Vec<String> }。
+        // Node 版会把 cookie 塞进 body（login_qr_check.js），**Rust 版没有这层整形**，
+        // 所以「读 body.cookie」的写法在这里不适用。
+        //
+        // 传原始条目进去，由 `session_cookie` 负责拼装与清洗。
+        Ok(crate::qr_login::QrState::from_code(code, &resp.cookie))
     }
 }
 
-fn decode_base64(s: &str) -> Result<Vec<u8>, SourceError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .map_err(|e| SourceError::Protocol(format!("base64 解码失败: {e}")))
+/// 把二维码内容渲染成 PNG 字节。**纯函数，可单测。**
+fn render_qr_png(content: &str) -> Result<Vec<u8>, SourceError> {
+    use image::Luma;
+    use qrcode::QrCode;
+
+    let code = QrCode::new(content.as_bytes())
+        .map_err(|e| SourceError::Protocol(format!("二维码编码失败: {e}")))?;
+    // 放大到 256px 见方，否则终端/手机上都太小扫不出来
+    let img = code.render::<Luma<u8>>().min_dimensions(256, 256).build();
+
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| SourceError::Protocol(format!("PNG 编码失败: {e}")))?;
+    Ok(png)
 }
 ```
 
-`crates/provider-netease/Cargo.toml` 追加：
+`crates/provider-netease/src/client.rs` 末尾追加（**Task 7 会往同一个
+`mod tests` 里再加一条，所以这个模块要先建出来**）：
 
-```toml
-base64 = "0.22"
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_qr_png_produces_a_real_png() {
+        // crate 不给图，我们自己渲染 —— 这条测试守的是「渲染真的产出了 PNG」，
+        // 而不是「调用了某个 API」。
+        let png = render_qr_png("https://music.163.com/login?codekey=abc").unwrap();
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G']),
+            "缺少 PNG 魔数，前 8 字节: {:?}",
+            &png[..png.len().min(8)]
+        );
+        assert!(png.len() > 100, "PNG 太小，可能是空图: {} 字节", png.len());
+    }
+}
 ```
 
 `crates/provider-netease/src/lib.rs`：
@@ -1757,7 +1905,7 @@ pub mod qr_login;
 pub const PLATFORM: &str = "netease";
 
 pub use client::NeteaseClient;
-pub use qr_login::{QrState, extract_music_u};
+pub use qr_login::{QrState, extract_music_u, session_cookie};
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -1766,7 +1914,7 @@ pub use qr_login::{QrState, extract_music_u};
 cargo test -p dsls-provider-netease
 ```
 
-Expected: 7 passed。
+Expected: 11 passed。
 
 - [ ] **Step 5: 提交**
 
@@ -2109,8 +2257,8 @@ fn level_for(q: Quality) -> String {
 
 > **已核实**：`song_url` / `song_url_v1` / `song_url_v1_302` / `song_url_ncmget` / `song_url_match` 五个方法在 `ncm-api-rs` 0.1.0 中都存在。用 `song_url_v1`（对应 Node 版 `/song/url/v1`，支持 `level` 参数）。
 
-**再加一个测试进 `client.rs` 的 `mod tests`** —— 它钉住的是**编译期契约**，
-不是运行时行为：
+**在 `client.rs` 已有的 `mod tests` 里追加一条测试** —— 它钉住的是
+**编译期契约**，不是运行时行为：
 
 ```rust
 #[cfg(test)]
@@ -2135,6 +2283,9 @@ mod tests {
         assert!(src.capabilities().supports(Capability::StreamUrl));
     }
 }
+
+// Task 6 已经在同一个文件里建好了 `mod tests`（里面有 render_qr_png 那条），
+// 这里是在**已有的模块里追加**一条，不要再写第二个 `mod tests`。
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
@@ -2143,7 +2294,7 @@ mod tests {
 cargo test -p dsls-provider-netease
 ```
 
-Expected: 16 passed。
+Expected: 20 passed。
 
 - [ ] **Step 6: 提交**
 
