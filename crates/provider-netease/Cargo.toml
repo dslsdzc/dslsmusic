@@ -1,0 +1,24 @@
+[package]
+name = "dsls-provider-netease"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsls-provider-api = { path = "../provider-api" }
+# 已核实：全 crate 只有 0.1.0 一个发布版本（2026-04-07，作者 imsyy/SPlayer）。
+# 保持 "0.1"（= ^0.1 = >=0.1.0,<0.2.0）而不是 =0.1.0：
+#   (a) semver 下 0.2 本来就不会被自动选中，破坏性升级不会悄悄进来；
+#   (b) =0.1.0 会把后续 0.1.x 的修 bug 版本也一起挡在门外；
+#   (c) 真正的防线是提交进仓库的 Cargo.lock。
+# 单版本 crate 的长期风险是真的 —— 缓解手段是把它整个包在我们自己的
+# NeteaseClient 后面（本任务就是这么做的），换实现时改动能收敛在这里。
+ncm-api-rs = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+async-trait = "0.1"
+anyhow.workspace = true
+log.workspace = true
+serde_json = "1"
+qrcode = { version = "0.14.1", features = ["image"] }
+image = "0.25.9"
