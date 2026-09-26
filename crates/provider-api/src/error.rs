@@ -1,9 +1,14 @@
+// Track 只在测试里用到（`SourceResult<T>` 是泛型别名，不构成使用）。
+// 早先为了压住这个未使用警告，写过一个「什么也不检查」的 const _ 块——已删。
+// 正确做法就是标 cfg(test)。
+#[cfg(test)]
 use crate::model::Track;
 
 // PartialEq/Eq 是给调用方与测试用的：source-resolver 要能对比错误，
 // 测试也要能直接断言「这两个结果不同」，否则只能在已知字面量上调 unwrap()，
 // 而那会触发 clippy::unnecessary_literal_unwrap。
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceError {
     /// provider 根本没这个能力
     #[error("该音源不支持此操作")]
@@ -47,11 +52,9 @@ impl SourceError {
 /// 与 `Err(Unsupported)`「provider 没这个能力」是两回事。
 pub type SourceResult<T> = Result<Option<T>, SourceError>;
 
-const _: () = {
-    // 编译期确认 Track 被用在类型别名里
-    #[allow(dead_code)]
-    fn _t(_: SourceResult<Track>) {}
-};
+// （此处原有一个 `const _: () = { fn _t(_: SourceResult<Track>) {} };` 块，
+//   声称「编译期确认 Track 被用在类型别名里」——**它什么也不检查**：
+//   `SourceResult<T>` 是泛型别名，约束不了任何东西。已删除。）
 
 #[cfg(test)]
 mod tests {
