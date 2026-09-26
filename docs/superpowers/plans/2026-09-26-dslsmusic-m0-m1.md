@@ -3078,6 +3078,9 @@ pub fn decode_to_i16(
         symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
     let mut scratch: Vec<i16> = Vec::new();
+    // `warned_remix` 在**循环外**声明 —— 保证「源声道数不是 2」这件事
+    // **整轨只告警一次**，而不是每个 packet 刷一条（那会把线索变成噪音）。
+    let mut warned_remix = false;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -3093,41 +3096,68 @@ pub fn decode_to_i16(
         }
         let decoded = decoder.decode(&packet)?;
         scratch.clear();
-        push_interleaved_i16(&decoded, &mut scratch);
+        push_interleaved_i16(&decoded, &mut scratch, &mut warned_remix);
         on_samples(&mut scratch);
     }
     Ok(sample_rate)
 }
 
-fn push_interleaved_i16(buf: &AudioBufferRef<'_>, out: &mut Vec<i16>) {
+fn push_interleaved_i16(buf: &AudioBufferRef<'_>, out: &mut Vec<i16>, warned_remix: &mut bool) {
     macro_rules! conv {
         ($b:expr) => {{
-            let channels = $b.spec().channels.count();
+            let src_channels = $b.spec().channels.count();
             let frames = $b.frames();
-            out.reserve(frames * channels);
-            for f in 0..frames {
-                for c in 0..channels {
-                    let v = $b.chan(c)[f];
-                    // ⚠️ **乘 32768.0，不是 `i16::MAX`(32767)。**
-                    // 用 32767 会让整条路径**衰减 1 LSB**（1000→999、32767→32766、
-                    // −32768→−32767）——实测确认过。乘 32768.0 后 **i16 源逐位精确**，
-                    // 且**不需要**额外的正端饱和：`(1.0 * 32768.0) as i16 == 32767`
-                    // （Rust 的 `as` 浮点→整数转换是**饱和**的，symphonia 同款）。
-                    out.push((v.clamp(-1.0, 1.0) * 32768.0) as i16);
+            // ⚠️ **0 声道不需要特判分支**（加了也测不到，是死代码）：
+            //    带容量的 0 声道 `AudioBuffer` 构造不出来 —— `AudioBuffer::new`
+            //    会在 `duration / channels.count()` 上除零 panic。所以 0 声道
+            //    只可能是 `AudioBuffer::unused()`：`frames()` 必为 0、
+            //    `chan(0)` 返回空切片（已核实·源码 symphonia-core-0.5.5/
+            //    src/audio.rs:586-593）⇒ 下面的循环一次都不跑。
+            // ⚠️ **1 声道：右声道读同一个平面** ⇒ 复制到 L/R。
+            //    **>2 声道：只看前两个平面**（朴素，**不是 BS.775 降混** ——
+            //    我们本轮不引入系数；**后果：5.1 源的中置声道整条被丢**，
+            //    对白/人声会听不见。已记为 v2 条目，见 §18.x）。
+            let left = $b.chan(0);
+            let right = $b.chan(if src_channels > 1 { 1 } else { 0 });
+            // 只有「复制」（1 声道）与「丢声道」（>2 声道）才告警。
+            // 2 声道直通、0 声道没有样本可摊 —— 给它们报「已降混」是假话。
+            if src_channels != 2 && src_channels != 0 && !*warned_remix {
+                *warned_remix = true;
+                if src_channels == 1 {
+                    log::warn!("源音频是 1 声道：已复制到 L/R（下游按 2 声道交错消费）");
+                } else {
+                    log::warn!(
+                        "源音频是 {src_channels} 声道：只取前两个声道（朴素做法，不是 BS.775 降混）"
+                    );
                 }
+            }
+            // 输出恒为 **2** 声道 ⇒ reserve 按 2 而非 `src_channels`
+            out.reserve(frames * 2);
+            for f in 0..frames {
+                let (l, r): (f32, f32) = (left[f].into_sample(), right[f].into_sample());
+                // ⚠️ **乘 32768.0，不是 `i16::MAX`(32767)。**
+                // 用 32767 会让整条路径**衰减 1 LSB**（1000→999、32767→32766、
+                // −32768→−32767）——实测确认过。乘 32768.0 后 **i16 源逐位精确**，
+                // 且**不需要**额外的正端饱和：`(1.0 * 32768.0) as i16 == 32767`
+                // （Rust 的 `as` 浮点→整数转换是**饱和**的，symphonia 同款）。
+                out.push((l.clamp(-1.0, 1.0) * 32768.0) as i16);
+                out.push((r.clamp(-1.0, 1.0) * 32768.0) as i16);
             }
         }};
     }
+    // ⚠️ `AudioBufferRef` 一共 **10 个变体** —— 数一遍，别凭印象。
+    // 早先这版只有 9 个（漏了 `S8`），是 **E0004 非穷尽 match**。
     match buf {
-        AudioBufferRef::F32(b) => conv!(b),
-        AudioBufferRef::S16(b) => conv!(b),
-        AudioBufferRef::S32(b) => conv!(b),
         AudioBufferRef::U8(b) => conv!(b),
-        AudioBufferRef::F64(b) => conv!(b),
-        AudioBufferRef::S24(b) => conv!(b),
         AudioBufferRef::U16(b) => conv!(b),
         AudioBufferRef::U24(b) => conv!(b),
         AudioBufferRef::U32(b) => conv!(b),
+        AudioBufferRef::S8(b) => conv!(b),
+        AudioBufferRef::S16(b) => conv!(b),
+        AudioBufferRef::S24(b) => conv!(b),
+        AudioBufferRef::S32(b) => conv!(b),
+        AudioBufferRef::F32(b) => conv!(b),
+        AudioBufferRef::F64(b) => conv!(b),
     }
 }
 ```
