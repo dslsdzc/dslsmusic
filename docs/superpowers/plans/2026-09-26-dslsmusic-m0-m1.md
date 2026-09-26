@@ -1835,6 +1835,8 @@ image = { version = "0.25.9", default-features = false, features = ["png"] }
 `crates/provider-netease/src/qr_login.rs`：
 
 ```rust
+use dsls_provider_api::SourceError;
+
 /// 网易云扫码登录返回码。
 /// 801 = 等待扫码，802 = 待确认，803 = 成功（带 cookie），800 = 二维码过期。
 ///
@@ -1859,24 +1861,47 @@ pub enum QrState {
 impl QrState {
     /// `raw_cookies` 是 `ApiResponse.cookie`，即响应头 `Set-Cookie` 的**原始条目**
     /// （每条含 `Path=` / `Expires=` / `HttpOnly` 等属性，crate 只删了 `Domain=`）。
-    pub fn from_code(code: i64, raw_cookies: &[String]) -> Self {
+    /// **返回 `Result` 而不是裸 `QrState`**，两个理由（复审 Important 1 + Minor 2）：
+    ///
+    /// 1. **803 但拿不到会话 cookie，必须无法被忽略。** 原来写
+    ///    `session_cookie(...).unwrap_or_default()`，把「没有会话」折成一个空串
+    ///    cookie；调用方只 `match` 变体就写盘，症状与「登录成功但仍是游客」
+    ///    一模一样，而且更隐蔽。返回 `Err` 之后这条路径**不可能**被静默吞掉，
+    ///    也才让 `session_cookie` 里那句 `is_empty → None` 真正生效。
+    /// 2. **未知状态码不能再折成 `Expired`。** 原来 `_ => Expired` 会把
+    ///    400 / 999 / 200 都说成「二维码已过期」，误导用户；且
+    ///    `is_upstream_changed()` 在这条路径上**永不触发**，上游变了也没人知道。
+    pub fn from_code(code: i64, raw_cookies: &[String]) -> Result<Self, SourceError> {
         match code {
-            801 => QrState::WaitingScan,
-            802 => QrState::WaitingConfirm,
-            803 => QrState::Confirmed {
-                cookie: session_cookie(raw_cookies).unwrap_or_default(),
+            801 => Ok(QrState::WaitingScan),
+            802 => Ok(QrState::WaitingConfirm),
+            800 => Ok(QrState::Expired),
+            803 => match session_cookie(raw_cookies) {
+                Some(cookie) => Ok(QrState::Confirmed { cookie }),
+                // 803 承诺带 cookie，没带到 = 上游变了或有别的问题。
+                // **绝不能**当成登录成功。
+                None => Err(SourceError::Protocol(
+                    "803 但 Set-Cookie 里没有可用的 MUSIC_U".into(),
+                )),
             },
-            _ => QrState::Expired,
+            other => Err(SourceError::Protocol(format!(
+                "login_qr_check 返回未知状态码 {other}"
+            ))),
         }
     }
 }
 
 /// 从 `key=value; key=value` 串里取出某个 cookie 的值。
+///
+/// `=` 两侧都 trim —— crate 自己的 `cookie_to_json` 也是两侧都 trim
+/// （`src/util/cookie.rs:5-17`），我们与它对齐，否则 `MUSIC_U = tok`
+/// 这种带空格的形态会被我们判成「没有 MUSIC_U」而它认。**两套解析不一致
+/// 是最难查的一类 bug。**
 fn extract_cookie(raw: &str, key: &str) -> Option<String> {
     raw.split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v.to_string())
+        .filter_map(|part| part.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().to_string())
 }
 
 /// 取出 MUSIC_U 的值。**这是给测试与诊断用的，不是要持久化的东西**——
@@ -3222,9 +3247,9 @@ async fn login() -> anyhow::Result<()> {
             QrState::WaitingConfirm => print!("*"),
             QrState::Expired => anyhow::bail!("二维码已过期，请重新运行 login"),
             QrState::Confirmed { cookie } => {
-                if cookie.is_empty() {
-                    anyhow::bail!("登录成功但没有拿到 MUSIC_U");
-                }
+                // **不需要判空**：`from_code` 已改成返回 `Result`，
+                // 拿不到会话会是 `Err(Protocol)`，在上一行的 `?` 就返回了。
+                // 这里再判一次就是不可能到达的死代码。
                 std::fs::write(dir.join("session"), &cookie)?;
                 println!("\n登录成功，会话已保存。");
                 return Ok(());
