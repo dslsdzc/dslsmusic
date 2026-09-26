@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/platform", "app"]
+# ⚠️ 用 glob 而不是逐个列 —— 后续任务会各自新建 crate（provider-api /
+# provider-netease / audio），逐个列的话每加一个都要记得回来改这里，
+# 漏一次 cargo 就报 "package not found"。glob 让新 crate 自动成为成员。
+members = ["crates/*", "app"]
 
 [workspace.package]
 version = "0.1.0"

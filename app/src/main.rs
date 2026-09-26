@@ -60,6 +60,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut metrics = metrics::FrameMetrics::new();
 
+    // 推迟的 surface 重配请求。为什么要推迟见下面 Suboptimal 分支的说明。
+    let mut needs_reconfigure = false;
+
     'running: loop {
         match window.poll_events() {
             PlatformEvent::CloseRequested => break 'running,
@@ -69,6 +72,13 @@ fn main() -> anyhow::Result<()> {
                 gpu.surface.configure(&gpu.device, &gpu.config);
             }
             _ => {}
+        }
+
+        // ⚠️ 重配必须在**上一次 present 之后、这一次 acquire 之前**。
+        // 上一帧已 present，此刻没有存活的 SurfaceTexture，configure 安全。
+        if needs_reconfigure {
+            needs_reconfigure = false;
+            gpu.surface.configure(&gpu.device, &gpu.config);
         }
 
         metrics.begin_frame();
@@ -86,9 +96,20 @@ fn main() -> anyhow::Result<()> {
             // ⚠️ Suboptimal 携带一个**完全可用**的纹理，在 Linux/Vulkan 上
             // 直接来自 VK_SUBOPTIMAL_KHR。把它当致命错误会让「任何使
             // swapchain extent 变陈旧的窗口/缩放变化」直接杀掉进程。
-            // 正确做法：重新配置，然后**照常渲染这一帧**。
+            //
+            // ⚠️⚠️ **但不能在这里 configure**：`Surface::configure` 在
+            // 有存活的 `SurfaceTexture` 时会 **panic**（wgpu 30.0.1
+            // `api/surface.rs:143-144` 明载；实现见 wgpu-core
+            // `device/resource.rs` 的 `E::PreviousOutputExists`）。
+            // 而 `f` 正是活着的那个纹理。
+            //
+            // 对照：上面的 `Outdated | Lost` 分支可以就地 configure，
+            // 是因为**那条路径上没有纹理**。
+            //
+            // 正确做法：照常渲染并 present 这一帧，把重配**推迟到下一轮
+            // 取下帧之前**（见循环顶部消费 needs_reconfigure 的地方）。
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
+                needs_reconfigure = true;
                 f
             }
             other => anyhow::bail!("取 surface texture 失败: {other:?}"),
