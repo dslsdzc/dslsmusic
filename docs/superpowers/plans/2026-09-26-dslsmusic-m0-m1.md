@@ -3036,7 +3036,19 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// 解码为交错的 i16 立体声（重采样留给后续 DSP 阶段）。
+/// 解码为交错的 i16。
+
+/// ⚠️ **契约：输出恰好 2 声道交错。** 这是**修正后**的说法 ——
+/// 早先只写「立体声」而**代码不归一化**，于是 mono 源会被下游
+/// 当成 L/R 两样本 ⇒ **2 倍速 + 升调**（6ch 源 3 倍速），
+/// **而 xrun 恒 0、不报错**。这类「听起来不对但指标全正常」最难查。
+///
+/// 归一则：
+/// - **1 声道 → 复制到 L/R**（无损、平凡正确）
+/// - **2 声道 → 直通**
+/// - **> 2 声道 → 取前两个声道**（⚠️ **朴素降混，不是 BS.775** ——
+///   那个系数表我们拿不到，**不许编系数**）。发生时要**记一条日志**，
+///   让「我听到了什么」这件事可追。（重采样留给后续 DSP 阶段。）
 ///
 /// 回调取 `&mut [i16]` 而**不是** `&[i16]` —— 因为 PCM graph 的 DSP
 /// 要**原地**处理样本（设计文档 §6.1）。
@@ -3096,7 +3108,12 @@ fn push_interleaved_i16(buf: &AudioBufferRef<'_>, out: &mut Vec<i16>) {
             for f in 0..frames {
                 for c in 0..channels {
                     let v = $b.chan(c)[f];
-                    out.push((v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                    // ⚠️ **乘 32768.0，不是 `i16::MAX`(32767)。**
+                    // 用 32767 会让整条路径**衰减 1 LSB**（1000→999、32767→32766、
+                    // −32768→−32767）——实测确认过。乘 32768.0 后 **i16 源逐位精确**，
+                    // 且**不需要**额外的正端饱和：`(1.0 * 32768.0) as i16 == 32767`
+                    // （Rust 的 `as` 浮点→整数转换是**饱和**的，symphonia 同款）。
+                    out.push((v.clamp(-1.0, 1.0) * 32768.0) as i16);
                 }
             }
         }};
@@ -3259,9 +3276,21 @@ fn fill_from_ring<T>(
     let mut frame = 0usize;
     let mut starved = false;
 
+    // ⚠️ **尾部槽位必须先写。** 若 `out.len()` 不是 `channels` 的整数倍，
+    // 最后那几个槽位**永远不会被下面的循环写到**，会留下 cpal 缓冲里的旧值
+    // （听感＝爆音）。先整体铺静音，再让循环覆盖，是唯一稳妥的顺序。
+    for slot in out.iter_mut() {
+        *slot = T::EQUILIBRIUM;
+    }
+
     while frame < total_frames {
         let want_frames = (total_frames - frame).min(cap_frames);
         let got = consumer.pop_raw(&mut scratch[..want_frames * 2]);
+        // ⚠️ `got` **可能是奇数**（环里恰好剩半个立体声帧）。
+        // 直接 `got / 2` 会丢掉那一个样本，**并让它后面的所有 L/R 整体错位**
+        // ——听感是**声道互换**，比丢一个样本难查得多。
+        // ⇒ 奇数时**只取整帧**，剩下的那半个样本当作饿死（下面会记一次 underrun，
+        //    `starved` 会置位并 break，不会带着错位继续跑）。
         let got_frames = got / 2;
 
         for f in 0..want_frames {
@@ -3314,7 +3343,7 @@ fn fill_from_ring<T>(
 cargo test -p dsls-audio
 ```
 
-Expected: 3 passed。
+Expected: 7 passed。
 
 - [ ] **Step 6: 提交**
 
