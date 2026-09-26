@@ -176,6 +176,11 @@ wgpu.workspace = true
 # Task 3 的 gpu.rs 里用 pollster::block_on 驱动 request_adapter / request_device
 pollster.workspace = true
 raw-window-handle.workspace = true
+# Task 3 的 window.rs / gpu.rs 公开接口返回 anyhow::Result
+# ⚠️ 待定：platform 原本只有 thiserror，像是刻意让本层用类型化错误、
+#    由 app 层用 anyhow。若确认如此，应改公开签名为自定义 Error 并去掉
+#    anyhow —— 那是 API 变更，不在 Task 3 范围内。
+anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 ```
@@ -442,7 +447,11 @@ pub enum PlatformEvent {
 
 pub struct PlatformWindow {
     window: sdl3::video::Window,
-    event_pump: sdl3::EventPump,
+    /// ⚠️ 必须是 `RefCell`：`GpuContext<'a>` 的 surface 借自本结构体
+    /// （经 `raw_window()`），而且是**全程共享借用**，所以 `poll_events`
+    /// 拿不到 `&mut self`。用内部可变性只让 event_pump 可变，公开签名
+    /// 保持 `&self` 不变。
+    event_pump: std::cell::RefCell<sdl3::EventPump>,
 }
 
 impl PlatformWindow {
@@ -456,7 +465,10 @@ impl PlatformWindow {
             .build()
             .map_err(|e| anyhow::anyhow!("SDL 窗口创建失败: {e}"))?;
         let event_pump = sdl.event_pump()?;
-        Ok(Self { window, event_pump })
+        Ok(Self {
+            window,
+            event_pump: std::cell::RefCell::new(event_pump),
+        })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -470,10 +482,13 @@ impl PlatformWindow {
     }
 
     /// 取走本帧的全部事件（只保留最后一个 resize / 第一个 quit）。
-    pub fn poll_events(&mut self) -> PlatformEvent {
+    ///
+    /// **收 `&self` 而非 `&mut self`** —— `GpuContext` 全程共享借用本结构体，
+    /// 收 `&mut` 会与它冲突（E0502）。可变性由 `RefCell` 提供。
+    pub fn poll_events(&self) -> PlatformEvent {
         let mut result = PlatformEvent::None;
         let self_id = self.window.id();
-        for event in self.event_pump.poll_iter() {
+        for event in self.event_pump.borrow_mut().poll_iter() {
             match event {
                 Event::Quit { .. } => return PlatformEvent::CloseRequested,
                 Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
@@ -685,7 +700,9 @@ use dsls_platform::{PlatformEvent, PlatformWindow, init_gpu};
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let mut window = PlatformWindow::new("dslsmusic", 1280, 720)?;
+    // window 不需要 mut：poll_events 收 &self（见 window.rs 的说明）
+    let window = PlatformWindow::new("dslsmusic", 1280, 720)?;
+    // gpu 需要 mut：下面会调用 surface.configure
     let mut gpu = init_gpu(&window)?;
     log::info!("RenderTier = {:?}", gpu.tier);
 
@@ -818,7 +835,9 @@ impl FrameMetrics {
 - [ ] **Step 7: 构建并运行**
 
 ```bash
-cargo run -p dslsmusic 2>&1 | head -20
+# ⚠️ 必须带 RUST_LOG=info —— env_logger 无此环境变量时默认 Error 级，
+#    log::info! 会被全部丢弃，下面那行 Expected 根本打不出来。
+RUST_LOG=info cargo run -p dslsmusic 2>&1 | head -20
 ```
 
 Expected:
