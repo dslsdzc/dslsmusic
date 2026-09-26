@@ -97,6 +97,12 @@ members = ["crates/platform", "app"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+# MSRV。edition 2024 本身要求 ≥1.85，所以这个值是自洽的下限。
+# 与 rust-toolchain.toml 的 channel pin 是两件事：
+#   - channel pin  → 保证「编出相同的代码」（可复现），代价是每个贡献者多下一份工具链
+#   - rust-version → 保证「旧工具链得到清晰错误」而非难解失败
+# 依赖的 MSRV 可能更高，那种情况 cargo 会指名报错，不会静默失败。
+rust-version = "1.85"
 
 [workspace.dependencies]
 # ── 平台层 ──
@@ -162,6 +168,7 @@ name = "dsls-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 sdl3.workspace = true
@@ -200,6 +207,7 @@ name = "dslsmusic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 dsls-platform = { path = "../crates/platform" }
@@ -2527,6 +2535,7 @@ git commit -m "feat(m1): CLI 端到端串联 —— 扫码登录 / 搜索 / 取�
 M0 与 M1 全部完成当且仅当：
 
 - [ ] 仓库根有 `LICENSE`（GPLv3 全文），且 workspace `license = "GPL-3.0-or-later"`
+- [ ] workspace 与两个成员都声明了 `rust-version`（MSRV 1.85），`cargo metadata` 可读出
 - [ ] `cargo deny check licenses` 通过（GPLv3 兼容性审计；**需要网络**，本机 `cargo metadata --offline` 因缺 android_system_properties 缓存而失败）
 - [ ] `cargo test --workspace` 全绿
 - [ ] `cargo clippy --workspace -- -D warnings` 无告警
