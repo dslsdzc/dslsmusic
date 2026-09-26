@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// 环形缓冲容量：约 10 秒 @60fps。
 const CAPACITY: usize = 600;
@@ -142,6 +142,3 @@ pub fn percentile(sorted: &[f32], p: f32) -> f32 {
 pub fn frame_budget_ms(target_fps: u32) -> f32 {
     1000.0 / target_fps as f32
 }
-
-#[allow(dead_code)]
-fn _assert_duration_used(_: Duration) {}
