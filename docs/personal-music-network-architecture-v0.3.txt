@@ -1,0 +1,2927 @@
+PERSONAL MUSIC NETWORK (PMN)
+Complete Architecture Concept
+Version: 0.3
+Language: English
+
+======================================================================
+1. OVERVIEW
+======================================================================
+
+Personal Music Network (PMN) is a user-centered music computing
+architecture.
+
+It is not merely a music player, a synchronization service, a streaming
+client, a recommendation engine, or a multi-device audio system. It is a
+logical music environment in which music can be acquired, understood,
+organized, planned, transformed, rendered, distributed, synchronized,
+computed, and experienced across one or many devices.
+
+The central idea is:
+
+    Music should be modeled first.
+    Distribution comes second.
+
+A PMN must therefore remain complete and coherent when only one physical
+device exists, while also scaling naturally to multiple devices without
+changing the logical meaning of the system.
+
+The architecture separates musical intent from physical execution.
+
+The execution chain is:
+
+    1. Music Planning
+       Determines how music should happen.
+
+    2. Capability Requirement Derivation
+       Determines what abstract capabilities are required to realize the
+       musical plan.
+
+    3. Capability Planning
+       Matches those requirements against available capability instances and
+       constructs a placement graph.
+
+    4. Network Scheduling
+       Maps the placement graph onto real nodes, links, artifacts, clocks,
+       and resource states.
+
+In compact form:
+
+    User Intent
+        |
+        v
+    Music Planner
+        |
+        v
+    Logical Musical Timeline
+        |
+        v
+    Capability Requirements
+        |
+        v
+    Capability Planner
+        |
+        v
+    Placement Graph
+        |
+        v
+    Network Scheduler
+        |
+        v
+    Distributed Execution Graph
+        |
+        v
+    Capability Instances on Physical Nodes
+        |
+        v
+    Listening Experience
+        |
+        +---------------------> Feedback / Learning
+
+The key design principles are:
+
+    The logical music system is independent of the number and type of devices.
+
+    Personal sovereignty is a first-class architectural boundary.
+
+A single-node PMN is still a PMN.
+A multi-node PMN is the same logical PMN whose required capabilities happen
+to be placed across multiple physical nodes.
+
+Nodes are not the primary scheduling abstraction.
+Capabilities are.
+
+A PMN is also not a globally readable user profile.
+
+Public music knowledge may be shared and federated.
+Personal behavior, preferences, memory, private resources, credentials, and
+representations derived from them remain inside the owner's PMN trust
+boundary by default.
+
+Cross-PMN interaction must therefore be explicit, scoped, and minimal.
+
+
+======================================================================
+2. FIRST PRINCIPLE: DECOMPOSE "MUSIC"
+======================================================================
+
+The word "music" in Personal Music Network must not be reduced to
+"track files".
+
+The complete music lifecycle is:
+
+    Music Source
+        ->
+    Acquisition
+        ->
+    Identification / Understanding
+        ->
+    Music Knowledge
+        ->
+    Selection
+        ->
+    Sequencing
+        ->
+    Transition Planning
+        ->
+    Timeline Compilation
+        ->
+    Audio Rendering
+        ->
+    Output
+        ->
+    Listening Feedback
+        ->
+    Personal Learning
+
+This lifecycle separates several fundamentally different questions:
+
+    Where does the music come from?
+    What is this music?
+    What should be played?
+    In what order should it be played?
+    How should neighboring musical regions connect?
+    How should the final continuous timeline be rendered?
+    Where should computation and playback execute?
+    How does the user's behavior change future planning?
+
+This is the conceptual center of PMN.
+
+
+======================================================================
+3. MUSIC INPUT
+======================================================================
+
+3.1 Music Sources
+
+A MusicSource is anything capable of exposing musical material.
+
+Examples include:
+
+    - streaming providers
+    - local files
+    - cloud drives
+    - NAS storage
+    - peer PMN nodes
+    - internet URLs
+    - live streams
+    - radio
+    - physical media
+    - microphones
+    - user recordings
+    - generated audio
+    - another federated PMN
+
+A source is not the owner of musical identity.
+
+For example:
+
+    NetEase song ID
+    local path
+    cloud object ID
+
+are source-specific locators, not canonical music identity.
+
+A source answers:
+
+    What can I expose?
+    Can it be accessed now?
+    How can it be acquired?
+
+A source does not decide:
+
+    What canonical musical entity is this?
+    Should it be played next?
+    Where should playback happen?
+
+
+3.2 Acquisition
+
+Acquisition converts source availability into usable media.
+
+The acquisition layer handles:
+
+    - network requests
+    - byte ranges
+    - chunk transfer
+    - streaming
+    - downloading
+    - caching
+    - peer transfer
+    - integrity verification
+    - content hashing
+    - media probing
+    - partial materialization
+    - replica discovery
+    - expiry information
+    - authorization constraints
+
+Streaming, caching, downloading, and replication are therefore treated as
+variations of one operation:
+
+    Materialize musical data.
+
+The difference is how much data is materialized, where, and for how long.
+
+
+======================================================================
+4. MUSIC UNDERSTANDING
+======================================================================
+
+4.1 Music Perception
+
+After acquisition, PMN should be capable of building a perceptual and
+musical representation of the material.
+
+Physical properties may include:
+
+    sample rate
+    channel layout
+    bit depth
+    loudness
+    dynamic range
+    spectrum
+
+Musical properties may include:
+
+    tempo
+    beat
+    downbeat
+    meter
+    key
+    chord
+    phrase structure
+    section boundaries
+    timbre
+    instrumentation
+    vocal presence
+
+High-level semantic properties may include:
+
+    genre
+    style
+    era
+    energy
+    valence
+    mood
+    similarity
+    lyrical topic
+
+Identity-related analysis may include:
+
+    song identification
+    artist identity
+    recording identity
+    version identity
+    lyric recognition
+    language
+
+This layer can use deterministic DSP, symbolic methods, machine learning,
+large models, embeddings, or combinations of them.
+
+AI is therefore not an optional chat feature attached to PMN.
+It is one possible implementation mechanism of the Music Intelligence
+layer.
+
+
+4.2 Music Knowledge Graph
+
+The Music Knowledge Graph represents what PMN knows about music.
+
+Typical entity types include:
+
+    Work
+    Recording
+    Version
+    Release
+    ReleaseTrack
+    Artist
+    Playlist
+    LyricsTrack
+    Artwork
+    Video
+    MediaVariant
+    MusicalSegment
+    AnalysisArtifact
+    UserKnowledge
+
+Relations may include:
+
+    same_as
+    version_of
+    cover_of
+    remix_of
+    remaster_of
+    live_version_of
+    performed_by
+    composed_by
+    released_as
+    belongs_to
+    sampled_from
+    similar_to
+    transition_to
+    preferred_after
+
+The graph is a domain model, not a requirement to use a graph database.
+
+SQLite, relational tables, indexes, and materialized views are perfectly
+valid storage implementations.
+
+
+======================================================================
+5. MUSICAL SEGMENTS
+======================================================================
+
+A Track is too coarse to be the fundamental unit of advanced playback.
+
+PMN introduces MusicalSegment as a first-class concept.
+
+A recording may contain:
+
+    Intro
+    Verse
+    Chorus
+    Bridge
+    Breakdown
+    Solo
+    Outro
+
+Segments may themselves expose:
+
+    beat boundaries
+    bar boundaries
+    phrase boundaries
+    stems
+    local tempo
+    local key
+    local energy
+    local musical state
+
+This allows the system to represent:
+
+    "Leave Track A at the end of its second chorus
+     and enter Track B at its intro."
+
+instead of only:
+
+    "Play A, then play B."
+
+A MusicalSegment is therefore the practical middle layer between an entire
+track and raw audio samples.
+
+
+======================================================================
+6. MUSIC STATE SPACE
+======================================================================
+
+PMN models a musical region as a state in a multidimensional music space.
+
+A conceptual MusicState may include:
+
+    tempo
+    key
+    loudness
+    energy
+    rhythm density
+    timbre
+    instrumentation
+    vocal presence
+    emotional character
+    semantic topic
+    familiarity
+    novelty
+    session position
+
+A segment can therefore be mapped to:
+
+    Segment
+        ->
+    MusicState
+
+Playback becomes the construction of a trajectory through MusicState space.
+
+This is more general than a queue of track IDs.
+
+
+======================================================================
+7. SELECTION
+======================================================================
+
+Selection answers:
+
+    What musical material could be played next?
+
+Candidate generation can consider:
+
+    - local library
+    - streaming providers
+    - peer nodes
+    - caches
+    - user favorites
+    - historical behavior
+    - semantic similarity
+    - audio similarity
+    - current context
+    - user intent
+    - newly discovered material
+    - generated musical material
+
+Selection produces candidates.
+It does not yet define a final order.
+
+
+======================================================================
+8. SEQUENCING
+======================================================================
+
+A conventional player uses:
+
+    Vec<Track>
+
+as its core playback structure.
+
+PMN instead uses a SessionGraph.
+
+Example:
+
+             C
+           /
+    A -> B -> D -> F
+    |       \
+    +-> E    G
+
+Edges are weighted by properties such as:
+
+    transition quality
+    user preference
+    novelty
+    artist repetition
+    energy trajectory
+    harmonic compatibility
+    semantic continuity
+    recent-history penalties
+    context compatibility
+
+The next musical item is therefore a planning decision, not just an index
+increment.
+
+
+======================================================================
+9. SESSION SHAPE
+======================================================================
+
+PMN should optimize not only pairwise transitions but the macrostructure of
+an entire listening session.
+
+A session may have a shape such as:
+
+    Warmup
+        ->
+    Build
+        ->
+    Peak
+        ->
+    Release
+        ->
+    Contrast
+        ->
+    Second Build
+        ->
+    Ending
+
+A session objective may be expressed as:
+
+    "Gradually become more intense."
+    "Wind down over the next hour."
+    "Avoid abrupt style changes."
+    "Make it feel like a DJ set."
+    "Explore more unfamiliar music."
+    "Keep the energy stable."
+
+This transforms playback from "choose next track" into long-horizon musical
+planning.
+
+
+======================================================================
+10. TRANSITION SPACE
+======================================================================
+
+Transitions must not be hard-coded as a small enum such as:
+
+    HardCut
+    Crossfade
+    BeatMatch
+
+Instead PMN defines a general TransitionSpace(A, B).
+
+A transition solution can include:
+
+    source exit point
+    target entry point
+    alignment
+    duration
+    gain curves
+    EQ curves
+    tempo curves
+    pitch curves
+    stem curves
+    effect curves
+    spatial curves
+    generated bridge material
+
+A transition is therefore a small music transformation program.
+
+This is one of the most important abstractions in PMN.
+
+
+======================================================================
+11. MUSICAL TIMELINE ALGEBRA
+======================================================================
+
+PMN should define a compact set of primitive operations from which complex
+playback behavior can be composed.
+
+Candidate primitives include:
+
+    CUT
+    CONCAT
+    OVERLAP
+
+    SEEK
+    TRIM
+    LOOP
+
+    GAIN
+    PAN
+    EQ
+
+    STRETCH
+    PITCH
+
+    ALIGN_BEAT
+    ALIGN_BAR
+    ALIGN_PHRASE
+
+    SELECT_STEM
+    MIX
+
+    SPATIALIZE
+
+    GENERATE
+
+Examples:
+
+Crossfade:
+
+    OVERLAP
+    + GAIN(A: 1 -> 0)
+    + GAIN(B: 0 -> 1)
+
+Beat transition:
+
+    ALIGN_BEAT
+    + STRETCH
+    + OVERLAP
+    + GAIN
+
+Advanced AutoMix:
+
+    ALIGN_PHRASE
+    + ALIGN_BEAT
+    + STRETCH
+    + EQ
+    + GAIN
+
+The objective is not to create endless special-case playback features.
+The objective is to make those features compositions over one general
+timeline algebra.
+
+
+======================================================================
+12. TIMELINE IR
+======================================================================
+
+Music Planning should not directly drive the realtime audio callback.
+
+Instead it produces a Music Timeline IR.
+
+Example:
+
+    00:00.000  START A @ 00:14.230
+    02:51.200  A gain 1.0 -> 0.0 over 8 bars
+    02:51.200  START B @ 00:08.440
+    02:51.200  B tempo 126 -> 128
+    02:51.200  B gain 0.0 -> 1.0
+    03:07.100  STOP A
+
+The pipeline becomes:
+
+    Music Assets
+        ->
+    Music Planner
+        ->
+    Timeline IR
+        ->
+    Timeline Compiler
+        ->
+    DSP / Mix Graph
+        ->
+    PCM / Encoded Output
+
+This cleanly separates high-level musical reasoning from realtime audio
+execution.
+
+
+======================================================================
+13. PLAYBACK CAPABILITY CHANGES THE MUSIC GRAPH
+======================================================================
+
+Playback is not merely a passive backend.
+
+Suppose A and B appear musically incompatible.
+
+If the engine supports:
+
+    tempo morphing
+    pitch morphing
+    stem isolation
+    generated bridge material
+    phrase-aware transitions
+
+then an edge that previously did not exist may become feasible.
+
+Therefore:
+
+    Playback Capabilities
+        ->
+    Transition Feasibility
+        ->
+    Session Graph Topology
+
+A stronger playback engine increases the number of valid musical paths
+available to the planner.
+
+
+======================================================================
+14. GENERATED TRANSITIONS
+======================================================================
+
+Generative systems naturally fit into PMN as one more source of timeline
+material.
+
+Example:
+
+    Track A
+        ->
+    Generated 8-bar Bridge
+        ->
+    Track B
+
+The generated material can satisfy explicit constraints:
+
+    key compatibility
+    tempo trajectory
+    energy trajectory
+    instrumentation compatibility
+    duration
+    phrase boundaries
+
+Generated content remains a normal MusicAsset with provenance.
+
+PMN should distinguish:
+
+    OriginalArtifact
+    DerivedArtifact
+    GeneratedArtifact
+
+
+======================================================================
+15. PERSONAL MUSIC MODEL
+======================================================================
+
+User modeling should extend beyond "liked tracks".
+
+A complete PersonalMusicModel may include:
+
+    ContentPreference
+    SequencePreference
+    TransitionPreference
+    SessionPreference
+    ContextPreference
+    DiscoveryPreference
+
+Examples:
+
+    "Likes this artist."
+    "Dislikes two songs by the same artist in a row."
+    "Prefers hard cuts over long fades."
+    "At night, prefers sessions that gradually reduce energy."
+    "While running, prefers higher tempo."
+    "Accepts approximately 20% unfamiliar music."
+
+This allows PMN to learn how the user prefers music to be organized and
+experienced, not only which tracks they like.
+
+
+======================================================================
+16. FEEDBACK LOOP
+======================================================================
+
+Playback feeds back into planning.
+
+Events can include:
+
+    started
+    paused
+    resumed
+    seeked
+    skipped
+    replayed
+    completed
+    manually_selected
+    auto_selected
+    volume_changed
+    transition_skipped
+    queue_reordered
+    liked
+    disliked
+
+This allows the system to learn distinctions such as:
+
+    "The user does not dislike Track B.
+     The user dislikes the transition from A to B."
+
+This is substantially richer than conventional recommendation feedback.
+
+
+======================================================================
+16A. PERSONAL SOVEREIGNTY BOUNDARY
+======================================================================
+
+"Personal" is not branding. It is the primary ownership, privacy, and trust
+boundary of PMN.
+
+A PMN distinguishes at least four data domains:
+
+1. PUBLIC MUSIC KNOWLEDGE
+
+    Examples:
+
+        title
+        artist
+        album / release
+        ISRC
+        public artwork
+        public lyrics
+        BPM
+        key
+        public release metadata
+        public musical structure
+        generally shareable analysis of public music
+
+    This data may be replicated, cached, exchanged, and federated according
+    to ordinary provenance and rights rules.
+
+2. PERSONAL DATA
+
+    Examples:
+
+        listening history
+        skip history
+        favorites
+        ratings
+        personal tags
+        personal notes
+        personal memories
+        user embeddings
+        TasteModel
+        SequencePreference
+        TransitionPreference
+        SessionPreference
+        ContextPreference
+        DiscoveryPreference
+        private listening context
+
+    This is first-class privacy-sensitive data.
+
+    Default:
+
+        visibility = PRIVATE_TO_PMN
+        cross_pmn_replication = FORBIDDEN
+        cross_pmn_read = FORBIDDEN
+        export = EXPLICIT_ONLY
+
+3. PRIVATE RESOURCES
+
+    Examples:
+
+        local audio files
+        private recordings
+        unreleased media
+        private lyric corrections
+        private generated material
+        provider credentials
+        authentication tokens
+        private models
+        private model adaptations
+
+    Private resources remain inside the owning PMN unless an explicit,
+    scoped sharing operation permits otherwise.
+
+4. EXPLICIT SHARED DATA
+
+    Examples:
+
+        shared playlist
+        explicitly shared recommendation
+        shared annotation
+        collaborative session state
+        shared transition plan
+        shared generated mix
+
+    Shared data belongs to an explicit scope.
+
+    It must not silently inherit access to the owner's unrelated personal
+    state.
+
+
+======================================================================
+16B. OWNERSHIP APPLIES TO RELATIONS, NOT ONLY OBJECTS
+======================================================================
+
+A fact being attached to a public song does not make that fact public.
+
+Example:
+
+    Recording A --performed_by--> Artist B
+
+        class = PublicMusicKnowledge
+
+But:
+
+    User --prefers--> Recording A
+
+        class = PersonalPreference
+
+Likewise:
+
+    Recording A BPM = 128
+
+may be public music knowledge, while:
+
+    User usually skips Recording A after midnight
+
+is personal behavioral data.
+
+Relations therefore require ownership and provenance.
+
+Conceptually:
+
+    Relation {
+        subject,
+        predicate,
+        object,
+        owner,
+        data_class,
+        provenance
+    }
+
+The same principle applies to graph edges, events, embeddings, summaries,
+scores, and learned parameters.
+
+
+======================================================================
+16C. DERIVED DATA INHERITS PRIVACY
+======================================================================
+
+Transforming personal data does not make it non-personal.
+
+Examples:
+
+    Listening History
+        ->
+    Taste Embedding
+
+The Taste Embedding remains PersonalPreference data.
+
+    Private Recording
+        ->
+    Audio Embedding
+
+The embedding remains private unless explicitly declassified.
+
+    Skip History + Context
+        ->
+    Prediction Model
+
+The resulting model remains personal.
+
+Default rule:
+
+    DerivedArtifact.data_class
+        = strongest_privacy_class(inputs)
+
+unless an explicit, user-authorized declassification operation exists.
+
+A vector, embedding, score, model, or aggregate must not be treated as
+public merely because it no longer resembles the original records.
+
+
+======================================================================
+16D. LOCAL AVAILABILITY IS PERSONAL
+======================================================================
+
+Public music metadata and personal possession are different facts.
+
+Example:
+
+    Recording X has BPM 120
+
+may be public.
+
+But:
+
+    Recording X exists as FLAC on Alice's desktop
+
+reveals Alice's private library and infrastructure.
+
+Therefore the following are personal or private by default:
+
+    local library membership
+    replica locations
+    private cache contents
+    private node topology
+    exact storage capacity
+    private compute hardware
+    provider account availability
+
+Federation should expose abstract capability or availability answers only
+when necessary for an explicit operation.
+
+
+======================================================================
+16E. COMPUTE TO DATA, NOT PERSONAL DATA TO COMPUTE
+======================================================================
+
+Cross-PMN operations should prefer:
+
+    Request
+        ->
+    Local Policy Check
+        ->
+    Local Computation
+        ->
+    Minimal Response
+
+over:
+
+    Export Personal Data
+        ->
+    Remote Computation
+
+Example: group recommendation.
+
+Wrong default:
+
+    Alice TasteModel -> Federation Planner
+    Bob TasteModel   -> Federation Planner
+
+Preferred default:
+
+    Federation Planner
+        ->
+    candidate references
+        ->
+    Alice PMN performs private local evaluation
+        ->
+    returns minimal result
+
+The minimal result may be:
+
+    Accept / Neutral / Reject
+
+or a narrowly scoped score or ranking.
+
+The full TasteModel, listening history, and personal embeddings remain
+inside Alice's PMN.
+
+The architectural principle is:
+
+    Bring computation to personal data.
+    Do not bring personal data to computation by default.
+
+
+======================================================================
+16F. PERSONAL MODELS NEVER BECOME AMBIENT FEDERATION STATE
+======================================================================
+
+The following remain inside the PMN boundary by default:
+
+    TasteModel
+    UserEmbedding
+    BehaviorEmbedding
+    TransitionPreference
+    SequencePreference
+    SessionPreference
+    ContextModel
+    DiscoveryModel
+    PersonalMemory
+
+A foreign PMN must never receive ambient visibility into another PMN's
+personal state.
+
+There is no generic cross-PMN API equivalent to:
+
+    browse_user_state()
+    read_full_history()
+    export_taste_model()
+
+Cross-boundary interaction must occur through explicit operations such as:
+
+    explicit_share
+    explicit_query
+    explicit_session_participation
+    explicit_capability_lease
+
+Preference projections are themselves personal data and must not be exported
+by default.
+
+
+======================================================================
+16G. SHARED EVENTS AND PERSONAL EVENTS ARE SEPARATE
+======================================================================
+
+The same real-world listening event may produce different projections.
+
+Example:
+
+    Track X was played in Shared Session S.
+
+Shared projection:
+
+    Session S played Track X at time T.
+
+Alice's private projection:
+
+    listened 80%
+    reduced volume
+    disliked transition
+    skipped shortly afterward
+
+Bob's private projection:
+
+    completed track
+    favorited track
+    replayed later
+
+SharedSpace receives only the shared projection.
+
+Each participant's private reaction remains inside their own PMN.
+
+This separation should be structural rather than relying only on field-level
+access control.
+
+
+======================================================================
+16H. SAME-PMN AND CROSS-PMN TRUST ARE DIFFERENT
+======================================================================
+
+Same-PMN nodes operate inside one personal trust domain.
+
+Subject to the owner's policy, they may replicate:
+
+    personal history
+    personal models
+    personal memory
+    private analysis
+    private lyrics
+    private media
+
+A different PMN is a foreign trust domain.
+
+Cross-PMN defaults are restricted to:
+
+    PublicMusicKnowledge
+    +
+    ExplicitSharedData
+
+Any wider disclosure requires explicit authorization.
+
+Therefore:
+
+    same PMN
+        = personal trust domain
+
+    different PMN
+        = foreign trust domain
+
+
+======================================================================
+16I. DATA POLICY AS A FIRST-CLASS TYPE
+======================================================================
+
+Privacy classification should exist in the data model, not only in UI text.
+
+A conceptual model:
+
+    DataClass {
+        PublicMusicKnowledge,
+
+        PersonalBehavior,
+        PersonalPreference,
+        PersonalMemory,
+
+        PrivateMedia,
+        PrivateCredential,
+        PrivateModel,
+
+        SharedArtifact,
+        SharedSessionState
+    }
+
+And:
+
+    DataPolicy {
+        class,
+        owner,
+        scope,
+        exportable,
+        replicable,
+        computable_remotely,
+        declassification_policy
+    }
+
+Examples:
+
+    BPM:
+        class = PublicMusicKnowledge
+        replicable = true
+
+    SkipHistory:
+        class = PersonalBehavior
+        replicable = same_pmn_only
+
+    TasteEmbedding:
+        class = PersonalPreference
+        replicable = same_pmn_only
+
+    ProviderCredential:
+        class = PrivateCredential
+        replicable = false
+
+    SharedPlaylist:
+        class = SharedArtifact
+        scope = SharedSpace(S)
+
+
+======================================================================
+16J. PRIVACY TAINT THROUGH AI AND ANALYSIS
+======================================================================
+
+AI, DSP, analytics, and embeddings must preserve data provenance and privacy
+classification.
+
+If a model consumes personal data, outputs derived from that data are
+personal by default.
+
+If a model consumes private media, outputs that reveal information about the
+media remain private by default.
+
+Privacy classification therefore propagates through:
+
+    AI inference
+    embeddings
+    recommendation scores
+    summaries
+    learned parameters
+    personal adaptation
+    analytics
+    generated artifacts
+
+This prevents privacy loss through "representation laundering", where
+sensitive source data is converted into a vector or model and incorrectly
+treated as harmless.
+
+
+======================================================================
+16K. PMN PRIVACY PRINCIPLE
+======================================================================
+
+Formal statement:
+
+    Personal means that behavioral data, preference data, memory, private
+    resources, credentials, and any representations derived from them remain
+    inside the owner's PMN trust boundary unless the owner explicitly
+    delegates a narrowly scoped disclosure or operation.
+
+Federation must therefore be based on:
+
+    explicit scope
+    minimum disclosure
+    local evaluation where possible
+    revocable delegation
+    provenance
+    ownership
+    purpose limitation
+
+A PMN that exposes personal state to foreign PMNs by default is no longer a
+Personal Music Network in the architectural sense.
+
+
+======================================================================
+17. NETWORK MODEL: ONE DEVICE AND MANY DEVICES
+======================================================================
+
+The network design begins with two strict rules:
+
+    1. Single-device and multi-device PMN must share the same logical model.
+
+    2. Physical nodes are not the primary scheduling abstraction.
+       Capabilities are.
+
+A single-device PMN may physically contain only one node, but logically the
+same planning machinery still exists:
+
+    Logical PMN
+        ->
+    Capability Requirements
+        ->
+    Capability Planner
+        ->
+    Local Capability Instances
+
+A multi-device PMN uses exactly the same semantics:
+
+    Logical PMN
+        ->
+    Capability Requirements
+        ->
+    Capability Planner
+        ->
+    Placement Graph
+        ->
+    Network Scheduler
+        ->
+    Capability Instances distributed across many Nodes
+
+The number and type of physical devices change deployment, not meaning.
+
+
+======================================================================
+18. NODE: IDENTITY, RESOURCE BOUNDARY, AND CAPABILITY CONTAINER
+======================================================================
+
+A Node is not fundamentally "the thing that gets a task".
+
+A Node is primarily:
+
+    - an identity boundary
+    - a trust boundary
+    - a failure boundary
+    - a resource boundary
+    - a locality boundary
+    - a container for capability instances
+
+A node should therefore not be classified primarily as:
+
+    Phone
+    Desktop
+    Server
+    NAS
+
+Those are product forms, not architectural roles.
+
+Conceptually:
+
+    Node {
+        identity,
+        capability_inventory,
+        resources,
+        presence,
+        connectivity,
+        trust,
+        policy,
+        constraints
+    }
+
+A desktop may host:
+
+    local storage capability
+    FLAC decode capability
+    AAC encode capability
+    realtime DSP capability
+    CUDA AI inference capability
+    music analysis capability
+    timeline compilation capability
+    audio sink capability
+    desktop UI capability
+
+A phone may host:
+
+    local storage capability
+    decode capability
+    mobile UI capability
+    sensor/context capability
+    small-model inference capability
+    headphone audio sink capability
+
+A NAS may host:
+
+    object storage capability
+    replication capability
+
+A speaker may host:
+
+    audio sink capability
+
+A watch may host:
+
+    control capability
+
+A GPU server may host:
+
+    AI inference capability
+    stem separation capability
+    analysis capability
+
+The architecture should therefore avoid reasoning such as:
+
+    "AI goes to the desktop."
+    "Storage goes to the NAS."
+    "Playback goes to the phone."
+
+It should instead reason about capability requirements and currently
+available capability instances.
+
+
+======================================================================
+19. CAPABILITY INSTANCE: THE PRIMARY EXECUTION ABSTRACTION
+======================================================================
+
+The true schedulable execution primitive is CapabilityInstance.
+
+A capability should not be represented only as a boolean.
+
+Conceptually:
+
+    CapabilityInstance {
+        id,
+        node_id,
+        kind,
+        version,
+        properties,
+        limits,
+        current_state,
+        cost_model,
+        endpoint
+    }
+
+Examples:
+
+    audio.decode
+        codec = FLAC
+        max_channels = 8
+        max_sample_rate = 384000
+        realtime_factor = 45
+
+    audio.transcode
+        input = FLAC
+        output = AAC
+        realtime_factor = 12.4
+
+    audio.output
+        channels = 2
+        max_sample_rate = 192000
+        exclusive = true
+
+    ai.inference
+        model = pmn-transition-v3
+        backend = CUDA
+        vram = 16 GiB
+        estimated_latency = 280 ms
+
+    storage.object
+        free_space = 5.7 TiB
+        persistent = true
+
+    music.analysis.beat
+        algorithm = beat-v2
+        version = 2.1
+
+The node tells PMN where the capability lives.
+The capability tells PMN what can actually be done.
+
+
+======================================================================
+20. CAPABILITY INVENTORY AND DYNAMIC STATE
+======================================================================
+
+Capability description has two parts:
+
+Static properties:
+
+    supported codecs
+    supported model families
+    maximum channel count
+    supported operations
+    hardware features
+    implementation version
+
+Dynamic properties:
+
+    current load
+    free memory
+    free storage
+    battery level
+    temperature
+    current queue depth
+    measured throughput
+    current availability
+    estimated latency
+
+This distinction matters because:
+
+    "The node supports AI inference"
+
+does not imply:
+
+    "The node is currently the best place to execute this inference."
+
+Capability planning must use both capability semantics and live resource
+state.
+
+
+======================================================================
+21. CAPABILITY REQUIREMENTS
+======================================================================
+
+Logical music operations produce CapabilityRequirements.
+
+A requirement should be able to express:
+
+    kind
+    semantic constraints
+    performance constraints
+    quality constraints
+    resource constraints
+    locality constraints
+    timing constraints
+    privacy constraints
+
+Requirements should also have strength:
+
+    REQUIRED
+    PREFERRED
+    OPTIONAL
+
+Example:
+
+    Play a 24/96 FLAC in bit-perfect mode.
+
+    REQUIRED:
+        audio.decode.flac
+        audio.output
+        sample_rate >= 96000
+        bit_depth >= 24
+        no_resampling
+        no_sample_format_conversion
+
+    PREFERRED:
+        exclusive_output
+
+Example:
+
+    Generate a transition bridge.
+
+    REQUIRED:
+        ai.inference
+        model = pmn-transition-v3
+        memory >= 4 GiB
+
+    PREFERRED:
+        latency < 500 ms
+
+    OPTIONAL:
+        GPU acceleration
+
+This turns feature support into explicit constraints rather than platform
+special cases.
+
+
+======================================================================
+22. CAPABILITY COMPOSITION
+======================================================================
+
+A task does not need to be executable by one node.
+
+Capabilities may be composed across nodes.
+
+Example:
+
+    Prepare Track X for playback on Phone.
+
+Required logical pipeline:
+
+    storage.read
+        ->
+    audio.decode.flac
+        ->
+    audio.encode.aac
+        ->
+    network.send
+        ->
+    audio.decode.aac
+        ->
+    audio.output
+
+A valid placement may be:
+
+    NAS
+        storage.read
+            |
+            v
+    Desktop
+        decode.flac
+        encode.aac
+            |
+            v
+    Phone
+        decode.aac
+        audio.output
+
+The planning question is therefore not:
+
+    Which node should run this task?
+
+It is:
+
+    Which capability placement graph best realizes this logical task graph?
+
+
+======================================================================
+23. CAPABILITY EQUIVALENCE AND DEGRADATION
+======================================================================
+
+Different capabilities may satisfy the same logical requirement at different
+quality or cost levels.
+
+Example:
+
+    Required logical function:
+        time_stretch
+
+Possible implementations:
+
+    hardware DSP
+    native CPU algorithm
+    GPU implementation
+    remote server implementation
+
+Likewise a playback requirement may permit:
+
+    FLAC native decode
+    server-side FLAC -> AAC transcode
+    provider AAC variant
+    cached AAC replica
+
+The planner therefore needs explicit equivalence and degradation semantics.
+
+A capability requirement may specify:
+
+    exact requirement
+    acceptable alternatives
+    ordered fallback set
+    forbidden transformations
+
+This is especially important for:
+
+    bit-perfect mode
+    lossless requirements
+    spatial audio
+    low-latency playback
+    battery-saving mode
+    cellular data policies
+
+Graceful degradation should emerge from planning rules, not hard-coded
+device branches.
+
+
+======================================================================
+24. FOUR NETWORK PLANES
+======================================================================
+
+PMN networking is decomposed into four planes:
+
+    1. Control Plane
+    2. Data Plane
+    3. Compute Plane
+    4. Time Plane
+
+Capability-oriented execution planning spans all four planes.
+
+The planes answer different questions:
+
+    Control:
+        What should happen?
+
+    Data:
+        Where are the required artifacts and how can they move?
+
+    Compute:
+        Which capability instances should execute the required operations?
+
+    Time:
+        When must those operations occur?
+
+
+======================================================================
+25. CONTROL PLANE
+======================================================================
+
+The Control Plane carries logical state and intent.
+
+It may contain:
+
+    Music Graph state
+    Playback Session state
+    SessionGraph
+    Timeline Plan
+    User Intent
+    Capability Requirements
+    Node Directory
+    Capability Directory
+    Resource Availability
+    Policies
+    Operation Log
+
+When the user taps Play on a phone, the logical operation should resemble:
+
+    PlayIntent {
+        recording: X,
+        presentation_target: headphones
+    }
+
+The control plane should not directly encode:
+
+    "Fetch this URL from Desktop A and execute decoder B."
+
+That is a placement decision made after capability resolution.
+
+
+======================================================================
+26. DATA PLANE
+======================================================================
+
+The Data Plane moves artifacts.
+
+Artifacts include:
+
+    audio
+    artwork
+    lyrics
+    analysis results
+    waveforms
+    embeddings
+    AI models
+    generated transitions
+    timeline assets
+
+The network may track:
+
+    Artifact X
+
+    Desktop       COMPLETE
+    Server        COMPLETE
+    Phone         PARTIAL
+    Provider      REMOTE
+
+The planner asks:
+
+    What artifacts are required?
+    Where are they?
+    What capability instances need them?
+    What transfer path minimizes total execution cost?
+
+
+======================================================================
+27. PARTIAL ARTIFACTS
+======================================================================
+
+Availability must not be binary.
+
+Useful states include:
+
+    NONE
+    METADATA_ONLY
+    PARTIAL
+    COMPLETE
+    STALE
+    UNAVAILABLE
+
+A phone can begin playback with only the first chunks of a large file.
+
+This unifies:
+
+    streaming
+    caching
+    downloading
+    replication
+
+as one data-plane mechanism.
+
+
+======================================================================
+28. CONTENT-ADDRESSED MEDIA
+======================================================================
+
+Media storage should preferably support content addressing.
+
+Conceptually:
+
+    ContentHash(audio bytes)
+        ->
+    ObjectId
+
+Paths become node-local locators, not identities.
+
+This enables:
+
+    deduplication
+    integrity verification
+    replication
+    resume
+    cross-node equivalence
+    partial transfer
+
+Large media can be represented as chunked manifests:
+
+    MediaManifest
+        |- Chunk 0
+        |- Chunk 1
+        |- Chunk 2
+        ...
+
+Chunking allows:
+
+    fast startup
+    seek-before-complete
+    partial caching
+    efficient synchronization
+
+
+======================================================================
+29. COMPUTE PLANE
+======================================================================
+
+Music workloads may include:
+
+    decode
+    encode
+    transcode
+    resample
+    DSP
+    spatial rendering
+    BPM analysis
+    key detection
+    beat tracking
+    stem separation
+    embedding generation
+    lyric recognition
+    AI inference
+    model adaptation
+    transition generation
+    timeline compilation
+
+The Compute Plane does not schedule "tasks onto devices" directly.
+
+It schedules task requirements onto capability instances.
+
+Single-node:
+
+    TaskGraph
+        ->
+    Capability Planner
+        ->
+    Capability instances on Local Node
+
+Multi-node:
+
+    TaskGraph
+        ->
+    Capability Planner
+        ->
+    Placement Graph
+        ->
+    Capability instances across multiple Nodes
+
+
+======================================================================
+30. TASK GRAPH AND REQUIREMENT GRAPH
+======================================================================
+
+Complex music operations naturally form DAGs.
+
+Example:
+
+    Audio
+      |- Beat Analysis
+      |- Key Analysis
+      |- Stem Analysis
+      |- Embedding
+             |
+             v
+      Transition Planner
+             |
+             v
+         Timeline IR
+
+Each task node derives capability requirements.
+
+The result is a RequirementGraph:
+
+    Task
+        ->
+    CapabilityRequirement
+        ->
+    Candidate CapabilityInstances
+
+The planner then constructs a PlacementGraph that binds each logical
+requirement to one or more concrete capability instances.
+
+
+======================================================================
+31. CAPABILITY PLANNER
+======================================================================
+
+The Capability Planner is the core abstraction between musical planning and
+physical networking.
+
+It consumes:
+
+    Logical Timeline
+    Task Graph
+    Capability Requirements
+    Capability Directory
+    Artifact Directory
+    Node Resource State
+    Link State
+    User Policy
+    Privacy Policy
+    Power Policy
+    Quality Policy
+    Timing Constraints
+
+It produces:
+
+    PlacementGraph
+
+A PlacementGraph answers:
+
+    Which capability instance executes each operation?
+    Which artifacts must be moved?
+    Which intermediate results are materialized?
+    Which operations remain local?
+    Which operations may be fused?
+    Which operations may be delegated?
+
+
+======================================================================
+32. PLACEMENT AS AN OPTIMIZATION PROBLEM
+======================================================================
+
+Placement is a constrained optimization problem.
+
+A conceptual objective may minimize:
+
+    total latency
+    + transfer cost
+    + compute cost
+    + energy cost
+    + monetary cost
+    + reliability risk
+    + quality loss
+    + privacy exposure
+
+subject to:
+
+    capability requirements
+    resource limits
+    connectivity
+    timing constraints
+    user policy
+    privacy policy
+    media rights
+    quality requirements
+
+Weights can change dynamically.
+
+Examples:
+
+    Phone battery is low:
+        energy weight increases.
+
+    Cellular network is active:
+        transfer-cost weight increases.
+
+    User requests lowest latency:
+        latency weight increases.
+
+    Private lyric analysis:
+        cloud capability instances are forbidden.
+
+    Bit-perfect playback:
+        resampling and format-conversion placements are forbidden.
+
+
+======================================================================
+33. NETWORK SCHEDULER
+======================================================================
+
+The Network Scheduler takes a PlacementGraph and makes it executable.
+
+It resolves:
+
+    transport selection
+    artifact transfer
+    task start order
+    dependency readiness
+    reservations
+    buffering
+    retries
+    failover
+    time synchronization
+    execution endpoints
+
+It produces:
+
+    DistributedExecutionGraph
+
+The Capability Planner answers:
+
+    "What should execute where, in capability terms?"
+
+The Network Scheduler answers:
+
+    "How do those placements actually run now?"
+
+
+======================================================================
+34. TIME PLANE
+======================================================================
+
+Music networking has a requirement ordinary file sync does not:
+
+    Correct timing matters.
+
+For:
+
+    synchronized speakers
+    multi-room playback
+    remote playback
+    cross-device handoff
+    distributed realtime DSP
+
+the system may need to estimate:
+
+    clock offset
+    RTT
+    jitter
+    clock drift
+
+PMN therefore needs a logical timing model.
+
+A playback instruction may be expressed as:
+
+    "Execute Timeline position 123.000 s
+     at PMN time T."
+
+Timing capability itself may be modeled explicitly:
+
+    clock.sync
+    realtime.schedule
+    low_jitter_output
+
+A synchronized group can therefore be planned according to actual timing
+capabilities rather than merely node presence.
+
+
+======================================================================
+35. THREE DISTINCT MULTI-DEVICE PLAYBACK MODES
+======================================================================
+
+These must not be conflated.
+
+35.1 Handoff
+
+    Desktop:
+        Track A @ 1:23.500
+
+    -> transfer session semantics ->
+
+    Phone:
+        Track A @ 1:23.500
+
+The original playback endpoint stops.
+
+Prefer semantic handoff:
+
+    recording
+    position
+    session graph
+    policies
+    transition state
+
+The destination resolves the required capabilities and media independently.
+
+Only when the destination cannot obtain the content should peer streaming be
+required.
+
+
+35.2 Remote Playback
+
+    Phone:
+        control capability
+
+    Desktop:
+        timeline / decode / DSP capabilities
+
+    Speaker:
+        audio output capability
+
+The audio does not need to pass through the controller.
+
+
+35.3 Synchronized Group
+
+    One logical PlaybackSession
+        ->
+    several audio.output capability instances
+
+All outputs execute a shared timeline under timing constraints.
+
+
+======================================================================
+36. PLAYBACK SESSION
+======================================================================
+
+PlaybackSession is a logical network entity.
+
+Conceptually:
+
+    PlaybackSession {
+        id,
+        session_graph,
+        timeline_state,
+        current_position,
+        current_musical_region,
+        policy,
+        presentation_targets
+    }
+
+A presentation target should not necessarily be a node ID.
+
+It may be a logical requirement such as:
+
+    "my headphones"
+    "living room group"
+    "current mobile device"
+    "any bit-perfect sink"
+
+The capability planner resolves that target into concrete output capability
+instances.
+
+
+======================================================================
+37. SESSION AUTHORITY
+======================================================================
+
+Synchronized playback requires authoritative session state.
+
+One capability instance may provide:
+
+    session.control.authority
+
+Responsibilities include:
+
+    timeline decisions
+    play/pause
+    seek
+    session position
+    transition decisions
+
+Other participants follow the authoritative timeline.
+
+Authority itself should be capability-oriented:
+
+    If the current authority disappears, another eligible capability instance
+    may assume the role according to policy.
+
+For a small personal network, a lease and deterministic priority system may
+be sufficient. A heavyweight distributed-consensus protocol is not
+automatically required.
+
+
+======================================================================
+38. STATE CLASSES
+======================================================================
+
+Not all state should synchronize.
+
+PMN should distinguish at least:
+
+Persistent State:
+    favorites
+    playlists
+    playback history
+    custom metadata
+    custom lyrics
+    user knowledge
+
+Session State:
+    current playback
+    current session graph
+    current position
+    active presentation targets
+    current timeline plan
+
+Node-Local State:
+    hover state
+    animation state
+    local buffer fill
+    temporary UI state
+    thermal state
+    device-specific settings
+
+Capability-Local State:
+    decoder warm state
+    model residency
+    GPU pipeline cache
+    current DSP state
+    reserved realtime buffers
+
+This separation prevents synchronization from becoming indiscriminate.
+
+
+======================================================================
+39. OPERATION-BASED REPLICATION
+======================================================================
+
+PMN should avoid synchronizing raw database files.
+
+Prefer:
+
+    Operation
+        ->
+    Replication
+        ->
+    Reducer
+        ->
+    Local Materialized View
+
+Example operations:
+
+    Favorite(recording)
+    PlaylistInsert(playlist, recording)
+    PlaylistRemove(playlist, entry)
+    CustomLyricsUpdate(recording)
+    PlaybackCompleted(recording)
+
+SQLite can remain the local query/index engine while the operation log
+defines replicated semantic change.
+
+
+======================================================================
+40. CONSISTENCY MODEL
+======================================================================
+
+Different state deserves different consistency.
+
+Examples:
+
+    Media Object:
+        immutable
+
+    Analysis Artifact:
+        immutable + versioned
+
+    Playback Event:
+        append-only
+
+    Favorite:
+        eventually consistent
+
+    Tags:
+        mergeable set
+
+    Playlist:
+        ordered merge
+
+    Current Session:
+        authority-driven
+
+    Capability telemetry:
+        ephemeral / eventually refreshed
+
+    Buffer state:
+        local only
+
+    Credentials:
+        explicitly scoped
+
+PMN should not pursue global strong consistency where the domain does not
+require it.
+
+
+======================================================================
+41. OFFLINE-FIRST CAPABILITY MODEL
+======================================================================
+
+Nodes being offline is normal.
+
+Capabilities therefore appear and disappear dynamically.
+
+Typical topology:
+
+    laptop sleeping
+    phone outside home
+    home server online
+    desktop shut down
+
+The planner must react to changing capability availability.
+
+Example:
+
+    Required:
+        storage.read(Recording X)
+        audio.decode
+        audio.output
+
+Available:
+
+    Phone:
+        output available
+        no media
+
+    Desktop:
+        lossless storage available
+        node offline
+
+    Server:
+        AAC artifact available
+        online
+
+    Provider:
+        FLAC available
+        online
+
+The planner may choose the server AAC path now and re-evaluate future plans
+when the desktop returns.
+
+
+======================================================================
+42. ARTIFACT PLACEMENT POLICY
+======================================================================
+
+Capability placement and artifact placement are related but distinct.
+
+Capability placement answers:
+
+    Where should computation execute?
+
+Artifact placement answers:
+
+    Where should data persist or be cached?
+
+Examples:
+
+    Home Server:
+        retain all lossless media
+
+    Phone:
+        cache favorite playlists
+        maximum 30 GB
+
+    Laptop:
+        metadata everywhere
+        recent media only
+
+Placement can become predictive:
+
+    The user is likely to listen during tomorrow's commute.
+    The phone is charging on Wi-Fi tonight.
+    Replicate likely-needed artifacts now.
+
+This is a PMN-specific extension beyond ordinary file synchronization.
+
+
+======================================================================
+43. DIRECTORIES
+======================================================================
+
+Planning requires several logical directories:
+
+    NodeDirectory
+    CapabilityDirectory
+    ArtifactDirectory
+    LinkDirectory
+
+Example capability entries:
+
+    ai.inference / pmn-transition-v3
+
+        Desktop GPU:
+            available
+            latency 280 ms
+
+        Home Server CPU:
+            available
+            latency 4.8 s
+
+        Phone:
+            unsupported
+
+Example artifact entries:
+
+    FLAC Object ABC
+
+        Desktop SSD:
+            complete
+            local latency 0.2 ms
+
+        Home Server:
+            complete
+            LAN latency 4 ms
+
+        Phone:
+            unavailable
+
+        Streaming Provider:
+            remote
+            estimated latency 80 ms
+
+Planning operates over these directories rather than device names alone.
+
+
+======================================================================
+44. LOCAL FAST PATH
+======================================================================
+
+Logical uniformity must not force inefficient implementation.
+
+If producer capability and consumer capability are local to the same node,
+PMN should use direct local mechanisms:
+
+    memory
+    shared buffers
+    filesystem
+    in-process calls
+    local GPU resources
+
+It should not route local playback through localhost RPC merely to preserve a
+network abstraction.
+
+The architecture unifies semantics, not overhead.
+
+
+======================================================================
+45. TRANSPORT ABSTRACTION
+======================================================================
+
+Upper layers should not depend on a specific transport.
+
+Possible transport paths include:
+
+    in-process
+    shared memory
+    LAN
+    direct QUIC
+    QUIC over WireGuard
+    public direct connection
+    relay
+    USB/tethered link
+
+Conceptually:
+
+    PeerTransport
+
+selects a suitable connection for the DistributedExecutionGraph.
+
+Transport is an implementation detail below capability and placement
+semantics.
+
+
+======================================================================
+46. DISCOVERY VS CONNECTIVITY VS CAPABILITY DISCOVERY
+======================================================================
+
+These are separate questions.
+
+Node Discovery:
+
+    Which nodes exist?
+
+Connectivity:
+
+    Through which paths can a known node be reached?
+
+Capability Discovery:
+
+    Which capability instances does that node currently expose?
+
+A node can be known but unreachable.
+
+A reachable node can be online while a specific capability is unavailable.
+
+For example:
+
+    Desktop:
+        reachable
+
+    CUDA GPU capability:
+        unavailable because GPU is reserved
+
+Therefore node presence and capability availability must not be collapsed
+into one state.
+
+
+======================================================================
+47. TRUST MODEL
+======================================================================
+
+Local network membership does not imply trust.
+
+Each node should have a cryptographic identity.
+
+Example:
+
+    node keypair
+    NodeId = hash(public key)
+
+Enrollment can use:
+
+    QR code
+    one-time secret
+    mutual verification
+
+After enrollment, trusted node membership is independent of current IP
+address or network location.
+
+Capability delegation must additionally respect authorization.
+
+A trusted node does not automatically receive permission to exercise every
+capability or credential in the PMN.
+
+Trust is scoped by boundary:
+
+    same-PMN trust
+        may authorize personal-state replication according to owner policy
+
+    cross-PMN trust
+        never implies access to personal state
+
+A foreign PMN receives only explicitly shared scopes and explicitly delegated
+operations.
+
+
+======================================================================
+48. CREDENTIALS AND DELEGATION
+======================================================================
+
+PMN node identity and provider credentials are different objects.
+
+For example:
+
+    PMN Node Identity
+    !=
+    NetEase session credential
+
+Credentials should support explicit placement and delegation policies:
+
+    LocalOnly
+    SelectedNodes
+    DelegatedUse
+
+A home server may be allowed to analyze local audio without receiving the
+user's provider credential.
+
+Likewise a remote capability may be technically able to execute an
+operation but still be excluded by privacy or authorization policy.
+
+Cross-PMN compute is subject to the Personal Sovereignty Boundary.
+A technically suitable remote capability must not receive personal data
+unless the data policy explicitly permits that disclosure. When possible,
+the computation should execute inside the owning PMN and only its minimal
+result should cross the boundary.
+
+
+======================================================================
+49. CAPABILITY-ORIENTED EXECUTION PLANNING
+======================================================================
+
+The complete physical planning chain is:
+
+    Music Intent
+        |
+        v
+    Music Planner
+        |
+        v
+    Logical Timeline / Task Graph
+        |
+        v
+    Capability Requirement Derivation
+        |
+        v
+    Capability Requirements
+        |
+        v
+    Capability Planner
+        |
+        v
+    Placement Graph
+        |
+        v
+    Network Scheduler
+        |
+        v
+    Distributed Execution Graph
+        |
+        v
+    Capability Instances
+        |
+        v
+    Physical Nodes / Links / Artifacts
+
+This is the central network architecture of PMN.
+
+The system does not ask:
+
+    "Which device should do this?"
+
+until after it has answered:
+
+    "What capabilities are required?"
+    "Which concrete capability instances can satisfy them?"
+    "Can several capability instances be composed?"
+    "What placement best satisfies policy and cost constraints?"
+
+
+======================================================================
+50. EXAMPLE: TRANSITION GENERATION
+======================================================================
+
+Logical task:
+
+    GenerateTransition(A, B)
+
+Requirements:
+
+    REQUIRED:
+        audio.decode(A)
+        audio.decode(B)
+        music.analysis.beat
+        music.analysis.key
+        ai.inference(model = pmn-transition-v3)
+        storage.temp >= 500 MiB
+
+    PREFERRED:
+        generation_latency < 2 s
+
+Available capability instances:
+
+    Phone:
+        decode
+        beat analysis
+        8 GiB RAM
+        battery = 23%
+        no transition-generation model
+
+    Desktop:
+        decode
+        beat analysis
+        key analysis
+        CUDA transition model
+        online
+
+    Home Server:
+        decode
+        beat analysis
+        key analysis
+        CPU transition model
+        always online
+
+Capability filtering:
+
+    Phone:
+        invalid for full task
+
+    Desktop:
+        valid
+
+    Home Server:
+        valid
+
+Cost evaluation:
+
+    Desktop:
+        generation 1.8 s
+        transfer low
+
+    Home Server:
+        generation 19 s
+        transfer medium
+
+Placement result:
+
+    Desktop capability instances selected.
+
+Nothing in the Music Planner needed to know that the selected execution
+device was a desktop.
+
+
+======================================================================
+51. EXAMPLE: MULTI-NODE PIPELINE
+======================================================================
+
+Intent:
+
+    Play Recording X on Phone under cellular data-saving policy.
+
+Available resources:
+
+    NAS:
+        lossless FLAC
+
+    Desktop:
+        FLAC decoder
+        AAC encoder
+
+    Phone:
+        AAC decoder
+        headphone sink
+
+Placement graph:
+
+    NAS:
+        storage.read
+            |
+            v
+    Desktop:
+        decode FLAC
+        encode AAC 256
+            |
+            v
+    Phone:
+        decode AAC
+        DSP
+        headphone output
+
+The task is not "assigned to Desktop".
+
+Different stages are bound to different capability instances.
+
+
+======================================================================
+52. SINGLE-NODE / MULTI-NODE UNIFICATION
+======================================================================
+
+Single-node example:
+
+    Logical Requirements
+        |- storage.read
+        |- audio.decode
+        |- music.analysis
+        |- timeline.render
+        |- audio.output
+
+All matching capability instances happen to reside on Node A.
+
+The placement graph collapses naturally into local execution.
+
+Multi-node example:
+
+    Server B:
+        storage.read
+
+    Desktop C:
+        music.analysis
+        AI inference
+
+    Phone A:
+        decode
+        DSP
+        audio.output
+
+The Music Planner sees the same logical intent in both cases.
+
+Only capability placement and execution scheduling change.
+
+
+======================================================================
+53. PERSONAL MUSIC NETWORK COMPLETE MODEL
+======================================================================
+
+The complete PMN can therefore be decomposed into seven major domains:
+
+1. MUSIC INPUT
+    Sources
+    Acquisition
+    Media Fabric
+
+2. MUSIC UNDERSTANDING
+    Identification
+    Perception
+    Analysis
+    AI
+    Music Knowledge Graph
+
+3. MUSIC PLANNING
+    User Intent
+    Candidate Selection
+    Sequencing
+    Session Shape
+    Personal Music Model
+
+4. MUSIC TRANSFORMATION
+    Musical Segments
+    Transition Space
+    Timeline Algebra
+    Generated Material
+    Timeline IR
+
+5. MUSIC EXECUTION
+    Decode
+    DSP
+    Mix
+    Spatial Render
+    Timeline Renderer
+    Audio / Media Sink
+
+6. MUSIC FEEDBACK
+    Playback Events
+    User Behavior
+    Personal Memory
+    Learning
+
+7. CAPABILITY-ORIENTED NETWORK FABRIC
+    Nodes
+    Capability Instances
+    Requirement Graphs
+    Placement Graphs
+    Artifacts
+    Storage
+    Compute
+    Providers
+    Outputs
+    Links
+    Replication
+    Scheduling
+    Timing
+    Federation
+
+Cross-cutting concerns include:
+
+    identity
+    personal sovereignty
+    security
+    privacy classification
+    ownership
+    provenance
+    synchronization
+    observability
+    policy
+    capability negotiation
+    cost modeling
+    failure handling
+
+
+======================================================================
+54. CORE ARCHITECTURAL PRINCIPLES
+======================================================================
+
+PMN should preserve the following principles:
+
+1. MUSIC FIRST
+   Network architecture exists to serve musical semantics.
+
+2. LOGICAL NETWORK FIRST
+   One device and many devices share one logical model.
+
+3. PERSONAL BOUNDARY PRECEDES FEDERATION
+   Public music knowledge may cross PMN boundaries. Personal behavior,
+   preference, memory, private resources, credentials, and their derived
+   representations remain inside the owner PMN by default.
+
+5. CAPABILITY FIRST, DEVICE SECOND
+   Planning begins with required capabilities. Physical device identity is a
+   placement constraint, not the primary execution abstraction.
+
+5. NODES ARE BOUNDARIES AND CONTAINERS
+   A node provides identity, trust, resources, locality, failure isolation,
+   and capability instances.
+
+6. CAPABILITIES ARE COMPOSABLE
+   One logical operation may be realized by capability instances distributed
+   across several nodes.
+
+7. IDENTITY IS NOT LOCATION
+   Music identity must not be defined by provider IDs, file paths, or URLs.
+
+8. TRACK IS NOT THE MINIMUM PLAYBACK UNIT
+   MusicalSegment is the practical unit for advanced planning.
+
+9. PLAYBACK IS PLANNING + COMPILATION + RENDERING
+   It is not merely "decode then output".
+
+10. TRANSITIONS ARE PROGRAMS
+   They should be composable over a general timeline algebra.
+
+11. SESSION STRUCTURE MATTERS
+    Long-horizon listening should be planned, not merely greedily sequenced.
+
+12. PLAYBACK CAPABILITY CHANGES POSSIBLE MUSICAL PATHS
+    A stronger renderer can create transitions that were previously
+    infeasible.
+
+13. DATA, COMPUTE, CONTROL, AND TIME ARE DIFFERENT NETWORK PROBLEMS
+    They should not be collapsed.
+
+14. CAPABILITY AVAILABILITY IS DYNAMIC
+    Supported does not mean currently available or currently optimal.
+
+15. LOCAL EXECUTION MUST REMAIN FAST
+    Network abstraction must not force unnecessary RPC or serialization.
+
+16. OFFLINE IS NORMAL
+    Temporary node and capability absence are routine states, not exceptional
+    failures.
+
+17. STATE CONSISTENCY IS DOMAIN-SPECIFIC
+    Not everything needs strong consistency.
+
+18. CREDENTIALS ARE NOT GLOBAL BY DEFAULT
+    Access to provider accounts must be explicitly scoped.
+
+19. DEGRADATION IS A PLANNING PROPERTY
+    Fallback behavior should be described through requirement alternatives and
+    policy, not platform-specific branches.
+
+20. USER FEEDBACK CLOSES THE LOOP
+    PMN continuously learns not only what music the user likes, but how the
+    user prefers music to be sequenced, transitioned, and experienced.
+
+21. IMPLEMENTATION SCOPE MUST NOT DEFINE ARCHITECTURAL SCOPE
+    Features that are expensive or unavailable today may still belong in the
+    complete PMN model.
+
+
+======================================================================
+55. CONCISE DEFINITION
+======================================================================
+
+Personal Music Network is a user-owned logical music environment that:
+
+    acquires music,
+    understands music,
+    organizes music,
+    plans music,
+    transforms music,
+    renders music,
+    distributes music,
+    executes music through available capabilities across one or many nodes,
+    and learns from the user's listening behavior.
+
+Its privacy architecture is:
+
+    Public Music Knowledge:
+        may be exchanged subject to provenance and rights.
+
+    Personal State:
+        remains inside the owner PMN by default.
+
+    Explicit Shared Scope:
+        is the only normal bridge across personal boundaries.
+
+    Derived Personal Representations:
+        inherit the privacy of their source data.
+
+Its execution architecture is:
+
+    Music Planner:
+        decides how music should happen.
+
+    Capability Requirement Layer:
+        describes what abilities are required to realize that plan.
+
+    Capability Planner:
+        binds abstract requirements to concrete capability instances and
+        constructs the placement graph.
+
+    Network Scheduler:
+        turns that placement into a live distributed execution graph over
+        nodes, links, artifacts, and clocks.
+
+The resulting system is not fundamentally a player with synchronization.
+
+It is a music operating environment whose musical intelligence, playback,
+storage, computation, devices, providers, and personal state form one
+coherent capability-oriented network.
