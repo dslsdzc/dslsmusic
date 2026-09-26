@@ -6,6 +6,12 @@ members = ["crates/platform", "app"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+# MSRV。edition 2024 本身要求 ≥1.85，所以这个值是自洽的下限。
+# 与 rust-toolchain.toml 的 channel pin 是两件事：
+#   - channel pin  → 保证「编出相同的代码」（可复现），代价是每个贡献者多下一份工具链
+#   - rust-version → 保证「旧工具链得到清晰错误」而非难解失败
+# 依赖的 MSRV 可能更高，那种情况 cargo 会指名报错，不会静默失败。
+rust-version = "1.85"
 
 [workspace.dependencies]
 # ── 平台层 ──

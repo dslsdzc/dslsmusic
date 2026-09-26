@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# 固定到具体版本，而不是 "stable" —— 后者的实际含义是「用你本机装的
+# 那个 stable」，既不提供可复现性（新 stable 会静默编出不同的代码），
+# 又会让旧 stable 用户撞上难以理解的失败。本机实测为 1.96.1。
+channel = "1.96"
 components = ["rustfmt", "clippy"]
