@@ -3411,14 +3411,30 @@ dsls-provider-api = { path = "../crates/provider-api" }
 dsls-provider-netease = { path = "../crates/provider-netease" }
 dsls-audio = { path = "../crates/audio" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-# 已核实：reqwest 最新稳定版是 0.13.5
-reqwest = { version = "0.13", features = ["stream", "rustls-tls"] }
+# ⚠️ **不是 0.13。** 计划早先写的 `0.13 + ["stream","rustls-tls"]`
+# **编译不过** —— 0.13 把 `rustls-tls` 改名成了 `rustls`（已核实 features2 表）。
+# 而且 0.13 的 rustls 走 aws-lc-rs，会新拖进一大坨 C 编译。
+#
+# 用 **0.12**（与 `ncm-api-rs` 同版本、feature 取并集）⇒ **一个 crate 都不新增**
+# —— 这正是 §18.10「依赖裁剪」要的。
+# ⚠️ `default-features = false` 是必须的：0.12 的 default 含 `default-tls`
+#    = native-tls = openssl-sys，本仓库没有它。
+# ⚠️ **不开 `stream`**：这里是**全量下载到内存再解码** —— `decode_to_i16` 要的是
+#    `MediaSource`（`Read` + **`Seek`**），流式响应**不可 seek**。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
 ```
 
 - [ ] **Step 2: 写 CLI**
 
-`app/src/main.rs` 替换为：
+`app/src/main.rs` —— ⚠️ **是「在 Task 3 的 main.rs 之上追加」，不是「替换为」。**
+
+**Task 3 那段渲染路径必须逐字留着** —— M0 的验收标准
+（`cargo run -p dslsmusic` 弹出窗口）靠它。
+**纯 CLI 会让那条标准直接失效**（clap 发现缺子命令会退出 2）。
+
+子命令因此是**可选**的：`cmd: Option<Cmd>`，`None` 时走渲染路径。
+（实现者已按此落地并实跑了三条路径 —— 缺省 / 显式 render / login+play。）
 
 ```rust
 use clap::{Parser, Subcommand};
@@ -3448,7 +3464,10 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // ⚠️ **不要写裸的 `env_logger::init()`** —— 它在 `RUST_LOG` 未设时默认 **Error**，
+    // 会把 Task 8 修复轮特地把默认级别提到 `info` 的那次修复**改回去**
+    // （那条修复的存在理由：试听片段诊断的 `warn!` 默认必须可见）。
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match Cli::parse().cmd {
         Cmd::Login => login().await,
         Cmd::Play { keywords, quality } => play(&keywords, &quality).await,
@@ -3511,7 +3530,11 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
         "standard" => Quality::Standard,
         "lossless" => Quality::Lossless,
         "hires" => Quality::HiRes,
-        _ => Quality::High,
+        // ⚠️ **未知值硬报错，不静默降级。** 静默 `_ => High` 会让
+        //    `--quality lossles`（少个 s）**悄悄播 320k** —— 用户以为要的是无损。
+        other => anyhow::bail!(
+            "未知音质 {other:?}；可用: low / standard / high / lossless / hires"
+        ),
     };
 
     // 经**抽象**调用，不碰具体类型 —— M1 存在的理由就是验证这条链路。
@@ -3546,7 +3569,15 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     println!("得到地址（{} 字符）", url.len());
 
     let mut engine = AudioEngine::new()?;
-    let bytes = reqwest::get(&url).await?.bytes().await?;
+    // ⚠️ **必须查状态码。** `reqwest` 对 4xx/5xx **不报错** ——
+    //    403 的 HTML 错误页会被原样喂给解码器，报出来的是「解码失败」，
+    //    而真正的原因是「地址失效」。错误信息会指向完全错误的方向。
+    let resp = reqwest::get(&url).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("下载失败：HTTP {status}（播放地址可能已失效）");
+    }
+    let bytes = resp.bytes().await?;
     println!("已下载 {} KB，开始播放…（Ctrl-C 停止）", bytes.len() / 1024);
 
     let cursor = std::io::Cursor::new(bytes.to_vec());
@@ -3570,7 +3601,17 @@ async fn play(keywords: &str, quality: &str) -> anyhow::Result<()> {
     while engine.ring_available() > 0 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    println!("\n播放结束。xrun 计数 = {}（必须为 0）", engine.xrun_count());
+    // ⚠️ **不能只打一个数，更不能写「必须为 0」。**
+    // 歌放完时环被**自然读空**，回调必然记一次欠载 —— 收尾那几次**不是缺陷**
+    // （实测收尾 1/8/9/10 次，随轮询与回调的竞态浮动）。
+    //
+    // 所以打**两个口径**：解码结束时采样的「播放期间」（**这个必须为 0**）
+    // + 最终总计。差值就是收尾清空造成的，可解释。
+    println!(
+        "\n播放结束。xrun：播放期间 = {}（必须为 0）、总计 = {}（差值来自收尾清空）",
+        xrun_during_playback,
+        engine.xrun_count()
+    );
     Ok(())
 }
 ```
@@ -3612,10 +3653,23 @@ RUST_LOG=info cargo run -p dslsmusic -- play "周杰伦 晴天"
 Expected:
 1. 打印搜索结果列表
 2. 打印解析到的播放地址
-3. **扬声器出声**
-4. 播放结束打印 `xrun 计数 = 0`
+3. **扬声器出声** —— ⚠️ **且「出声对」（见下）**
+4. 播放结束打印 `xrun：播放期间 = 0、总计 = N`（**只有「播放期间」那个必须为 0**）
 
-**若 `xrun` 不为 0** —— 说明 buffer 太小或解码线程饿死，**这是必须修的 bug，不是可接受的误差**。
+> ⚠️ **「出声」不等于「出声对」—— 这条是 Task 9 实现者实测发现的。**
+>
+> `dsls-audio` **不重采样**：`decode_to_i16` 按**源**采样率产出样本，
+> 而 `AudioEngine` 按**设备**采样率建流。源 44.1kHz + 设备 48kHz ⇒
+> **1.0884 倍速、+1.46 半音**，**而 xrun 恒 0、无任何告警**。
+> 实测：44100Hz 源的 42.893 秒歌，**39.4 秒放完**。
+>
+> **⇒ 验收必须包含「速度与音高正确」**（最省事的判据：**掐表对时长**，
+> 而不是靠耳朵分辨 8.8% —— 那个很多人在没有参照物时听不出来）。
+>
+> **这条正是「指标全绿但输出是错的」的实例**：xrun 0、测试全绿、能出声。
+
+**若 `xrun`（播放期间口径）不为 0** —— 说明 buffer 太小或解码线程饿死，
+**这是必须修的 bug，不是可接受的误差**。
 
 - [ ] **Step 6: 失败路径验证（重要，别跳过）**
 
@@ -3650,7 +3704,8 @@ M0 与 M1 全部完成当且仅当：
 - [ ] `RUST_LOG=info cargo run -p dslsmusic` 弹出窗口、显示三角形、日志显示 `RenderTier: A` 且适配器**不是** llvmpipe
 - [ ] 日志出现帧时间统计行
 - [ ] `cargo run -p dslsmusic -- login` 能完成扫码并落地 session
-- [ ] `cargo run -p dslsmusic -- play "<歌名>"` **能出声**，结束时 `xrun 计数 = 0`
+- [ ] `cargo run -p dslsmusic -- play "<歌名>"` **能出声**，且**时长与源一致**（掐表验速）
+- [ ] 播放期间 `xrun = 0`（收尾那几次不计 —— 那是环自然读空）
 - [ ] 搜索无结果时**退出码为 0**
 
 ## 已知遗留（明确不在 M0/M1 范围内）
