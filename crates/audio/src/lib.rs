@@ -82,8 +82,13 @@ pub struct AudioEngine {
     conv: Vec<i16>,
     /// ring 容量（样本数），按**输出率**算出来的。
     ring_capacity: usize,
-    /// 设备侧报错次数（`device_error_count()`）。与 `producer.underruns()` 共享同一个
-    /// 计数器 —— 但**口径完全不同**，见那个方法的文档。
+    /// 设备侧报错次数（`device_error_count()`）。
+    ///
+    /// ⚠️ **与 `producer.underruns()` 不是一个计数器**（两者各自一个
+    /// `Arc<AtomicU64>`：这个在 `build` 里建，那个在 ring 里建），
+    /// **口径也完全不同**，见 [`AudioEngine::device_error_count`] 的文档。
+    /// 把两个合并成一个计数会**原样重建**那个方法要堵的盲区 ——
+    /// 一次播放里设备侧报 17 次错而 `xrun_count()` 是 0，正是本字段存在的理由。
     device_errors: Arc<AtomicU64>,
 }
 
@@ -115,9 +120,18 @@ impl AudioEngine {
         if let Some(pcm_id) = preferred_exclusive(&host) {
             match Self::new_on(&pcm_id, desired_rate) {
                 Ok(engine) => return Ok(engine),
+                // ⚠️ **「设备被占着」这句话只配安在 busy 类错误上。**
+                //    `new_on` 报错的原因不止一种：名字打不开（`hw:CARD=9,DEV=0` 拼错、
+                //    设备不在枚举里）走的是 `find_device` 的 `bail!`，那条与「谁占着」无关。
+                //    把「这是常态」接到它上面，等于把用户从「你名字写错了」引到
+                //    「去关掉 PipeWire」——一个**指向错误方向**的解释比没有解释更贵。
+                Err(e) if is_device_busy(&e) => log::warn!(
+                    "独占设备 {pcm_id} 正被占用（{e}）—— **这是常态**（PipeWire 或别的进程\
+                     占着它）。退回共享路径；这不会是静音，但系统混音器会回到中间。"
+                ),
                 Err(e) => log::warn!(
-                    "独占设备 {pcm_id} 打不开（{e}）—— **这是常态**（PipeWire 或别的进程\
-                     正占着它）。退回共享路径；这不会是静音，但系统混音器会回到中间。"
+                    "独占设备 {pcm_id} 打不开（{e}）—— 这**不是**「设备被占着」那一类\
+                     （错误类别见上），退回共享路径。这不会是静音，但系统混音器会回到中间。"
                 ),
             }
         }
@@ -448,6 +462,11 @@ impl AudioEngine {
     /// ⚠️ 口径：它是「cpal 的错误回调被调了几次」，不是「丢了多少样本」；
     /// 而且回调里现在只有 ALSA 的 xrun 会走到（设备拔出等也走同一条，本机没遇到过）。
     /// **必须为 0**，非零就说明这条实时路径被饿到过。
+    ///
+    /// ⚠️ **回调里不打印错误文本，只剩这个次数**（§16.2：那条回调与音频数据回调
+    /// 同源，格式化 + 取 logger 锁 + 写 stderr 三样都犯）。所以别指望日志里有
+    /// 「音频流错误」这一行 —— 它就长这样：`device_error_count()` 非零，没有别的。
+    /// 这是刻意取舍，理由见 `build_output` 里错误回调那段注释。
     pub fn device_error_count(&self) -> u64 {
         self.device_errors.load(Ordering::Relaxed)
     }
@@ -518,6 +537,22 @@ fn preferred_exclusive(host: &cpal::Host) -> Option<String> {
     None
 }
 
+/// 这条错误是不是「设备被占用」那一类（cpal 的 `ErrorKind::DeviceBusy`）。
+///
+/// 为什么要分开：只有这一类才配得上「这是常态，PipeWire 或别的进程占着它」那句
+/// 归因。别的失败（名字拼错、设备不在枚举里、权限不足）套上那句话会把用户引向
+/// 完全错误的方向 —— 见 [`AudioEngine::new`] 里那段按类别分档的告警。
+///
+/// `anyhow::Error` 的**整条链**都要看：`cpal::Error` 常被 `?` 转进来，
+/// 那时它就是链上的一个节点，不一定是第一个。
+fn is_device_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<cpal::Error>()
+            .is_some_and(|e| e.kind() == cpal::ErrorKind::DeviceBusy)
+    })
+}
+
 /// 按 PCM 名字在**枚举**里找一个输出设备。
 ///
 /// 找不到时把本机有哪些设备列进错误信息 —— 这条信息就是用户下一步要用的东西，
@@ -542,13 +577,15 @@ fn find_device(host: &cpal::Host, pcm_id: &str) -> anyhow::Result<cpal::Device> 
         return Ok(d);
     }
 
-    // ② **卡名换成卡号再找一次。** ALSA 文档与所有教程写的都是
-    //    `hw:CARD=Loopback,DEV=0`（CARD 可以是卡名），而 cpal 枚举的**只有卡号**形式
-    //    （`hw:CARD=3,DEV=0`）⇒ 不换的话，用户按文档写就会得到「找不到设备」，
-    //    而设备明明在。实测：Task 11 的控制者在验收说明里写的就是卡名那种。
-    if let Some(canonical) = output_path::canonicalize_card_name(pcm_id) {
+    // ② **规范成 cpal 枚举的形式再找一次。** ALSA 认的名字不止 cpal 枚举的那一种：
+    //    卡名（`hw:CARD=Loopback,DEV=0`）、位置写法（`hw:3,0`）、缺 `DEV`（`hw:CARD=3`）
+    //    都是合法 ALSA 名字，而 cpal 枚举的**只有** `hw:CARD=<号>,DEV=<号>` 一种
+    //    ⇒ 不规范的话，用户按文档或 `aplay` 的习惯写就会得到「找不到设备」，
+    //    而设备明明在。实测两处：Task 11 的控制者在验收说明里写的是卡名那种；
+    //    CLI 的帮助文本把 `--device` 称作「ALSA 的 PCM 名字」（`app/src/main.rs`）。
+    if let Some(canonical) = output_path::canonicalize_pcm_id(pcm_id) {
         if let Some(d) = lookup_pcm_id(host, &canonical) {
-            log::info!("设备名 {pcm_id} 按 ALSA 的卡名写法解析为 {canonical}");
+            log::info!("设备名 {pcm_id} 规范为 cpal 枚举的形式 {canonical}");
             return Ok(d);
         }
     }
@@ -705,11 +742,18 @@ where
         move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
             fill_from_ring::<T>(out, channels, &mut consumer, &mut scratch);
         },
-        // 错误回调：计数 + 日志。**只做一次原子加**（无分配、无锁、无 IO），
-        // 这条回调可能与音频线程同源。
-        move |err| {
+        // 错误回调：**只做一次原子加**（无分配、无锁、无 IO）。
+        //
+        // ⚠️ 这里以前还有一行 `log::error!("音频流错误: {err}")` —— 已删。
+        //    这条回调**跑在必须赶上 deadline 的那个线程上**（错误回调与数据回调同源，
+        //    见 `build_output` 的调用点），而 `log::error!` 三样全犯：格式化（可能分配）、
+        //    取 logger 的全局锁、写 stderr（IO）—— §16.2 明禁。
+        //    代价如实记着：**错误的文本没了**，只剩次数。这是刻意的取舍 ——
+        //    `device_error_count()` 是这里的接口（实测量到的是 ALSA 的
+        //    underrun/overrun 一类），要文本就得把它交给非实时线程去打印，
+        //    那是接口改动，不在本次范围。
+        move |_err| {
             device_errors.fetch_add(1, Ordering::Relaxed);
-            log::error!("音频流错误: {err}");
         },
         None, // timeout：None = 无限等待后端初始化
     )?;

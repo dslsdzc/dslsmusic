@@ -72,9 +72,14 @@ const EXCLUSIVE_CAVEAT: &str = "独占（系统混音器不在我们与设备之
      还要格式与源一致、采样率与源一致，且**设备自己不做处理**\
      （某些声卡有内部 DSP/硬件混音，从进程内看不出来）⇒ 只能说「到我们这一层为止没动过样本」。";
 
+/// ⚠️ 这句话会跟着 `Shared` **每条路径**打印，而「列出本机可选设备」的日志只在
+/// **自动选路**那一支（[`crate::preferred_exclusive`]）里打印 —— 用 `--device`
+/// 点名设备时走的是 `new_on`，那条日志根本不出现。所以这里写成**条件从句**：
+/// 承诺必须在所有会打印它的场合都成立，否则就是下一句「日志里会列出…」而日志里没有。
 const SHARED_CAVEAT: &str = "共享（经系统混音器）。**系统可能替我们重采样**，我们看不见也管不着 —— \
      这一档只能保证「我们交出去的是源采样率的样本」。要绕开系统混音器，\
-     见 DSLS_AUDIO_DEVICE（下面的日志里会列出本机可选的 hw: 设备）。";
+     把 DSLS_AUDIO_DEVICE 设成一台物理设备（`hw:`）；走**自动选路**且没拿到独占时，\
+     上面的日志里会列出本机可选的 hw: 设备（用 --device 点名设备时不会打印那份列表）。";
 
 impl OutputPath {
     /// 系统混音器在不在我们和设备之间。
@@ -231,6 +236,18 @@ fn classify_env_value(raw: Option<&str>) -> EnvPreference {
 ///
 /// 调用时本进程**不持有别的播放 PCM**（否则第 2 步可能认到别的设备上）。
 /// `AudioEngine::new` 在构造的最开始调它，满足这条。
+///
+/// 这条前置条件**不靠调用方自觉**：第 2 步拿到的是本进程持有的**全部**播放 PCM
+/// （[`held_playback_pcms`]），**多于一台就判 `Unavailable`**，不取第一个 ——
+/// 所以前置条件被破坏时，结果是「如实判不出来」，而不是「认到别的卡上」。
+///
+/// # 一条**没有消除**的窗口（如实记着）
+///
+/// 探针必须先释放、独占流才能重开 —— 这中间 PCM 是空着的，别的进程可以抢。
+/// 这里把它缩到最小（发现工作全部在持有期间做完，见 [`probe_via_proc`] 里那段），
+/// 但**消不掉**：剩下的窗口是 `new_on` 自己的一次枚举 + open。抢输了的后果是
+/// **如实退回 `Shared`**，不是静默出错 —— 前提是那条错误信息别把它说成
+/// 「设备被占着」（见 `AudioEngine::new` 里按 `ErrorKind::DeviceBusy` 分档的告警）。
 pub fn probe_default_target(host: &cpal::Host) -> Candidate {
     match platform_note() {
         // 本平台做不到 ⇒ 从这一步就如实降级，不去跑下面的探针。
@@ -277,33 +294,59 @@ fn probe_via_proc(host: &cpal::Host) -> Candidate {
     };
 
     let me = std::process::id();
-    let found = held_playback_pcm(me);
+    let found = held_playback_pcms(me);
     // 诊断用：探针还活着的时候把「本进程持有哪个 PCM」记下来。
     log::debug!("探针期间本进程（pid {me}）持有的播放 PCM: {found:?}");
-    drop(probe);
 
-    let Some((card, dev)) = found else {
-        return Candidate::Unavailable {
+    // ⚠️ **发现工作全部在探针还活着时做完，`drop(probe)` 留到最后。**
+    //    原因是「先释放再重开」这个窗口：探针一放，PCM 就空出来了，别的进程可以抢；
+    //    而 `hardware_output_device` 是一次**完整的设备枚举**（枚举本身要读 ALSA 的
+    //    hint 列表与 `/proc`，不是几个指令），把它放在 `drop` 后面等于把这个窗口
+    //    从「一次 open」拉长成「一次枚举 + 一次 open」。
+    //    挪到最后只剩 `AudioEngine::new` 那边 `new_on` 自己的一次枚举 + open，
+    //    这一段**消不掉**（除非把已经解析好的 `cpal::Device` 交给引擎，那是接口改动）——
+    //    所以这里是「把窗口缩到不可再缩」而不是「消除竞态」，如实记着。
+    let candidate = match found.as_slice() {
+        [] => Candidate::Unavailable {
             reason: format!(
                 "默认设备背后不是一张物理卡（本进程没有持有任何 /proc/asound 里的播放 PCM）—— \
                  这通常是 PipeWire/PulseAudio 这类服务型后端：硬件由**服务进程**持有。\
                  进程内无法把 default 映射到 hw:{HW_PREFIX} 名字（原因与实测见 output_path.rs 的文档）"
             ),
-        };
-    };
-
-    let pcm_id = format!("{HW_PREFIX}CARD={card},DEV={dev}");
-    // 只在 cpal 自己枚举得出的设备里选 —— 我们不自己拼 ALSA 名字去打开：
-    // 拼错了是一条静默的失败路径，而枚举列表是 cpal/ALSA 报出来的事实。
-    match hardware_output_device(host, &pcm_id) {
-        Some(_) => Candidate::Found { pcm_id },
-        None => Candidate::Unavailable {
+        },
+        [(card, dev)] => {
+            let pcm_id = format!("{HW_PREFIX}CARD={card},DEV={dev}");
+            // 只在 cpal 自己枚举得出的设备里选 —— 我们不自己拼 ALSA 名字去打开：
+            // 拼错了是一条静默的失败路径，而枚举列表是 cpal/ALSA 报出来的事实。
+            match hardware_output_device(host, &pcm_id) {
+                Some(_) => Candidate::Found { pcm_id },
+                None => Candidate::Unavailable {
+                    reason: format!(
+                        "从 /proc/asound 判定目标是 {pcm_id}，但它不在 cpal 的输出设备列表里 \
+                         （可能是只支持录音的设备）"
+                    ),
+                },
+            }
+        }
+        // ⚠️ **多于一台就判「判不出来」，不取第一个。** 同进程里若同时开着两个
+        //    `AudioEngine`（两台不同的卡），「第一个」是 `/proc/asound` 的**遍历顺序**
+        //    决定的；而多子流的卡（`snd-aloop` 有 8 个子流）上打开另一台卡**会成功**
+        //    ⇒ 声音出到错误的设备，而采样率、xrun、时长**全都正常**。
+        //    这正是本模块开头那段「宁可拿不到证据，也不猜」的同一条规矩。
+        //    （今天单引擎故不可达；写成显式的判定是为了让它**继续**不可达。）
+        many => Candidate::Unavailable {
             reason: format!(
-                "从 /proc/asound 判定目标是 {pcm_id}，但它不在 cpal 的输出设备列表里 \
-                 （可能是只支持录音的设备）"
+                "本进程同时持有多台播放 PCM（{}）—— 「default 落在哪一台」不再唯一，\
+                 判定为不可用（本模块宁可判不出来，也不认错设备）",
+                many.iter()
+                    .map(|(c, d)| format!("{HW_PREFIX}CARD={c},DEV={d}"))
+                    .collect::<Vec<_>>()
+                    .join("、")
             ),
         },
-    }
+    };
+    drop(probe);
+    candidate
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -315,24 +358,93 @@ fn probe_via_proc(_host: &cpal::Host) -> Candidate {
     }
 }
 
-/// 把 ALSA 文档里的设备名规范成 **cpal 枚举里的形式**（卡名 → 卡号）。
+/// 把用户写的 ALSA PCM 名字规范成 **cpal 枚举里的形式**。`None` = 不需要改 / 改不出来。
 ///
 /// # 为什么需要它（实测的坑）
 ///
-/// ALSA 自己的命名文档和所有教程都写 `hw:CARD=Loopback,DEV=0` —— `CARD` 既可以是
-/// **卡号**也可以是**卡名**，`aplay -D hw:CARD=Loopback,DEV=0` 照样能开。
-/// 但 **cpal 枚举出来的一律是卡号**（`hw:CARD=<数字>,DEV=<数字>`，源码注释原话
-/// `Add hw:/plughw: for all physical devices with numeric index`），
-/// 而 `AudioEngine::new_on` 是**按枚举到的名字**找设备 ⇒
-/// 用户按文档写卡名会得到「找不到输出设备」，**而设备明明在**。
+/// cpal 枚举物理设备时**只**产出 `hw:CARD=<数字>,DEV=<数字>` 一种形状
+/// （源码注释原话 `Add hw:/plughw: for all physical devices with numeric index`），
+/// 而 ALSA 自己认好几种写法 —— `aplay -D hw:3,0` 与 `aplay -D hw:CARD=Loopback,DEV=0`
+/// 都照样能开。`AudioEngine::new_on` 是**按枚举到的名字**找设备的 ⇒
+/// 用户（按 ALSA 文档或教程）写出的名字会得到「找不到输出设备」，**而设备明明在**。
 /// （实测：Task 11 的控制者在验收说明里就写的是 `hw:CARD=Loopback,DEV=0`。）
 ///
-/// ⇒ 这里用 `/proc/asound/cards` 把卡名换成卡号。换不出来就返回 `None`，
-/// 让调用方按原样报错 —— **绝不猜**。
+/// | 用户写的 | 规范成 |
+/// |---|---|
+/// | `hw:3,0` / `hw:3`（位置写法） | `hw:CARD=3,DEV=0` |
+/// | `hw:CARD=3`（缺 `DEV`） | `hw:CARD=3,DEV=0` |
+/// | `hw:CARD=Loopback,DEV=0`（卡名） | `hw:CARD=<查到的号>,DEV=0` |
 ///
-/// 支持的形式：`hw:CARD=<卡名>[,DEV=<n>]` 与 `plughw:...`（DEV 缺省按 0）。
-/// 已经是数字卡号的、或别的形式一律返回 `None`（不需要也不该改）。
-pub fn canonicalize_card_name(pcm_id: &str) -> Option<String> {
+/// 查不出卡号、或本来就是规范形式、或根本不是 `hw:`/`plughw:` ⇒ `None`，
+/// 调用方按原样报错 —— **绝不猜**。
+///
+/// 返回的字符串**一定是 cpal 枚举得出的形状**（`<前缀>:CARD=<数字>,DEV=<数字>`）：
+/// 卡名查不到号、或卡号不是数字，都返回 `None` 而不是「补个 `DEV=0` 交差」——
+/// 那种返回值拿到枚举里必然查不到，只是让上层多查一次。
+///
+/// # 两段各自的出处
+///
+/// - **数字写法**这一段是 cpal `canonical_pcm_id` 的镜像（已核实·源码
+///   `cpal-0.18.2/src/host/alsa/mod.rs:1696-1711`）。cpal 也经公开的
+///   `HostTrait::device_by_id`（同文件 `:164-168`）暴露了同一个归一化，
+///   但**那条路不查卡名**（`canonical_pcm_id` 对 `CARD=<非数字>` 原样返回），
+///   所以卡名那段无论如何都得自己写。两段都写成纯函数、各自可单测，
+///   比「先 `device_by_id` 再补一次卡名」少一层接力。
+/// - 镜像若与 cpal 的真实行为有出入，后果**有上界**：这个返回值只用来
+///   *查* cpal 的枚举，查不到就退回「原样报错」，与今天同一个下场，不会更坏。
+/// - **卡名**那一段查 `/proc/asound/cards`（见 [`card_index_by_name`]）。
+pub fn canonicalize_pcm_id(pcm_id: &str) -> Option<String> {
+    // 先把数字写法补齐（`hw:3,0` → `hw:CARD=3,DEV=0`）。这一步也可能产出
+    // `hw:CARD=Loopback,DEV=0` 这种**仍是卡名**的形式，正好交给第二段查号。
+    let numeric = canonicalize_numeric_pcm_id(pcm_id);
+    let base = numeric.as_deref().unwrap_or(pcm_id);
+    // 卡名那一段对 `base` 与**原串**各试一次：`base` 可能已经是数字形式
+    // （那时第二段返回 None），而原串可能本来就没有 `DEV=`，两处都试才不漏。
+    canonicalize_card_name(base)
+        .or_else(|| canonicalize_card_name(pcm_id))
+        .or(numeric)
+}
+
+/// `hw:3,0` / `hw:CARD=3` 这类**数字**写法 → cpal 枚举的形式。`None` = 没改动。
+///
+/// 逐字镜像 `cpal-0.18.2/src/host/alsa/mod.rs:1696-1711` 的分支
+/// （`CARD=` 后面是数字、或位置写法），只把「返回原串」改成 `None`。
+fn canonicalize_numeric_pcm_id(pcm_id: &str) -> Option<String> {
+    let (prefix, rest) = pcm_id.split_once(':')?;
+    let (card_str, device_str) = match rest.split_once(',') {
+        Some((c, d)) => (c.trim(), d.trim()),
+        None => (rest.trim(), "0"),
+    };
+    let canonical = if let Some(card) = card_str.strip_prefix("CARD=") {
+        // `hw:CARD=3` —— 只缺 DEV。写了 DEV 就不用补（cpal 也是这么分的）。
+        if rest.contains(',') {
+            return None;
+        }
+        // ⚠️ **卡号必须是数字**，否则这一步什么都不做（留给卡名那一段）。
+        //    cpal 在这里会把 `hw:CARD=Loopback` 也补成 `,DEV=0`，但补出来的
+        //    仍然是**卡名**、仍然查不到设备 —— 返回它只会让上层白查一次。
+        //    （刻意比 cpal 严：本函数只吐 cpal 枚举得出的形状，
+        //      出处即 `Add hw:/plughw: for all physical devices with numeric index`。）
+        card.trim().parse::<u32>().ok()?;
+        format!("{prefix}:{rest},DEV=0")
+    } else {
+        // `hw:3,0` / `hw:3` —— 位置写法换成 CARD=/DEV=。
+        // 两个位置都必须是数字（位置写法的 ALSA 语法本来就只收数字），
+        // 而且卡号要**真的解析一次**：`hw:` / `hw:,0` 这种空卡段会在这里被挡掉
+        // （cpal 会补出 `hw:CARD=,DEV=0` —— 一个查不到任何设备的名字）。
+        // 前缀不校验（cpal 也不校验）：`default:0` 这种名字本来就打不开，
+        // 规范不规范都是同一个下场。
+        let card = card_str.parse::<u32>().ok()?;
+        let device = device_str.parse::<u32>().ok()?;
+        format!("{prefix}:CARD={card},DEV={device}")
+    };
+    (canonical != pcm_id).then_some(canonical)
+}
+
+/// 卡名 → 卡号那一段（`hw:CARD=Loopback,DEV=0` → `hw:CARD=3,DEV=0`）。
+///
+/// 只用 `/proc/asound/cards` 查；查不到返回 `None`，**绝不猜**。
+fn canonicalize_card_name(pcm_id: &str) -> Option<String> {
     let (prefix, rest) = pcm_id.split_once(':')?;
     if prefix != "hw" && prefix != "plughw" {
         return None;
@@ -456,12 +568,22 @@ pub fn pcm_id_of(device: &cpal::Device) -> String {
         .unwrap_or_else(|_| "<未知设备>".to_owned())
 }
 
-/// 扫 `/proc/asound`，返回**本进程**持有的**播放** PCM：`(卡号, 设备号)`。
+/// 扫 `/proc/asound`，返回**本进程**持有的**播放** PCM：`(卡号, 设备号)` 的
+/// **去重集合**（顺序不定；空 = 一个都没有）。
 ///
-/// 只读 `/proc`，不打开、不修改任何东西。找不到（含 `/proc/asound` 不存在）返回 `None`。
+/// 只读 `/proc`，不打开、不修改任何东西。`/proc/asound` 不存在时返回空表。
+///
+/// ⚠️ **返回集合而不是「第一个」**，理由见 [`probe_default_target`] 里那段
+/// 「多于一台就判判不出来」：取第一个 = 让 `/proc/asound` 的遍历顺序决定
+/// 「哪张卡是默认卡」，而那是会**静默送错设备**的猜。
+/// 去重按 `(卡号, 设备号)`：多子流的卡（`snd-aloop` 有 8 个子流）上同一个
+/// `hw:CARD=3,DEV=0` 只会算一台 —— 那是 ALSA 的子流分配，不是「两台设备」。
 #[cfg(target_os = "linux")]
-pub fn held_playback_pcm(pid: u32) -> Option<(u32, u32)> {
-    let cards = std::fs::read_dir("/proc/asound").ok()?;
+pub fn held_playback_pcms(pid: u32) -> Vec<(u32, u32)> {
+    let mut found: Vec<(u32, u32)> = Vec::new();
+    let Some(cards) = std::fs::read_dir("/proc/asound").ok() else {
+        return found;
+    };
     for card_entry in cards.filter_map(Result::ok) {
         let Some(card) = parse_card_dir(&card_entry.file_name().to_string_lossy()) else {
             continue;
@@ -480,13 +602,13 @@ pub fn held_playback_pcm(pid: u32) -> Option<(u32, u32)> {
                 let Ok(status) = std::fs::read_to_string(sub.path().join("status")) else {
                     continue;
                 };
-                if status_owner_pid(&status) == Some(pid) {
-                    return Some((card, dev));
+                if status_owner_pid(&status) == Some(pid) && !found.contains(&(card, dev)) {
+                    found.push((card, dev));
                 }
             }
         }
     }
-    None
+    found
 }
 
 /// `/proc/asound` 里的目录名 `card1` → `Some(1)`。
@@ -669,33 +791,63 @@ appl_ptr    : 13568
         assert!(parse_cards("--- no soundcards ---\n").is_empty());
     }
 
-    /// 卡名的规范化：**只在确实需要换、且换得出来时才换**。
+    /// 规范化：**只在确实需要换、且换得出来时才换**。
     #[test]
     fn canonicalize_only_when_it_helps() {
-        // 已经是卡号 / 位置写法 / 别的前缀 ⇒ 不该动（None 表示原样使用）
+        // 已经是 cpal 枚举的形式 / 不是 PCM 名字 ⇒ 不该动（None 表示原样使用）
         for unchanged in [
             "hw:CARD=3,DEV=0",
-            "hw:3,0",
             "plughw:CARD=1,DEV=0",
             "default",
             "pipewire",
-            "hw:CARD=0",
+            "",
+            "hw",  // 没有 `:`
+            "hw:", // 卡段是空的 —— 补成 `hw:CARD=,DEV=0` 只是噪声，见函数里的说明
         ] {
             assert_eq!(
-                canonicalize_card_name(unchanged),
+                canonicalize_pcm_id(unchanged),
                 None,
                 "{unchanged:?} 不该被改写"
             );
         }
+
+        // **数字写法必须补齐成 cpal 枚举的形式。** 这几条是本次修的：
+        // 以前它们原样返回 None ⇒ `--device hw:0,0` 报「找不到输出设备」，
+        // 而 `aplay -D hw:0,0` 认得这个名字（CLI 的帮助文本也把它称作
+        // 「ALSA 的 PCM 名字」）。分支逐条对齐 cpal 的 `canonical_pcm_id`。
+        for (input, want) in [
+            ("hw:0,0", "hw:CARD=0,DEV=0"),
+            ("hw:3", "hw:CARD=3,DEV=0"),
+            ("hw:CARD=3", "hw:CARD=3,DEV=0"),
+            ("plughw:3,1", "plughw:CARD=3,DEV=1"),
+            ("plughw:CARD=1", "plughw:CARD=1,DEV=0"),
+            // 空白要从两侧吃掉（用户从别处复制粘贴时很常见）
+            ("hw: 3 , 0 ", "hw:CARD=3,DEV=0"),
+        ] {
+            assert_eq!(
+                canonicalize_pcm_id(input).as_deref(),
+                Some(want),
+                "{input:?} 应被规范成 {want:?}"
+            );
+        }
+
         // 卡名形式：**本机查得到就换，查不到就 None**（绝不猜）
         assert_eq!(
-            canonicalize_card_name("hw:CARD=NoSuchCardZZZ,DEV=0"),
+            canonicalize_pcm_id("hw:CARD=NoSuchCardZZZ,DEV=0"),
             None,
             "卡名查不到时必须原样返回，让调用方报错"
         );
+        // ⚠️ 别在这里断言「`hw:CARD=<真实卡名>` 查不到」—— 本机 `snd-aloop` 常驻，
+        //    `Loopback` 是**查得到**的，那种断言会在这台机器上红、在没装 aloop 的
+        //    机器上绿，正好把「实现了」判成「没实现」。下面的存在性检查才是对的写法。
+        assert_eq!(
+            canonicalize_pcm_id("hw:CARD=NoSuchCardZZZ"),
+            None,
+            "卡名 + 缺 DEV：补出 `,DEV=0` 之后仍然查不到卡号 ⇒ 必须返回 None"
+        );
         // 本机真实存在的那张（snd-aloop 已加载时才在；不在时这条也应当返回 None，
         // 所以这里不断言它一定换得出来 —— 只在存在时检查结果形状）。
-        if let Some(canonical) = canonicalize_card_name("hw:CARD=Loopback,DEV=0") {
+        if let Some(canonical) = canonicalize_pcm_id("hw:CARD=Loopback,DEV=0") {
             assert!(
                 canonical.starts_with("hw:CARD=") && canonical.ends_with(",DEV=0"),
                 "换出来的必须仍是 hw:CARD=<号>,DEV=0 的形状，实得 {canonical:?}"
@@ -705,6 +857,13 @@ appl_ptr    : 13568
                     .trim_start_matches("hw:CARD=")
                     .starts_with(|c: char| c.is_ascii_digit()),
                 "CARD= 后面必须是**卡号**（cpal 枚举的形式），实得 {canonical:?}"
+            );
+            // 缺 `DEV=` 的卡名写法要与写全的**落到同一处** —— 两段规范化（先补 DEV、
+            // 再换卡号）必须能接力，否则 `hw:CARD=Loopback` 会走到「找不到设备」。
+            assert_eq!(
+                canonicalize_pcm_id("hw:CARD=Loopback").as_deref(),
+                Some(canonical.as_str()),
+                "卡名 + 缺 DEV 应当与写全 DEV 的写法规范到同一个名字"
             );
         }
     }

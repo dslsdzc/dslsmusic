@@ -42,3 +42,12 @@ log.workspace = true
 # 示例（examples/*.rs）要能看见引擎的 log —— 独占尝试、可选的 hw: 设备列表
 # 都是从 log 里出来的，不装 logger 就等于把「如实报告」吞掉。
 env_logger.workspace = true
+
+# ⚠️ **示例默认 `test = false`**：`loopback_verify` 里的 `#[cfg(test)]` 用例
+# （比对/声道互换/重测频率那几条纯函数回归）**在 `cargo test --workspace` 下根本不会跑**
+# —— 实测过：不加这一段时跑完整 workspace，那些用例名一个都不出现，
+# 而输出里那句 `test result: ok` 看起来就像跑过了。
+# 这两条判据的纯逻辑归这里管，所以显式把它声明成测试目标。
+[[example]]
+name = "loopback_verify"
+test = true

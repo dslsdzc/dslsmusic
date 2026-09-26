@@ -27,8 +27,9 @@
 //! - 所以它**不能**证明「你听到的是逐位精确的」。那需要**硬件级采集**
 //!   （一根线把输出接回输入，或用带数字回读的声卡）。
 //! - 回环设备自己也在做事：它的播放侧与采集侧是两个独立 PCM，中间由内核模块
-//!   的内存拷贝连接。这一层不是我们的代码，它**自己出问题**本示例看不出来
-//!   （但两遍交叉比对能看出来：见「回环自检」）。
+//!   的内存拷贝连接。这一层不是我们的代码，它**自己出问题**本示例看不出来。
+//!   （原文在这里指了一个叫「回环自检」的小节做两遍交叉比对 —— **全文没有那一节**，
+//!   是一句够不着的能力承诺，已删。真要做，得让同一次运行比对两遍独立的采集。）
 //!
 //! # 用法
 //!
@@ -85,7 +86,26 @@ const PREAMBLE_FRAMES: usize = 64;
 /// 为什么是「声明的容差」而不是逐位一致：重采样是**滤波**，输出与输入的解析值
 /// 本来就不会逐位相等（rubato 的 Fft 是同步重采样器，通带内近似单位增益，
 /// 但存在远低于本容差的纹波）。本容差只用来判「信号有没有被毁掉」：
-/// 频率错、线性插值、混叠、丢样本都会**远超**它。实测值会在输出里打出来。
+/// 频率错、线性插值、丢样本都会**远超**它。实测值会在输出里打出来。
+///
+/// # 0.05 这个数**凭什么**定在这里（不记下来，将来没人敢动它）
+///
+/// 它**不是**从重采样器推出来的，是从**实测分布**定的（2026-09-26 本机 snd-aloop，
+/// 原始记录见 `.superpowers/sdd/task-11-report.md` §3.2b）：
+///
+/// | 场景 | 幅度偏差 |
+/// |---|---|
+/// | 干净环境 | 0.18% |
+/// | 系统负载上来了 | 2.52% |
+/// | 满载（8 个忙循环） | 22%~65%（失败） |
+///
+/// ⇒ 它是给**测量环境**留的余量，不是给重采样器留的：干净环境下重采样路径的
+/// 实测偏差是上表第一行那个零头。想收紧它的人要先知道 —— **2.5% 那个量级是
+/// 真实的环境产物**（snd-aloop 没有流控，机器一忙设备就丢样本），收紧了会在
+/// 机器一忙时开始误报，而误报会把这条判据变成「看两次就忽略」的东西。
+/// （口径提醒：上表是**任务 11 那次**的记录；本次修复重跑时干净环境的实测值更低，
+/// 见 `.superpowers/sdd/task-11-fix-report.md`。两个数不矛盾 —— 它们记的是
+/// 不同时间的机器状态，而这正说明这个容差量的是**环境**、不是代码。）
 const RESAMPLE_AMP_TOLERANCE: f64 = 0.05;
 
 /// 正弦幅度（每个分量）。两个分量相加 20000 < 32767，不会削顶。
@@ -165,32 +185,56 @@ fn measure(
     name: &str,
     lb: &Loopback,
     run: fn(&Loopback, u64) -> anyhow::Result<Outcome>,
-) -> (Option<Outcome>, bool) {
+) -> Measured {
     let mut attempt = 0u64;
     let mut outcome = match run(lb, attempt) {
         Ok(o) => o,
         Err(e) => {
             println!("  ✗ 跑不起来：{e:#}");
-            return (None, true);
+            return Measured {
+                outcome: None,
+                failed: true,
+                retried: false,
+            };
         }
     };
+    let mut retried = false;
     if !outcome.pass && outcome.disturbed() > 0 {
         println!(
             "  ↻ {name}：这次两侧设备侧 xrun = 采集 {} / 播放 {} —— **测量本身被干扰**了\
-             （snd-aloop 没有流控），重测一次。\n                  说明：干净的一次跑失败**不会**重测；这次重测换了一套伪随机数据。",
+             （snd-aloop 没有流控），重测一次。\n                  说明：干净的一次跑失败**不会**重测；这次重测换了一套信号\
+             （判据 1 换伪随机种子，判据 2 换频率集）—— 否则回环缓冲里的残留会让\
+             「重测通过」变成一句空话。",
             outcome.capture_errors, outcome.playback_errors
         );
         attempt += 1;
+        retried = true;
         outcome = match run(lb, attempt) {
             Ok(o) => o,
             Err(e) => {
                 println!("  ✗ 重测跑不起来：{e:#}");
-                return (None, true);
+                return Measured {
+                    outcome: None,
+                    failed: true,
+                    retried,
+                };
             }
         };
     }
-    let failed = !outcome.pass;
-    (Some(outcome), failed)
+    Measured {
+        failed: !outcome.pass,
+        outcome: Some(outcome),
+        retried,
+    }
+}
+
+/// 一条判据的测量结果（见 [`measure`]）。
+struct Measured {
+    /// `None` = 根本没跑起来（配置/建流失败），不是「内容不对」。
+    outcome: Option<Outcome>,
+    failed: bool,
+    /// 是否**因为被干扰而重测过**。要一路带到结论里 —— 见 [`verify`]。
+    retried: bool,
 }
 
 fn verify() -> ExitCode {
@@ -213,6 +257,10 @@ fn verify() -> ExitCode {
 
     let mut failed = 0usize;
     let mut disturbances = 0u64;
+    // ⚠️ **重测历史要带进结论。** 只累加**最终那次**的计数，会在
+    //    「第一次被干扰且失败、第二次干净通过」之后打印一句**不带任何折扣**的
+    //    「回环验证通过」——唯一痕迹是中段那行提示，而读结论的人往往只看最后一段。
+    let mut retried: Vec<&str> = Vec::new();
     for (name, run) in [
         (
             "判据 1/2",
@@ -220,11 +268,16 @@ fn verify() -> ExitCode {
         ),
         ("判据 2/2", test_resample),
     ] {
-        let (outcome, bad) = measure(name, &lb, run);
-        if let Some(o) = outcome {
+        let measured = measure(name, &lb, run);
+        if let Some(o) = measured.outcome {
+            // 重测过的话，第一次的扰动计数已经不在手里了（`measure` 只回传最终那次），
+            // 所以这里记账用的是「重测过」这个事实本身 —— 那也是结论里缺的那一句。
             disturbances += o.disturbed();
         }
-        if bad {
+        if measured.retried {
+            retried.push(name);
+        }
+        if measured.failed {
             failed += 1;
         }
     }
@@ -233,9 +286,16 @@ fn verify() -> ExitCode {
     if failed == 0 {
         println!("回环验证通过。⚠️ 它证明的是「到 hw: 为止、我们这条路径」没问题，");
         println!("   **不是**「你听到的是逐位精确的」—— 那需要硬件级采集（见本文件顶部）。");
+        if !retried.is_empty() {
+            println!(
+                "   ⚠️ 而且这是**重测后**才通过的（{}）：第一次因测量链路被干扰而失败，\
+                 你看到的数字来自第二次。",
+                retried.join("、")
+            );
+        }
         if disturbances > 0 {
             println!(
-                "   ⚠️ 但这次运行两侧设备侧 xrun 合计 {disturbances} 次 —— 结论要打个折扣，建议重跑。"
+                "   ⚠️ 且这次运行两侧设备侧 xrun 合计 {disturbances} 次 —— 结论要再打个折扣，建议重跑。"
             );
         }
         ExitCode::SUCCESS
@@ -392,15 +452,38 @@ fn test_bit_exact(lb: &Loopback, attempt: u64) -> anyhow::Result<Outcome> {
     );
 
     let d = compare(&captured[at..], &signal);
+    // ⚠️ **「逐位一致」的判据里必须带上「全都比到了」。** `compare` 取
+    //    `captured.len().min(expected.len())` ⇒ 采集提前结束时它**只比前缀**，
+    //    而裁决原来只有 `mismatches == 0` ⇒ 会照样打印「✓ 逐位一致：N 个样本全等」
+    //    并以 0 退出。触发很窄（采集环 6 秒、尾部是静音；信号**内部**丢失会变成
+    //    mismatch，头部丢失会被 `find_onset` 抓成 None）——但这是本项目第一条
+    //    音频正确性判据，它的 pass **不该立在一个它从不检查的长度上**。
+    let covered = d.compared == signal.len();
     let outcome = Outcome {
-        pass: d.mismatches == 0,
+        pass: d.mismatches == 0 && covered,
         capture_errors: cap.device_errors,
         playback_errors,
     };
+    if !covered {
+        println!(
+            "  ✗ 采集**没有盖住整个信号**：比到 {} / {} 个样本就没了 \
+             （后面的 {} 个样本根本没录回来）——「逐位一致」这句话不成立，判失败。",
+            d.compared,
+            signal.len(),
+            signal.len() - d.compared
+        );
+        println!(
+            "    这通常意味着采集侧被饿到、或停流时尾巴没交付完；不是样本处理错了。\
+             重跑一次；反复出现就看系统负载。"
+        );
+        return Ok(outcome);
+    }
     if d.mismatches == 0 {
         println!(
-            "  ✓ 逐位一致：{} 个样本全等（最大偏差 {} LSB）",
-            d.compared, d.worst
+            "  ✓ 逐位一致：{} / {} 个样本全等（**信号被完整覆盖**，最大偏差 {} LSB）",
+            d.compared,
+            signal.len(),
+            d.worst
         );
         Ok(outcome)
     } else {
@@ -434,24 +517,56 @@ fn test_bit_exact(lb: &Loopback, attempt: u64) -> anyhow::Result<Outcome> {
 
 // ─────────────────────────── 判据二：重采样路径 ───────────────────────────
 
+/// 本档第 `attempt` 次尝试用的频率集（左、右各两个分量）。
+///
+/// 两条硬约束，换频率时**都要满足**：
+///
+/// 1. **每个频率在 0.9 秒的分析窗里是整数周期** —— 即频率是 10 的倍数
+///    （`f × 0.9 = f × 9/10`，整数 `f` 要让它为整数就得 `f ≡ 0 (mod 10)`）。
+///    满足它，矩形窗下四个分量互不泄漏，幅度读数才干净。
+/// 2. **远低于源采样率的奈奎斯特**（4000Hz 的奈奎斯特是 2000Hz）。
+///    贴着 2000 会退化成恒零（`sin(2π·2000·n/4000) = sin(πn) = 0`），
+///    所以本档最大只用到 1480。
+///
+/// 左右用**不同**的频率对，这一档就顺带验声道有没有接反。
+fn resample_freqs(attempt: u64) -> ([f64; 2], [f64; 2]) {
+    match attempt {
+        0 => ([440.0, 1500.0], [600.0, 1200.0]),
+        // 重测换一套 —— 理由见 `test_resample` 里那段（残留会让重测拿旧波形报绿）。
+        _ => ([520.0, 1480.0], [880.0, 1160.0]),
+    }
+}
+
 /// 重采样那一档：源采样率设备不支持（[`RESAMPLE_SRC_RATE`]）⇒ 引擎退回设备默认率
 /// 并重采样。这里验的是**信号有没有被毁掉**：两个已知频率的幅度还在不在。
 ///
 /// 为什么不是逐位：重采样是滤波，输出与输入的解析值本来就不逐位相等。
-/// 为什么幅度就够：频率错了（比率错）、线性插值（高频滚降）、混叠、丢样本，
-/// 都会让某个分量**塌掉**，而通带内的好重采样器两处都在 1% 以内。
+/// 为什么幅度就够：**频率错了**（比率错）、**线性插值**（高频滚降）、**丢样本**
+/// 都会让某个分量**塌掉**，而通带内的好重采样器在 1% 以内。
+///
+/// ⚠️ **混叠不在这一档的覆盖范围内 —— 而且是构造上覆盖不到。** 本档唯一的配置是
+/// 4000Hz → 48000Hz（12 倍**上**采样），上采样不可能产生混叠；要验它得配一个
+/// **降采样**用例（源率高于设备率），本档没配。（以前这里把「混叠」列进能抓到的东西，
+/// 那是一句由构造决定测不到的能力断言。）
 fn test_resample(lb: &Loopback, attempt: u64) -> anyhow::Result<Outcome> {
     println!("\n== 判据 2/2：重采样路径（{RESAMPLE_SRC_RATE}Hz → 设备默认率）==");
     if attempt > 0 {
         println!("  （第 {} 次重测）", attempt + 1);
     }
-    let _ = attempt; // 这一档用正弦，没有「前导码唯一」那类问题
-    // 左右**用不同的频率对**：这一档就能顺带验声道有没有接反。
-    // 每个频率在 0.9 秒的分析窗里都是整数周期（440×0.9=396、1500×0.9=1350、
-    // 600×0.9=540、1200×0.9=1080）⇒ 矩形窗下互不泄漏，幅度读数干净。
-    const LEFT: [f64; 2] = [440.0, 1500.0];
-    const RIGHT: [f64; 2] = [600.0, 1200.0];
-    let signal = dual_sine(RESAMPLE_SRC_RATE as usize, RESAMPLE_SRC_RATE, &LEFT, &RIGHT);
+    // ⚠️ **每次尝试换一套频率**，不是「用正弦就没问题」。
+    //    重测存在的场景正是「上一次跑失败了」，而失败那次留下的残留**就是同一个正弦**；
+    //    `find_onset_by_level` 从下标 0 开始扫、取第一个过阈值的样本 ⇒ 那个样本落在
+    //    **陈旧残留**里（snd-aloop 保留未读数据，报告自己的 dump 分析在 xrun 后
+    //    发现约 0.5 秒无关残留）。于是分析窗口从陈旧数据开始，**若第二次实际什么都
+    //    没产出，harness 会拿第一次的波形报「通过」** —— 恰在重试存在的那个场景里
+    //    给出假绿。换一套频率之后，残留不可能与本次的期望对上。
+    let (freqs_l, freqs_r) = resample_freqs(attempt);
+    let signal = dual_sine(
+        RESAMPLE_SRC_RATE as usize,
+        RESAMPLE_SRC_RATE,
+        &freqs_l,
+        &freqs_r,
+    );
 
     let mut engine = AudioEngine::new_on(&lb.play_id, RESAMPLE_SRC_RATE)?;
     print_path(engine.output_path(), &engine);
@@ -512,7 +627,21 @@ fn test_resample(lb: &Loopback, attempt: u64) -> anyhow::Result<Outcome> {
             playback_errors,
         });
     }
-    let window = &captured[start + skip..end * 2];
+    // ⚠️ **起点也要乘 2。** 它上面三行刚承诺「下面全都按帧算」，这里原来写的是
+    //    `captured[start + skip..end * 2]` —— 终点按帧乘了 2，起点没有。三个后果：
+    //    - 窗口长度变成 `2*span + start + skip` 个样本（实测 0.9309 秒，不是 0.9 秒）；
+    //      于是 440Hz 落在 409.2 个周期（`find_onset_by_level` 的起点因运行而异，
+    //      所以这个小数每次都不一样）⇒ 矩形窗下**只有它**的幅度读数会动。
+    //      量级很小：负频率镜像的泄漏是 `|sin(2πfN/fs)| / (N·|sin(2πf/fs)|)`
+    //      = 16.5 / 44640 ≈ **0.037%**（对全部相位取上界，已用 numpy 复核），
+    //      远在 5% 容差内 —— 但它是**唯一**会让四个频率读数不一致的项，不是零。
+    //    - 窗口起点落在帧 `(start+skip)/2`（≈27ms）而不是 `start+skip`（≈55ms）
+    //      ⇒ 保留了 `skip` 本来要避开的**一半**起振瞬态。
+    //    - **奇偶**：`start + skip` 为奇数时 `window[0]` 是**右**声道样本，而下面的
+    //      `step_by(2)` 把它当 `"L"` 喂进估计器 ⇒ 左右整条对调，四个频率全塌到 ~0
+    //      （实测：在真 dump 上把起点挪一个样本，四个读数从 ~10000 掉到 ~7）。
+    //      乘 2 之后起点恒为偶数，这条依赖**结构上**消失，不再靠运气。
+    let window = &captured[(start + skip) * 2..end * 2];
     let left: Vec<f32> = window.iter().step_by(2).map(|&s| s as f32).collect();
     let right: Vec<f32> = window
         .iter()
@@ -522,7 +651,7 @@ fn test_resample(lb: &Loopback, attempt: u64) -> anyhow::Result<Outcome> {
         .collect();
 
     let mut ok = true;
-    for (ch, samples, freqs) in [("L", &left, LEFT), ("R", &right, RIGHT)] {
+    for (ch, samples, freqs) in [("L", &left, freqs_l), ("R", &right, freqs_r)] {
         for f in freqs {
             let got = amplitude_at(samples, out_rate, f);
             let dev = (got - SINE_AMP as f64).abs() / SINE_AMP as f64;
@@ -684,9 +813,16 @@ where
                     off += n;
                 }
             },
-            move |err| {
+            // ⚠️ **这里只做一次原子加，不打印。**
+            //    错误回调跑在**与数据回调同一个音频线程**上（§16.2 三样全禁：
+            //    分配、加锁、IO —— `log::error!` 格式化要分配、要取 logger 的全局锁、
+            //    还要写 stderr）。这里以前有一行 `log::error!("采集流错误: {err}")`，
+            //    它与本文件顶部「采集回调里只做 T→i16 + 推进 ring」的自述**直接矛盾**，
+            //    而且报告里那次 **17 次 xrun 的突发，正是这一行在挨饿的线程上
+            //    反复触发的时候** —— 它会给正在饿肚子的线程再添一笔。
+            //    次数已经经 `report_measurement` 到用户手里了，解释该放在那里。
+            move |_err| {
                 errors.fetch_add(1, Ordering::Relaxed);
-                log::error!("采集流错误: {err}");
             },
             None,
         )
@@ -897,11 +1033,22 @@ struct Diff {
 }
 
 impl Diff {
-    /// 把「实得」当成左右互换的样本来比，看是不是就一致了 ——
-    /// 声道互换是一条**会静默发生**的错（见 `lib.rs` 里「半个帧」那段），
-    /// 值得单独认出来。
+    /// 多数**帧**是不是正好左右对调了 —— 声道互换是一条**会静默发生**的错
+    /// （见 `lib.rs` 里「半个帧」那段），值得单独认出来。
+    ///
+    /// ⚠️ 判据按**帧**数、且与 mismatch 无关。旧写法是
+    /// `swapped * 2 > mismatches`，而 `swapped` 只在**不一致的奇数下标**上递增
+    /// ⇒ `swapped ≤ mismatches / 2` ⇒ **等号恒成立** ⇒ 严格 `>` 永假
+    /// ⇒ 「⚠️ 左右声道**互换**了」这句提示**永远不会为真正的互换打印**。
+    /// 反方向它也错：两声道内容相同时（R 里是 L）它会误触发，打印一个对该 bug
+    /// 而言是错的诊断。⇒ 现在数的是「**全体帧里有多少帧恰好是期望那帧的对调**」，
+    /// 并要求它过半。L==R 的帧对调前后一样，不构成证据，不计。
+    ///
+    /// （判据本身不依赖这句诊断：真正的全互换会让每个样本都 mismatch，
+    /// `pass` 照样是 false。坏的是**诊断**，不是判据 —— 但错的诊断会把查错方向带偏。）
     fn worst_channel_swapped(&self) -> bool {
-        self.swapped * 2 > self.mismatches && self.mismatches > 0
+        let frames = self.compared / 2;
+        frames > 0 && self.swapped * 2 > frames
     }
 }
 
@@ -923,10 +1070,18 @@ fn compare(captured: &[i16], expected: &[i16]) -> Diff {
             if d.first.is_none() {
                 d.first = Some((i, want, got));
             }
-            // 同一帧里左右对调后是否相等？
-            if i % 2 == 1 && i >= 1 && expected[i - 1] == got && expected[i] == captured[i - 1] {
-                d.swapped += 1;
-            }
+        }
+    }
+    // 第二遍**按帧**数「这一帧是不是正好是期望那一帧的左右对调」。
+    // 与上面那遍分开是因为口径不同：上面数**样本**，这里数**帧** ——
+    // 混在一个循环里正是旧写法出错的地方（见 `worst_channel_swapped` 的文档）。
+    for f in 0..n / 2 {
+        let (i, j) = (f * 2, f * 2 + 1);
+        let (wl, wr) = (expected[i], expected[j]);
+        let (gl, gr) = (captured[i], captured[j]);
+        // L == R 的帧对调前后一样 —— 不构成「互换」的证据，别拿来凑数。
+        if wl != wr && gl == wr && gr == wl {
+            d.swapped += 1;
         }
     }
     d
@@ -973,4 +1128,83 @@ fn amplitude_at(samples: &[f32], rate: u32, freq: f64) -> f64 {
         im -= x as f64 * t.sin();
     }
     2.0 * (re * re + im * im).sqrt() / samples.len() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **真正的全 L/R 互换必须被判出来。** 这条是回归测试：旧写法
+    /// （`swapped * 2 > mismatches`，而 `swapped` 只在不一致的奇数下标上递增）
+    /// 恒推出 `swapped ≤ mismatches / 2` ⇒ 严格 `>` 永假 ⇒ 提示永远不打印。
+    #[test]
+    fn detects_a_real_channel_swap() {
+        // 4 帧，L/R 内容不同 —— 交换之后每一帧都看得出来。
+        let expected: Vec<i16> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let swapped: Vec<i16> = vec![20, 10, 40, 30, 60, 50, 80, 70];
+        let d = compare(&swapped, &expected);
+        assert_eq!(d.mismatches, 8, "全互换时每个样本都不一致");
+        assert!(
+            d.worst_channel_swapped(),
+            "全 L/R 互换必须被认出来（这是旧写法抓不到的那一档）"
+        );
+    }
+
+    /// **反方向也要对**：两声道内容相同时，交换与不交换一模一样 ——
+    /// 那不是「互换」的证据，不该打印那句诊断（旧写法在这里会误触发）。
+    #[test]
+    fn does_not_report_a_swap_when_channels_are_identical() {
+        let expected: Vec<i16> = vec![7, 7, 9, 9, 11, 11, 13, 13];
+        let d = compare(&expected, &expected);
+        assert_eq!(d.mismatches, 0);
+        assert!(
+            !d.worst_channel_swapped(),
+            "两声道内容相同（R 里是 L）不是互换，不能打印互换诊断"
+        );
+    }
+
+    /// 采集短了的时候 `compare` **只比前缀** —— 判据必须自己要求「全都比到了」。
+    /// 这条钉住 `test_bit_exact` 里那个 `covered` 依据的事实。
+    #[test]
+    fn compare_only_covers_what_it_was_given() {
+        let expected: Vec<i16> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let short: Vec<i16> = vec![1, 2, 3, 4];
+        let d = compare(&short, &expected);
+        assert_eq!(d.compared, 4, "只比到能给出来的长度");
+        assert_eq!(
+            d.mismatches, 0,
+            "前缀一致 ⇒ mismatches 是 0（这正是旧裁决的漏洞）"
+        );
+        assert!(
+            d.compared < expected.len(),
+            "⇒ `covered` 必须为假，否则「逐位一致」会立在 4/8 个样本上"
+        );
+    }
+
+    /// 重测换的那套频率必须同时满足两条硬约束，否则重测本身会变成假绿/假红：
+    /// ① 0.9 秒窗口里整数周期（⇒ 10 的倍数）；② 远低于源率的奈奎斯特（2000Hz）。
+    #[test]
+    fn retry_frequency_sets_are_usable_and_different() {
+        let a = resample_freqs(0);
+        let b = resample_freqs(1);
+        assert_ne!(a, b, "重测必须换一套频率，否则残留会让「重测通过」变成空话");
+        for set in [a, b] {
+            for f in set.0.iter().chain(set.1.iter()) {
+                assert_eq!(
+                    f % 10.0,
+                    0.0,
+                    "{f}Hz 在 0.9 秒里不是整数周期（f×0.9 要是整数 ⇒ f 得是 10 的倍数）"
+                );
+                assert!(
+                    *f < 2000.0,
+                    "{f}Hz 达到或超过源率 {RESAMPLE_SRC_RATE}Hz 的奈奎斯特（2000Hz）—— \
+                     贴到 2000 会退化成恒零信号"
+                );
+            }
+            assert_ne!(
+                set.0, set.1,
+                "左右必须用不同的频率对，否则这一档验不了声道接反"
+            );
+        }
+    }
 }
